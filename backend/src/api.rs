@@ -25,20 +25,22 @@ fn err(e: anyhow::Error) -> Response {
     (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response()
 }
 
-fn token_ok(headers: &HeaderMap, expected: &str) -> bool {
-    use subtle::ConstantTimeEq;
-    let got = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
-    let want = format!("Bearer {expected}");
-    got.len() == want.len() && bool::from(got.as_bytes().ct_eq(want.as_bytes()))
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers.get("authorization")?.to_str().ok()?.strip_prefix("Bearer ")
 }
 
-/// The cluster label always comes from configuration: client-go drops query strings
-/// from the webhook URL, and a caller-supplied label could be spoofed.
+/// Batches from collectors. The cluster is decided by the token, never by the caller.
+/// Body: the source's records as JSON lines (or a JSON list), optionally gzip-encoded.
 async fn ingest(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    if let Some(tok) = &s.cfg.ingest_token {
-        if !token_ok(&headers, tok) {
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
+    if s.cfg.ingest_tokens.is_empty() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no collector tokens configured").into_response();
+    }
+    let Some(cluster) = bearer(&headers).and_then(|t| s.cfg.cluster_for_token(t)) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let source = headers.get("x-audit-loupe-source").and_then(|v| v.to_str().ok()).unwrap_or("");
+    if source != "k8s-audit" {
+        return (StatusCode::BAD_REQUEST, format!("unsupported source {source:?}")).into_response();
     }
     let events = match parse_body(&body) {
         Ok(e) => e,
@@ -49,7 +51,7 @@ async fn ingest(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> R
         (r, a)
     }).collect();
     let received = events.len();
-    let (store, cluster) = (s.store.clone(), s.cfg.cluster.clone());
+    let store = s.store.clone();
     match tokio::task::spawn_blocking(move || store.insert_events(&cluster, &batch)).await {
         Ok(Ok(stored)) => Json(json!({"received": received, "stored": stored})).into_response(),
         Ok(Err(e)) => err(e),
@@ -189,12 +191,70 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Audit webhook receiver, on its own port so a NetworkPolicy can limit it to control-plane nodes.
+/// Collector entry point, on its own port so it can be exposed (Ingress/LoadBalancer)
+/// without exposing the read API.
 pub fn ingest_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .route("/ingest/k8s-audit", post(ingest))
-        // A batch of up to a few hundred Request-level events can exceed axum's 2 MB default.
+        .route("/ingest/v1/batch", post(ingest))
+        // Limit applies to the decompressed body.
         .layer(DefaultBodyLimit::max(64 << 20))
+        .layer(tower_http::decompression::RequestDecompressionLayer::new())
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn state() -> AppState {
+        AppState { store: Store::open(":memory:").unwrap(), cfg: Arc::new(Config::test()), watch: Default::default() }
+    }
+    const LINE: &str = r#"{"auditID":"a1","stage":"ResponseComplete","verb":"delete","user":{"username":"system:admin"},"objectRef":{"resource":"namespaces","name":"legacy-batch"},"responseStatus":{"code":200},"stageTimestamp":"2026-10-15T13:40:00Z"}"#;
+
+    async fn post(app: Router, token: Option<&str>, source: &str, body: Vec<u8>, gzip: bool) -> (StatusCode, String) {
+        let mut req = Request::post("/ingest/v1/batch").header("x-audit-loupe-source", source);
+        if let Some(t) = token { req = req.header("authorization", format!("Bearer {t}")); }
+        if gzip { req = req.header("content-encoding", "gzip"); }
+        let res = app.oneshot(req.body(Body::from(body)).unwrap()).await.unwrap();
+        let code = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        (code, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    #[tokio::test]
+    async fn token_decides_the_cluster() {
+        let st = state();
+        let (code, body) = post(ingest_router(st.clone()), Some("test-token"), "k8s-audit", LINE.into(), false).await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        let rows = st.store.timeline(&Query { cluster: None, actor: None, from_ms: 0, to_ms: i64::MAX, humans_only: false, writes_only: false, alerts_only: false, limit: 10 }).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cluster, "test");
+        // Same auditID again is not stored twice.
+        let (_, body) = post(ingest_router(st.clone()), Some("test-token"), "k8s-audit", LINE.into(), false).await;
+        assert!(body.contains("\"stored\":0"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn rejects_bad_token_and_unknown_source() {
+        let (code, _) = post(ingest_router(state()), Some("wrong-token-0000"), "k8s-audit", LINE.into(), false).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        let (code, _) = post(ingest_router(state()), None, "k8s-audit", LINE.into(), false).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        let (code, _) = post(ingest_router(state()), Some("test-token"), "syslog", LINE.into(), false).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn accepts_gzip() {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(LINE.as_bytes()).unwrap();
+        let (code, body) = post(ingest_router(state()), Some("test-token"), "k8s-audit", enc.finish().unwrap(), true).await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert!(body.contains("\"stored\":1"), "{body}");
+    }
 }

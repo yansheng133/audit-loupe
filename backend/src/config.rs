@@ -17,8 +17,9 @@ pub struct Config {
     /// ISO weekday numbers, Monday = 1.
     pub work_days: Vec<u32>,
     pub retention_days: i64,
-    /// If set, the audit webhook must send `Authorization: Bearer <token>`.
-    pub ingest_token: Option<String>,
+    /// One entry per cluster allowed to push: (cluster id, sha256 of its token).
+    /// The cluster a batch belongs to is decided by which token it carries.
+    pub ingest_tokens: Vec<(String, [u8; 32])>,
 }
 
 pub const DEFAULT_WATCH: &str = "apps/v1/deployments,apps/v1/statefulsets,apps/v1/daemonsets,\
@@ -48,7 +49,59 @@ fn range(spec: &str) -> Vec<u32> {
     out
 }
 
+pub fn hash_token(token: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(token.trim().as_bytes()).into()
+}
+
+/// Lines of "<cluster-id> <token>"; blank lines and # comments are ignored.
+/// A missing file means no cluster may push (the read API still works).
+pub fn parse_tokens(text: &str) -> anyhow::Result<Vec<(String, [u8; 32])>> {
+    let mut out: Vec<(String, [u8; 32])> = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let (Some(cluster), Some(token), None) = (parts.next(), parts.next(), parts.next()) else {
+            anyhow::bail!("tokens line {}: expected \"<cluster-id> <token>\"", n + 1);
+        };
+        if token.len() < 16 {
+            anyhow::bail!("tokens line {}: token for {cluster} is shorter than 16 characters", n + 1);
+        }
+        let h = hash_token(token);
+        if out.iter().any(|(c, t)| c == cluster || *t == h) {
+            anyhow::bail!("tokens line {}: duplicate cluster or token", n + 1);
+        }
+        out.push((cluster.to_string(), h));
+    }
+    Ok(out)
+}
+
+fn load_tokens(path: &str) -> anyhow::Result<Vec<(String, [u8; 32])>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse_tokens(&text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(anyhow::anyhow!("{path}: {e}")),
+    }
+}
+
 impl Config {
+    /// Which cluster a bearer token belongs to. Every entry is compared so timing
+    /// does not reveal how many clusters are configured or which one matched.
+    pub fn cluster_for_token(&self, token: &str) -> Option<String> {
+        use subtle::ConstantTimeEq;
+        let h = hash_token(token);
+        let mut found = None;
+        for (cluster, t) in &self.ingest_tokens {
+            if bool::from(t.ct_eq(&h)) {
+                found = Some(cluster.clone());
+            }
+        }
+        found
+    }
+
     pub fn from_env() -> anyhow::Result<Self> {
         let hours = var("AL_WORK_HOURS", "9-18");
         let (start, end) = hours
@@ -74,11 +127,12 @@ impl Config {
             work_end_hour: end,
             work_days: range(&var("AL_WORK_DAYS", "1-5")),
             retention_days: var("AL_RETENTION_DAYS", "90").parse().unwrap_or(90),
-            ingest_token: env::var("AL_INGEST_TOKEN").ok().filter(|v| !v.is_empty()),
+            ingest_tokens: load_tokens(&var("AL_INGEST_TOKENS_FILE", "/etc/audit-loupe/tokens/tokens"))?,
         })
     }
 
     /// Settings for tests.
+    #[cfg(test)]
     pub fn test() -> Self {
         Config {
             db_path: ":memory:".into(),
@@ -92,14 +146,25 @@ impl Config {
             work_end_hour: 18,
             work_days: vec![1, 2, 3, 4, 5],
             retention_days: 90,
-            ingest_token: None,
+            ingest_tokens: vec![("test".into(), crate::config::hash_token("test-token"))],
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::range;
+    use super::*;
+    #[test]
+    fn tokens_map_to_clusters() {
+        let mut cfg = Config::test();
+        cfg.ingest_tokens = parse_tokens("# comment\nlocal aaaaaaaaaaaaaaaaaaaa\nc-m-7h2kx  bbbbbbbbbbbbbbbbbbbb\n").unwrap();
+        assert_eq!(cfg.cluster_for_token("bbbbbbbbbbbbbbbbbbbb").as_deref(), Some("c-m-7h2kx"));
+        assert_eq!(cfg.cluster_for_token("aaaaaaaaaaaaaaaaaaaa").as_deref(), Some("local"));
+        assert_eq!(cfg.cluster_for_token("cccccccccccccccccccc"), None);
+        assert!(parse_tokens("x short").is_err());
+        assert!(parse_tokens("a aaaaaaaaaaaaaaaaaaaa\na aaaaaaaaaaaaaaaaaaab").is_err());
+        assert!(parse_tokens("a aaaaaaaaaaaaaaaaaaaa extra").is_err());
+    }
     #[test]
     fn parses_ranges() {
         assert_eq!(range("1-5"), vec![1, 2, 3, 4, 5]);

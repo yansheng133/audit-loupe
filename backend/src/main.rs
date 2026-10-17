@@ -1,5 +1,6 @@
 mod api;
 mod audit;
+mod collect;
 mod config;
 mod demo;
 mod diff;
@@ -16,14 +17,23 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
+    let cmd = std::env::args().nth(1).unwrap_or_else(|| "server".into());
+    match cmd.as_str() {
+        "server" | "seed-demo" => {}
+        "collect-file" => return collect::run_file().await,
+        other => anyhow::bail!("unknown command {other:?}; use server, collect-file or seed-demo"),
+    }
     let cfg = Arc::new(config::Config::from_env()?);
     let store = store::Store::open(&cfg.db_path)?;
-    if std::env::args().nth(1).as_deref() == Some("seed-demo") {
+    if cmd == "seed-demo" {
         demo::seed(&store, &cfg)?;
         info!(db = %cfg.db_path, "demo data written");
         return Ok(());
     }
-    info!(cluster = %cfg.cluster, db = %cfg.db_path, "starting");
+    info!(cluster = %cfg.cluster, db = %cfg.db_path, collectors = cfg.ingest_tokens.len(), "starting");
+    if cfg.ingest_tokens.is_empty() {
+        warn!("no collector tokens configured; the ingest endpoint will refuse all batches");
+    }
     let status: watch::Status = Default::default();
 
     // Bind first so probes pass and audit batches are accepted while discovery runs.
