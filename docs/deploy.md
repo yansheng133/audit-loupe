@@ -29,7 +29,7 @@ helm upgrade rancher rancher-prime/rancher -n cattle-system --reuse-values \
 
 - level 1 記 metadata 與 header（含 User-Agent，用來分辨介面或 kubectl）。不需要 request body。
 - `destination` 要用 `sidecar`，collect-rancher 讀的是 `rancher-audit-log` 這個 sidecar 的輸出。
-- 改這些值會讓 Rancher Pod 重建。
+- 改這些值會讓 Rancher Pod 重建（從 chart 推論，待 lab 驗證中斷多久）。
 
 ### 2.2 RKE2 開啟 apiserver audit log
 
@@ -141,7 +141,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["services/proxy"]
-    resourceNames: ["http:audit-loupe:8080", "audit-loupe"]
+    resourceNames: ["http:audit-loupe:8080", "audit-loupe"]   # 實際比對的名稱待 lab 驗證
     verbs: ["get"]
 ```
 
