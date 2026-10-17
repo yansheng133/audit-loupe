@@ -136,7 +136,23 @@ server:
 - **雜湊鏈要搭配外部的錨點才有意義**：鏈存在同一個資料庫裡，能改資料庫的人也能重算整條鏈。錨點送到 SIEM（或其他不能事後修改的地方）之後，可以用 `/api/integrity/anchor?cluster=&event_id=&hash=` 比對現在的資料是否與當時一致。沒有設定轉送時，雜湊鏈只能偵測意外損毀。
 - `/api/integrity` 逐座叢集驗證整條鏈，回報第一筆對不上的紀錄。
 
-## 6. UI extension
+## 6. SUSE Security（選用）
+
+在裝有 SUSE Security 的叢集加上 `collector.neuvector`，exec 事件的證據欄會列出之後在那個 Pod 裡被判定為違規的程序。
+
+```yaml
+collector:
+  neuvector:
+    enabled: true
+    apiKeySecret: audit-loupe-nv-apikey   # key: apikey，值為「<access key>:<secret>」
+    caSecret: audit-loupe-nv-ca           # controller 憑證（預設是自簽）
+```
+
+- API key 只需要「Security Event」讀取權限，可以限定 namespace。
+- SUSE Security 只記錄判定為違規或可疑的程序（Monitor／Protect 模式下不在允許清單的程序、內建的可疑程序偵測），**不是完整的指令紀錄**。Discover 模式下不會產生這類事件。畫面上一律寫「SUSE Security 判定為違規的程序」。
+- controller 只保留最近的事件，收集元件每 30 秒讀一次。
+
+## 7. UI extension
 
 Rancher 的 Extensions 頁面加入 Audit Loupe 的 extension repository 後安裝（repository 由 `ui/` 的 GitHub Actions 產生）。安裝後：
 
@@ -144,7 +160,7 @@ Rancher 的 Extensions 頁面加入 Audit Loupe 的 extension repository 後安�
 - 每座叢集的 Dashboard 多一張卡片，點了直接以該叢集篩選開啟。
 - server 不在 local 時，第一次開啟會詢問 server 所在的叢集 ID，記在這台瀏覽器。
 
-## 7. 誰看得到稽核資料
+## 8. 誰看得到稽核資料
 
 UI 透過 Rancher 的 service proxy 讀 server，所以由 Rancher 的權限決定：要有 server 所在叢集 `audit-loupe-system` namespace 的 `services/proxy` get 權限。給稽核人員的 Role 範例：
 
@@ -163,7 +179,7 @@ rules:
 
 再以 RoleBinding 綁給稽核人員的使用者或 IdP 群組。
 
-## 8. 移除
+## 9. 移除
 
 ```bash
 helm uninstall audit-loupe -n audit-loupe-system

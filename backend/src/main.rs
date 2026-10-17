@@ -7,6 +7,7 @@ mod demo;
 mod diff;
 mod forward;
 mod integrity;
+mod neuvector;
 mod rancher;
 mod relations;
 mod restore;
@@ -30,7 +31,8 @@ async fn main() -> anyhow::Result<()> {
         "collect-file" => return collect::run_file().await,
         "collect-rancher" => return collect::run_rancher().await,
         "collect-watch" => return watch::run().await,
-        other => anyhow::bail!("unknown command {other:?}; use server, collect-file, collect-rancher, collect-watch or seed-demo"),
+        "collect-neuvector" => return neuvector::run().await,
+        other => anyhow::bail!("unknown command {other:?}; use server, collect-file, collect-rancher, collect-watch, collect-neuvector or seed-demo"),
     }
     let cfg = Arc::new(config::Config::from_env()?);
     let store = store::Store::open(&cfg.db_path)?;

@@ -93,6 +93,13 @@ CREATE TABLE IF NOT EXISTS gaps (
   id INTEGER PRIMARY KEY, cluster TEXT NOT NULL, collector TEXT NOT NULL, instance TEXT NOT NULL, from_ms INTEGER NOT NULL, to_ms INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS gaps_time ON gaps(to_ms);
+CREATE TABLE IF NOT EXISTS security_events (
+  id INTEGER PRIMARY KEY, cluster TEXT NOT NULL, nv_id TEXT NOT NULL, ts_ms INTEGER NOT NULL, name TEXT NOT NULL, level TEXT NOT NULL,
+  namespace TEXT NOT NULL, workload TEXT NOT NULL, proc_name TEXT NOT NULL, proc_cmd TEXT NOT NULL, proc_parent TEXT NOT NULL,
+  proc_user TEXT NOT NULL, action TEXT NOT NULL, message TEXT NOT NULL,
+  UNIQUE (cluster, nv_id)
+);
+CREATE INDEX IF NOT EXISTS security_pod ON security_events(cluster, namespace, ts_ms);
 CREATE TABLE IF NOT EXISTS listing (
   cluster TEXT NOT NULL, api_group TEXT NOT NULL, resource TEXT NOT NULL, first INTEGER NOT NULL,
   PRIMARY KEY (cluster, api_group, resource)
@@ -1541,6 +1548,44 @@ impl Store {
         Ok(out)
     }
 
+    pub fn insert_security(&self, cluster: &str, items: &[crate::neuvector::Incident]) -> anyhow::Result<usize> {
+        let mut c = self.conn.lock().unwrap();
+        let tx = c.transaction()?;
+        let mut n = 0;
+        for i in items {
+            n += tx.execute(
+                "INSERT OR IGNORE INTO security_events (cluster, nv_id, ts_ms, name, level, namespace, workload, proc_name, proc_cmd, proc_parent, proc_user, action, message)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                params![cluster, i.id, i.reported_timestamp * 1000, i.name, i.level, i.workload_domain, i.workload_name, i.proc_name, i.proc_cmd,
+                        i.proc_parent_name, i.proc_effective_user, i.action, i.msg],
+            )?;
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Processes SUSE Security flagged in a pod's containers in a time window (around an exec).
+    /// Its workload name is the container's name as the runtime reports it, which carries
+    /// the pod name; matched by prefix.
+    pub fn security_for_pod(&self, cluster: &str, ns: &str, pod: &str, from_ms: i64, to_ms: i64) -> anyhow::Result<Vec<Value>> {
+        let c = self.conn.lock().unwrap();
+        let pat = format!("%{}%", pod.replace('%', "").replace('_', "\\_"));
+        let rows = c
+            .prepare(
+                "SELECT ts_ms, name, level, workload, proc_name, proc_cmd, proc_parent, proc_user, action, message FROM security_events
+                 WHERE cluster=?1 AND namespace=?2 AND workload LIKE ?3 ESCAPE '\\' AND ts_ms BETWEEN ?4 AND ?5 ORDER BY ts_ms LIMIT 200",
+            )?
+            .query_map(params![cluster, ns, pat, from_ms, to_ms], |r| {
+                let parent: String = r.get(6)?;
+                Ok(json!({"tsMs": r.get::<_, i64>(0)?, "name": r.get::<_, String>(1)?, "level": r.get::<_, String>(2)?, "workload": r.get::<_, String>(3)?,
+                          "process": r.get::<_, String>(4)?, "command": r.get::<_, String>(5)?, "parent": parent.clone(),
+                          "startedByRuntime": crate::neuvector::started_by_runtime(&parent),
+                          "user": r.get::<_, String>(7)?, "action": r.get::<_, String>(8)?, "message": r.get::<_, String>(9)?}))
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
     /// Labels of a namespace as last seen.
     pub fn namespace_labels(&self, cluster: &str, ns: &str) -> anyhow::Result<Option<serde_json::Map<String, Value>>> {
         let c = self.conn.lock().unwrap();
@@ -1772,6 +1817,7 @@ impl Store {
         }
         c.execute("DELETE FROM anchors WHERE at_ms < ?1", params![cutoff])?;
         c.execute("DELETE FROM gaps WHERE to_ms < ?1", params![cutoff])?;
+        c.execute("DELETE FROM security_events WHERE ts_ms < ?1", params![cutoff])?;
         c.execute("DELETE FROM hourly WHERE hour_ms < ?1", params![cutoff])?;
         c.execute("DELETE FROM stories WHERE last_ms < ?1", params![cutoff])?;
         Ok(n + m)
@@ -2174,6 +2220,22 @@ mod tests {
         let gaps: Vec<(String, Option<i64>)> = c1.gaps.iter().map(|g| (g["collector"].as_str().unwrap().to_string(), g["toMs"].as_i64())).collect();
         assert!(gaps.contains(&("file".into(), Some(t0 + 660_000))), "closed gap: {gaps:?}");
         assert!(gaps.contains(&("watch".into(), None)), "watch is still silent: {gaps:?}");
+    }
+
+    #[test]
+    fn flagged_processes_are_found_by_pod_and_time() {
+        let s = Store::open(":memory:").unwrap();
+        let inc = |id: &str, wl: &str, ts: i64| crate::neuvector::Incident {
+            id: id.into(), name: "Process.Profile.Violation".into(), level: "Warning".into(), reported_timestamp: ts,
+            workload_name: wl.into(), workload_domain: "shop".into(), proc_name: "curl".into(), proc_cmd: "curl http://x/".into(),
+            proc_parent_name: "bash".into(), ..Default::default()
+        };
+        let n = s.insert_security("c1", &[inc("a", "web-6c9f7d-2kq8v", 1_000), inc("b", "api-1", 1_010), inc("a", "web-6c9f7d-2kq8v", 1_000)]).unwrap();
+        assert_eq!(n, 2, "duplicates ignored");
+        let found = s.security_for_pod("c1", "shop", "web-6c9f7d-2kq8v", 999_000, 1_100_000).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0]["command"], "curl http://x/");
+        assert!(s.security_for_pod("c1", "shop", "web-6c9f7d-2kq8v", 1_001_000, 1_100_000).unwrap().is_empty());
     }
 
     #[test]

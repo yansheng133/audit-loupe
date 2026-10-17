@@ -117,6 +117,20 @@ collector:
       requests: { cpu: 20m, memory: 32Mi }
       limits: { memory: 128Mi }
 
+  # SUSE Security (NeuVector) process incidents, shown next to kubectl exec. Only processes
+  # SUSE Security flags (violations, suspicious processes) are recorded, not every command.
+  # Needs a read-only API key with the "Security Event" read permission.
+  neuvector:
+    enabled: false
+    url: https://neuvector-svc-controller.cattle-neuvector-system:10443
+    # Secret with key "apikey": "<access key>:<secret>".
+    apiKeySecret: ""
+    # Secret with key ca.crt: the controller's certificate (self-signed by default).
+    caSecret: ""
+    resourcesSpec:
+      requests: { cpu: 10m, memory: 32Mi }
+      limits: { memory: 64Mi }
+
 image:
   server:
     repository: docker.io/yansheng133/audit-loupe-server

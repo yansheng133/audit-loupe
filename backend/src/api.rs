@@ -51,6 +51,19 @@ async fn ingest(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> R
             return (StatusCode::FORBIDDEN, "only the Rancher cluster's collector may send Rancher records").into_response();
         }
         "k8s-object" => return ingest_objects(s, cluster, &body).await,
+        "neuvector" => {
+            let mut items = Vec::new();
+            for line in body.split(|b| *b == b'\n').map(|l| l.trim_ascii()).filter(|l| !l.is_empty()) {
+                match serde_json::from_slice::<crate::neuvector::Incident>(line) {
+                    Ok(i) => items.push(i),
+                    Err(e) => return (StatusCode::BAD_REQUEST, format!("bad incident: {e}")).into_response(),
+                }
+            }
+            return match s.store.insert_security(&cluster, &items) {
+                Ok(n) => Json(json!({"received": items.len(), "stored": n})).into_response(),
+                Err(e) => err(e),
+            };
+        }
         "heartbeat" => {
             let v: serde_json::Value = match serde_json::from_slice(&body) {
                 Ok(v) => v,
@@ -266,6 +279,26 @@ async fn restore(State(s): State<AppState>, Q(p): Q<RestoreParams>) -> Response 
 async fn coverage(State(s): State<AppState>, Q(r): Q<Range>) -> Response {
     let (f, t) = r.bounds();
     match s.store.coverage(f, t, Utc::now().timestamp_millis()) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct SecurityParams {
+    cluster: String,
+    namespace: String,
+    pod: String,
+    from: DateTime<Utc>,
+    /// Default: 30 minutes after `from` (an exec session's end is not in the audit log).
+    to: Option<DateTime<Utc>>,
+}
+
+/// Processes SUSE Security flagged in a pod around a time (for an exec).
+async fn security(State(s): State<AppState>, Q(p): Q<SecurityParams>) -> Response {
+    let from = p.from.timestamp_millis() - 5_000;
+    let to = p.to.map(|t| t.timestamp_millis()).unwrap_or(from + 30 * 60_000);
+    match s.store.security_for_pod(&p.cluster, &p.namespace, &p.pod, from, to) {
         Ok(rows) => Json(rows).into_response(),
         Err(e) => err(e),
     }
@@ -489,6 +522,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/related", get(related))
         .route("/api/hourly", get(hourly))
         .route("/api/integrity", get(integrity))
+        .route("/api/security", get(security))
         .route("/api/coverage", get(coverage))
         .route("/api/restore", get(restore))
         .route("/api/gitops", get(gitops))

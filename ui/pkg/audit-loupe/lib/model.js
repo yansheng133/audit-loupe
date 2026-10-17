@@ -44,6 +44,7 @@ const ZH = {
   },
   noteExec: '在容器裡下了哪些指令，audit log 不會記錄。', noteSecret: 'Secret 不保存版本，只記錄誰在何時存取。', noteConfigMap: 'ConfigMap 的值預設遮蔽，只顯示哪個鍵變了。',
   noteGone: '物件已不在叢集裡；顯示的是最後看到的內容。',
+  secTitle: 'SUSE Security 判定為違規的程序', secNote: '只列出 SUSE Security 判定為違規或可疑的程序，不是完整的指令紀錄。', secNone: '這段時間 SUSE Security 沒有對這個 Pod 提出違規程序（不代表沒有執行任何指令）。',
   restore: '下載還原用 YAML', restoreHint: '這次變更之前的內容；只產生檔案，不會套用。',
   rel: {
     owned_by: '屬於', mounts: '掛載', reads: '讀取', runs_as: '以此身分執行', pulls_with: '拉映像用', selects: '選到', applies_to: '套用到', routes_to: '導流到',
@@ -93,6 +94,7 @@ const EN = {
   },
   noteExec: 'The commands typed inside the container are not in the audit log.', noteSecret: 'Secrets are not versioned; only who accessed them and when.', noteConfigMap: 'ConfigMap values are masked; only which key changed is shown.',
   noteGone: 'The object is gone; this is the last content seen.',
+  secTitle: 'Processes SUSE Security flagged', secNote: 'Only processes SUSE Security judged violations or suspicious; not a full command history.', secNone: 'SUSE Security flagged no processes in this pod in that period (which does not mean nothing was run).',
   restore: 'Download restore YAML', restoreHint: 'The state before this change; generated only, never applied.',
   rel: {
     owned_by: 'owned by', mounts: 'mounts', reads: 'reads', runs_as: 'runs as', pulls_with: 'pulls with', selects: 'selects', applies_to: 'applies to', routes_to: 'routes to',

@@ -1,5 +1,5 @@
 {{- $c := .Values.collector }}
-{{- if or $c.watch.enabled $c.rancher.enabled $c.file.enabled }}
+{{- if or $c.watch.enabled $c.rancher.enabled $c.file.enabled $c.neuvector.enabled }}
 {{- if not $c.token.existingSecret }}
 apiVersion: v1
 kind: Secret
@@ -191,6 +191,65 @@ spec:
             - { name: state, mountPath: /state }
       volumes:
         {{- include "al.collectorVolumes" . | nindent 8 }}
+        - { name: state, emptyDir: {} }
+---
+{{- end }}
+{{- if $c.neuvector.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: audit-loupe-neuvector
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "al.labels" . | nindent 4 }}
+    app.kubernetes.io/component: collect-neuvector
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {{- include "al.selector" . | nindent 6 }}
+      app.kubernetes.io/component: collect-neuvector
+  template:
+    metadata:
+      labels: {{- include "al.selector" . | nindent 8 }}
+        app.kubernetes.io/component: collect-neuvector
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: collect-neuvector
+          image: {{ include "al.collectorImage" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [collect-neuvector]
+          env:
+            {{- include "al.collectorEnv" . | nindent 12 }}
+            - { name: AL_NEUVECTOR_URL, value: {{ $c.neuvector.url | quote }} }
+            - { name: AL_NEUVECTOR_APIKEY_FILE, value: /etc/audit-loupe/neuvector/apikey }
+            {{- if $c.neuvector.caSecret }}
+            - { name: AL_NEUVECTOR_CA_FILE, value: /etc/audit-loupe/neuvector-ca/ca.crt }
+            {{- end }}
+            - { name: AL_STATE_DIR, value: /state }
+          securityContext: {{- include "al.securityContext" . | nindent 12 }}
+          resources: {{- toYaml $c.neuvector.resourcesSpec | nindent 12 }}
+          volumeMounts:
+            {{- include "al.collectorMounts" . | nindent 12 }}
+            - { name: apikey, mountPath: /etc/audit-loupe/neuvector, readOnly: true }
+            {{- if $c.neuvector.caSecret }}
+            - { name: nv-ca, mountPath: /etc/audit-loupe/neuvector-ca, readOnly: true }
+            {{- end }}
+            - { name: state, mountPath: /state }
+      volumes:
+        {{- include "al.collectorVolumes" . | nindent 8 }}
+        - name: apikey
+          secret:
+            secretName: {{ required "collector.neuvector.apiKeySecret is required" $c.neuvector.apiKeySecret }}
+            items: [{ key: apikey, path: apikey }]
+        {{- if $c.neuvector.caSecret }}
+        - name: nv-ca
+          secret: { secretName: {{ $c.neuvector.caSecret }}, items: [{ key: ca.crt, path: ca.crt }] }
+        {{- end }}
         - { name: state, emptyDir: {} }
 ---
 {{- end }}

@@ -1,6 +1,6 @@
 <script>
 import { identityChain, RULE_SEV } from '../lib/model';
-import { baseUrl } from '../lib/api';
+import { baseUrl, getJson } from '../lib/api';
 
 // Right column: every action on the selected object this day, then for the chosen one who
 // did it (identity chain), what it changed, and the related objects.
@@ -17,6 +17,17 @@ export default {
     related:  { type: Array, default: () => [] },
   },
   emits: ['pick', 'select'],
+
+  data() {
+    return { flagged: null };
+  },
+
+  watch: {
+    ev: {
+      immediate: true,
+      handler: 'loadFlagged',
+    },
+  },
 
   computed: {
     sorted() {
@@ -48,6 +59,31 @@ export default {
   },
 
   methods: {
+    // For an exec or attach: processes SUSE Security flagged in that pod afterwards.
+    async loadFlagged(ev) {
+      this.flagged = null;
+      const r = ev?.raw;
+
+      if (!r || r.resource !== 'pods' || !['exec', 'attach'].includes(r.subresource)) {
+        return;
+      }
+      try {
+        const rows = await getJson('/api/security', {
+          cluster: r.cluster, namespace: r.namespace, pod: r.name, from: new Date(ev.ts).toISOString()
+        });
+
+        if (this.ev === ev) {
+          this.flagged = rows;
+        }
+      } catch (e) {
+        this.flagged = null;
+      }
+    },
+    fmtTs(ms) {
+      const d = new Date(ms);
+
+      return `${ String(d.getHours()).padStart(2, '0') }:${ String(d.getMinutes()).padStart(2, '0') }:${ String(d.getSeconds()).padStart(2, '0') }`;
+    },
     sev(r) {
       return RULE_SEV[r] || 'low';
     },
@@ -130,6 +166,28 @@ export default {
           class="chain-note"
         >
           {{ chain.note }}
+        </p>
+      </div>
+
+      <div
+        v-if="flagged"
+        class="evidence"
+      >
+        <h3>{{ T.secTitle }}</h3>
+        <div
+          v-if="flagged.length"
+          class="diff"
+        >
+          <div
+            v-for="(f, i) in flagged"
+            :key="i"
+            class="ctx"
+          >
+            {{ fmtTs(f.tsMs) }} {{ f.process }}: {{ f.command }}（{{ f.parent }}）
+          </div>
+        </div>
+        <p class="chain-note">
+          {{ flagged.length ? T.secNote : T.secNone }}
         </p>
       </div>
 
