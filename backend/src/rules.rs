@@ -59,7 +59,9 @@ pub fn evaluate(r: &Record, cfg: &Config) -> Vec<Alert> {
     if r.via == Via::Direct && (write || matches!(r.subresource.as_str(), "exec" | "attach" | "portforward")) {
         out.push(Alert { rule: "bypassed_rancher", severity: "medium" });
     }
-    if write {
+    // With change windows configured, those decide (checked at ingest, where namespace
+    // labels are known); otherwise flag changes outside working hours.
+    if write && cfg.change_windows.is_empty() {
         let local = r.ts.with_timezone(&cfg.tz);
         let day = local.weekday().number_from_monday();
         let hour = local.hour();

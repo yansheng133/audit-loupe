@@ -71,6 +71,9 @@ spec:
             - { name: AL_WORK_HOURS, value: {{ .Values.server.workHours | quote }} }
             - { name: AL_WORK_DAYS, value: {{ .Values.server.workDays | quote }} }
             - { name: AL_RETENTION_DAYS, value: {{ .Values.server.retentionDays | quote }} }
+            {{- with .Values.server.changeWindows }}
+            - { name: AL_CHANGE_WINDOWS, value: {{ toJson . | quote }} }
+            {{- end }}
             {{- with .Values.server.forward }}
             {{- if .syslog }}
             - { name: AL_FORWARD_SYSLOG, value: {{ .syslog | quote }} }

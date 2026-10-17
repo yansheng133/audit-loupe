@@ -53,12 +53,24 @@ async fn ingest(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> R
         "k8s-object" => return ingest_objects(s, cluster, &body).await,
         _ => return (StatusCode::BAD_REQUEST, format!("unsupported source {source:?}")).into_response(),
     };
-    let batch: Vec<_> = records.into_iter().map(|r| {
-        let a = evaluate(&r, &s.cfg);
-        (r, a)
-    }).collect();
     let store = s.store.clone();
-    match tokio::task::spawn_blocking(move || store.insert_events(&cluster, &batch)).await {
+    let cfg = s.cfg.clone();
+    let work = move || -> anyhow::Result<usize> {
+        let mut batch = Vec::with_capacity(records.len());
+        for r in records {
+            let mut a = evaluate(&r, &cfg);
+            if !cfg.change_windows.is_empty() && r.human && crate::audit::is_write(&r.verb) && (200..300).contains(&r.code) {
+                let cl = r.cluster.clone().unwrap_or_else(|| cluster.clone());
+                let labels = if r.namespace.is_empty() { None } else { store.namespace_labels(&cl, &r.namespace)? };
+                if crate::windows::allowed(&cfg.change_windows, &cl, labels.as_ref(), r.ts, &cfg.tz) == Some(false) {
+                    a.push(crate::rules::Alert { rule: "outside_change_window", severity: "medium" });
+                }
+            }
+            batch.push((r, a));
+        }
+        store.insert_events(&cluster, &batch)
+    };
+    match tokio::task::spawn_blocking(work).await {
         Ok(Ok(stored)) => Json(json!({"received": received, "skipped": skipped, "stored": stored})).into_response(),
         Ok(Err(e)) => err(e),
         Err(e) => err(e.into()),
@@ -400,6 +412,7 @@ async fn info(State(s): State<AppState>) -> Json<serde_json::Value> {
         "timezone": s.cfg.tz.name(),
         "workHours": format!("{}-{}", s.cfg.work_start_hour, s.cfg.work_end_hour),
         "retentionDays": s.cfg.retention_days,
+        "changeWindows": s.cfg.change_windows.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(),
     }))
 }
 
@@ -499,6 +512,19 @@ mod tests {
         assert_eq!(code, StatusCode::OK, "{body}");
         let rows = st.store.timeline(&Query { cluster: None, actor: None, from_ms: 0, to_ms: i64::MAX, humans_only: false, writes_only: false, alerts_only: false, limit: 10 }).unwrap();
         assert_eq!((rows[0].cluster.as_str(), rows[0].source.as_str()), ("c-m-1", "rancher"), "the target cluster comes from the URI");
+    }
+
+    #[tokio::test]
+    async fn changes_outside_a_window_are_flagged() {
+        let mut cfg = Config::test();
+        cfg.change_windows = crate::windows::parse(r#"[{"name":"w","days":"6","hours":"0-24"}]"#).unwrap();
+        let st = AppState { store: Store::open(":memory:").unwrap(), cfg: Arc::new(cfg) };
+        // A Thursday: the only window is Saturdays.
+        let (code, _) = post(ingest_router(st.clone()), Some("test-token"), "k8s-audit", LINE.into(), false).await;
+        assert_eq!(code, StatusCode::OK);
+        let rows = st.store.timeline(&Query { cluster: None, actor: None, from_ms: 0, to_ms: i64::MAX, humans_only: false, writes_only: false, alerts_only: false, limit: 10 }).unwrap();
+        assert!(rows[0].alerts.contains(&"outside_change_window".to_string()), "{:?}", rows[0].alerts);
+        assert!(!rows[0].alerts.contains(&"off_hours".to_string()), "windows replace the working-hours rule");
     }
 
     #[tokio::test]

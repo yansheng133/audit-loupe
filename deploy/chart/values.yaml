@@ -24,6 +24,17 @@ server:
   workHours: "9-18"
   workDays: "1-5"
   retentionDays: 30
+  # Approved change windows. When set, a person's change outside every window covering the
+  # object is flagged (and the working-hours rule is off). Empty clusters or labels = all.
+  #  - name: prod-nightly
+  #    clusters: [c-m-xxxxx]
+  #    namespaceLabels: { env: prod }
+  #    days: "1-5"        # ISO weekdays, Monday = 1
+  #    hours: "22-2"      # server.timezone; may wrap past midnight
+  #  - name: CHG-1234     # a one-off window
+  #    clusters: [c-m-xxxxx]
+  #    ranges: [{ from: "2026-10-20T22:00:00+08:00", to: "2026-10-21T02:00:00+08:00" }]
+  changeWindows: []
   persistence:
     # SQLite on a volume. Empty storageClass uses the cluster default; RKE2 ships none.
     storageClass: ""

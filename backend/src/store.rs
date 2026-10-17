@@ -1422,6 +1422,21 @@ impl Store {
         Ok(rows)
     }
 
+    /// Labels of a namespace as last seen.
+    pub fn namespace_labels(&self, cluster: &str, ns: &str) -> anyhow::Result<Option<serde_json::Map<String, Value>>> {
+        let c = self.conn.lock().unwrap();
+        let body: Option<String> = c
+            .query_row(
+                "SELECT body FROM versions WHERE cluster=?1 AND api_group='' AND resource='namespaces' AND name=?2 ORDER BY id DESC LIMIT 1",
+                params![cluster, ns],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(body
+            .and_then(|b| serde_json::from_str::<Value>(&b).ok())
+            .and_then(|v| v.pointer("/metadata/labels").and_then(Value::as_object).cloned()))
+    }
+
     /// Namespace -> Rancher project ID, from the `field.cattle.io/projectId` label of each
     /// namespace's latest version.
     pub fn namespace_projects(&self, cluster: Option<&str>) -> anyhow::Result<Vec<(String, String, String)>> {

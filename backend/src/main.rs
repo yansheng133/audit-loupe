@@ -12,6 +12,7 @@ mod relations;
 mod rules;
 mod store;
 mod watch;
+mod windows;
 
 use std::sync::Arc;
 use std::time::Duration;

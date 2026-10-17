@@ -20,6 +20,8 @@ pub struct Config {
     /// The cluster Rancher runs in. Only its token may send Rancher API audit records, since
     /// those can name any downstream cluster as their target.
     pub rancher_cluster: String,
+    /// Approved change windows; when set they replace the working-hours rule.
+    pub change_windows: Vec<crate::windows::Window>,
 }
 
 fn var(name: &str, default: &str) -> String {
@@ -116,6 +118,7 @@ impl Config {
             retention_days: var("AL_RETENTION_DAYS", "30").parse().unwrap_or(30),
             ingest_tokens: load_tokens(&var("AL_INGEST_TOKENS_FILE", "/etc/audit-loupe/tokens/tokens"))?,
             rancher_cluster: var("AL_RANCHER_CLUSTER", "local"),
+            change_windows: crate::windows::parse(&env::var("AL_CHANGE_WINDOWS").unwrap_or_default()).map_err(|e| anyhow::anyhow!("AL_CHANGE_WINDOWS: {e}"))?,
         })
     }
 
@@ -137,6 +140,7 @@ impl Config {
                 ("local".into(), crate::config::hash_token("rancher-token")),
             ],
             rancher_cluster: "local".into(),
+            change_windows: vec![],
         }
     }
 }
