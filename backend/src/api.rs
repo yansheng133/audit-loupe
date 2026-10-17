@@ -39,21 +39,27 @@ async fn ingest(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> R
         return StatusCode::UNAUTHORIZED.into_response();
     };
     let source = headers.get("x-audit-loupe-source").and_then(|v| v.to_str().ok()).unwrap_or("");
-    if source != "k8s-audit" {
-        return (StatusCode::BAD_REQUEST, format!("unsupported source {source:?}")).into_response();
-    }
-    let events = match parse_body(&body) {
-        Ok(e) => e,
-        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    let (records, received, skipped) = match source {
+        "k8s-audit" => match parse_body(&body) {
+            Ok(evs) => (evs.iter().filter_map(to_record).collect::<Vec<_>>(), evs.len(), 0),
+            Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        },
+        "rancher-audit" if cluster == s.cfg.rancher_cluster => {
+            let (entries, bad) = crate::rancher::parse_lines(&body);
+            (entries.iter().filter_map(crate::rancher::to_record).collect(), entries.len() + bad, bad)
+        }
+        "rancher-audit" => {
+            return (StatusCode::FORBIDDEN, "only the Rancher cluster's collector may send Rancher records").into_response();
+        }
+        _ => return (StatusCode::BAD_REQUEST, format!("unsupported source {source:?}")).into_response(),
     };
-    let batch: Vec<_> = events.iter().filter_map(to_record).map(|r| {
+    let batch: Vec<_> = records.into_iter().map(|r| {
         let a = evaluate(&r, &s.cfg);
         (r, a)
     }).collect();
-    let received = events.len();
     let store = s.store.clone();
     match tokio::task::spawn_blocking(move || store.insert_events(&cluster, &batch)).await {
-        Ok(Ok(stored)) => Json(json!({"received": received, "stored": stored})).into_response(),
+        Ok(Ok(stored)) => Json(json!({"received": received, "skipped": skipped, "stored": stored})).into_response(),
         Ok(Err(e)) => err(e),
         Err(e) => err(e.into()),
     }
@@ -246,6 +252,20 @@ mod tests {
         assert_eq!(code, StatusCode::UNAUTHORIZED);
         let (code, _) = post(ingest_router(state()), Some("test-token"), "syslog", LINE.into(), false).await;
         assert_eq!(code, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn rancher_records_only_from_the_rancher_cluster() {
+        let st = state();
+        let line = r#"{"auditID":"r1","requestURI":"/k8s/clusters/c-m-1/api/v1/namespaces/legacy","method":"DELETE",
+          "user":{"name":"u-1","extra":{"username":["alice"]}},"responseCode":200,"responseTimestamp":"2026-10-15T13:40:00Z"}"#;
+        let line = line.replace('\n', " ");
+        let (code, _) = post(ingest_router(st.clone()), Some("test-token"), "rancher-audit", line.clone().into(), false).await;
+        assert_eq!(code, StatusCode::FORBIDDEN);
+        let (code, body) = post(ingest_router(st.clone()), Some("rancher-token"), "rancher-audit", line.into(), false).await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        let rows = st.store.timeline(&Query { cluster: None, actor: None, from_ms: 0, to_ms: i64::MAX, humans_only: false, writes_only: false, alerts_only: false, limit: 10 }).unwrap();
+        assert_eq!((rows[0].cluster.as_str(), rows[0].source.as_str()), ("c-m-1", "rancher"), "the target cluster comes from the URI");
     }
 
     #[tokio::test]

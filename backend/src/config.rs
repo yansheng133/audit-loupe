@@ -20,6 +20,9 @@ pub struct Config {
     /// One entry per cluster allowed to push: (cluster id, sha256 of its token).
     /// The cluster a batch belongs to is decided by which token it carries.
     pub ingest_tokens: Vec<(String, [u8; 32])>,
+    /// The cluster Rancher runs in. Only its token may send Rancher API audit records, since
+    /// those can name any downstream cluster as their target.
+    pub rancher_cluster: String,
 }
 
 pub const DEFAULT_WATCH: &str = "apps/v1/deployments,apps/v1/statefulsets,apps/v1/daemonsets,\
@@ -126,8 +129,9 @@ impl Config {
             work_start_hour: start,
             work_end_hour: end,
             work_days: range(&var("AL_WORK_DAYS", "1-5")),
-            retention_days: var("AL_RETENTION_DAYS", "90").parse().unwrap_or(90),
+            retention_days: var("AL_RETENTION_DAYS", "30").parse().unwrap_or(30),
             ingest_tokens: load_tokens(&var("AL_INGEST_TOKENS_FILE", "/etc/audit-loupe/tokens/tokens"))?,
+            rancher_cluster: var("AL_RANCHER_CLUSTER", "local"),
         })
     }
 
@@ -146,7 +150,11 @@ impl Config {
             work_end_hour: 18,
             work_days: vec![1, 2, 3, 4, 5],
             retention_days: 90,
-            ingest_tokens: vec![("test".into(), crate::config::hash_token("test-token"))],
+            ingest_tokens: vec![
+                ("test".into(), crate::config::hash_token("test-token")),
+                ("local".into(), crate::config::hash_token("rancher-token")),
+            ],
+            rancher_cluster: "local".into(),
         }
     }
 }

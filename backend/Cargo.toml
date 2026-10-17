@@ -20,6 +20,7 @@ tokio = { version = "1.53.3", features = ["full"] }
 tower-http = { version = "0.7.1", features = ["cors", "trace", "decompression-gzip"] }
 tracing = "0.1.44"
 flate2 = "1"
+jiff = { version = "0.2.16", default-features = false, features = ["std"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 

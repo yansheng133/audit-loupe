@@ -69,6 +69,8 @@ flowchart LR
 - **入口**：後端以 Ingress 或 LoadBalancer 開 HTTPS 入口，TLS 憑證由 cert-manager 簽發或使用者自備。
 - **每座叢集一把 token**：後端依 token 判斷資料來自哪座叢集，不採信收集元件自己報的叢集名稱。停用或更換某座叢集的 token，不影響其他叢集。之後可加 mTLS。
 - **批次送出**：收集元件攢成一批、壓縮後送出，收到後端確認才把「讀到的位置」往前記。後端暫時無法連線時，資料留在原本的 log 檔，恢復後補送。
+- **`collect-rancher` 的讀法**：每 15 秒列出 `cattle-system` 裡 `app=rancher` 的 Pod，每個 Pod 一條連線跟讀 `rancher-audit-log` 容器的輸出（帶 kubelet 時間戳）。每個 Pod 以 UID 記「後端已確認到哪個時間」，連線中斷或收集元件重啟後，從那個時間前一秒接著讀（`sinceTime` 只到秒），重疊的部分由後端以 `auditID` 排除。Pod 被刪除時，還沒讀到的部分會跟著消失，畫面標為收集中斷。
+- **只收 Rancher 叢集送來的 Rancher 紀錄**：Rancher 紀錄可以指名任何下游叢集（URI 裡的叢集 ID），所以只接受 Rancher 所在叢集（預設 `local`）那把 token 送來的 Rancher 紀錄。
 - **排除重複**：Rancher 紀錄以 `auditID` 判斷，下游 apiserver 紀錄以 `auditID` 判斷，物件版本以 UID 加 resourceVersion 判斷；收過的不重複寫入。
 - **網路需求**：每座下游叢集要能連到後端的入口，部署說明會列出這條防火牆規則。
 
@@ -96,6 +98,12 @@ flowchart LR
 - 改 `auditLog.*` Helm 值會改到 Pod template，Rancher Pod 會滾動重建（從 chart 推論，待 lab 驗證）。
 - 經 `/k8s/clusters/...` 轉送到下游的請求也會記錄（原始碼確認，文件未明寫）。
 - **例外**：exec、attach、port-forward、介面上的 shell 這類升級成長連線的請求不會記錄（原始碼確認，待 lab 驗證）。這類操作只能由下游 apiserver audit log 取得。
+- 以下幾點從 Rancher 原始碼（`pkg/auth/audit`）確認，寫解析程式時要配合：
+  - 紀錄沒有動詞與物件欄位，要從 HTTP method 與 `requestURI` 推出來。URI 有四種：經 Rancher 轉送的 Kubernetes API（`/k8s/clusters/<叢集 ID>/api|apis/...`）、Steve（`/v1/<型別>/...`，Rancher 介面用的 API）、Norman（`/v3/<型別>/<ID>?action=...`，使用者、權限綁定、token 這類管理物件）、登入（`/v3-public/...?action=login`）。
+  - 時間只到秒（`time.RFC3339`），而且是 Rancher Pod 的時區。對應下游紀錄時要把這一秒的誤差算進去（見第 4 節）。
+  - request body 只在 PUT、POST 且 level 2 以上才記；PATCH 的內容不會出現在 Rancher 紀錄裡，改了什麼要靠下游紀錄或物件版本。
+  - 較新的原始碼多了 `user.identity`（username、provider、principalId）與 `user.impersonatedBy`，由 `audit-log-username` 功能開關控制。Rancher 在寫入當下用使用者 ID 查名字填進去，使用者已刪除就查不到。Audit Loupe 有這個欄位就用，沒有就退回 `user.extra`。哪個 Rancher 版本開始有、預設是否開啟，待查證。
+  - 本機登入的紀錄有 `userLoginName`（登入表單上打的帳號），登入失敗時 `user.name` 是 `system:unauthenticated`，要靠這個欄位才知道是誰在試。
 
 ### 3.2 RKE2 apiserver audit log
 
@@ -115,9 +123,9 @@ flowchart LR
 1. Rancher 紀錄：`requestURI` 以 `/k8s/clusters/<叢集 ID>/` 開頭，`user.name` 是 `u-xxxxx`。
 2. 下游 apiserver 紀錄：`user.username` 是 `system:serviceaccount:cattle-impersonation-system:cattle-impersonation-u-xxxxx`，`impersonatedUser` 帶著真正的使用者，`extra.username`、`extra.principalid` 是 IdP 帳號。
 
-對應條件：同一座叢集、同一個 Rancher 使用者 ID、同一個物件與動詞，時間相差 2 秒內。對到的合成一列，畫面上的身分鏈顯示：IdP 帳號 → Rancher（介面或 kubectl）→ 代為執行的帳號 → 下游 apiserver。
+對應條件：同一座叢集、同一個 Rancher 使用者 ID、同一個物件與動詞，時間相差 2 秒內。Rancher 紀錄只到秒，而且記的是回應時間（晚於下游完成時間），實作上接受 Rancher 時間減下游時間在 -2 秒到 +3 秒之間，取最接近的一筆，一對一配對。哪一邊先到都可以，寫入時就配好。對到的合成一列（畫面與統計只算下游那一筆，Rancher 那一筆提供用戶端位址與 User-Agent，用來分辨介面或 kubectl），畫面上的身分鏈顯示：IdP 帳號 → Rancher（介面或 kubectl）→ 代為執行的帳號 → 下游 apiserver。
 
-只有下游紀錄、沒有 Rancher 紀錄的操作（例如用節點上的管理者憑證），標為「繞過 Rancher」。
+只有下游紀錄、沒有 Rancher 紀錄的操作（例如用節點上的管理者憑證），標為「繞過 Rancher」。只有 Rancher 紀錄、對不到下游紀錄的操作（下游沒開 audit），涵蓋度標為「經 Rancher 的操作」。
 
 ### 4.1 使用者被刪除之後
 
@@ -185,7 +193,9 @@ lab 實測時要量：每座叢集每秒幾筆、過濾前後差多少、每天�
 6. 四種情境在畫面上是否正確：經 Rancher 介面、經 Rancher kubectl、用節點管理者憑證繞過 Rancher、收集元件中斷。
 7. 過濾前後的紀錄量與儲存空間。
 8. UI extension 整頁版面。
-9. 經 ACE（Authorized Cluster Endpoint）直連下游時，下游紀錄是否帶 IdP 欄位；刪除使用者後 Rancher 自動清除了哪些物件；被刪除的 `u-xxxxx` 是否可能被重新使用。
+9. Steve URI 的實際形式：型別名稱是複數（`apps.deployments`）還是單數；兩段路徑（`/v1/<型別>/<x>`）在新增、修改、刪除時的意義。
+10. `user.identity` 欄位從哪個 Rancher 版本開始有、`audit-log-username` 預設是否開啟。
+11. 經 ACE（Authorized Cluster Endpoint）直連下游時，下游紀錄是否帶 IdP 欄位；刪除使用者後 Rancher 自動清除了哪些物件；被刪除的 `u-xxxxx` 是否可能被重新使用。
 
 ## 9. 分階段
 

@@ -1,5 +1,8 @@
 //! Collectors: read audit records where they are written and push them to the server.
 //!
+//! `collect-rancher` follows the Rancher API audit log through the Kubernetes log API of each
+//! Rancher pod's `rancher-audit-log` sidecar, which copies the log file to its output.
+//!
 //! `collect-file` follows the kube-apiserver audit log on an RKE2 control-plane node.
 //! It remembers how far it has read (inode + byte offset) in a small state file, so a
 //! restart resumes where it stopped, and it only moves that position forward after the
@@ -7,11 +10,17 @@
 //! (found again by its inode) before switching to the new one.
 
 use anyhow::Context;
+use chrono::{DateTime, Utc};
+use futures::{AsyncBufReadExt, TryStreamExt};
+use k8s_openapi::api::core::v1::Pod;
+use kube::api::{Api, ListParams, LogParams};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -213,9 +222,188 @@ pub async fn run_file() -> anyhow::Result<()> {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// collect-rancher
+// ---------------------------------------------------------------------------------------
+
+/// How far each Rancher pod's log has been delivered: pod UID -> kubelet time of the last
+/// line the server acknowledged. A new pod has a new UID and is read from its start.
+type Positions = HashMap<String, DateTime<Utc>>;
+
+fn load_positions(path: &Path) -> Positions {
+    fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+fn save_positions(path: &Path, p: &Positions) -> anyhow::Result<()> {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, serde_json::to_vec(p)?)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// With `timestamps=true` every line starts with the kubelet's RFC3339Nano time and a space.
+pub fn split_timestamp(line: &str) -> Option<(DateTime<Utc>, &str)> {
+    let (ts, rest) = line.split_once(' ')?;
+    Some((DateTime::parse_from_rfc3339(ts).ok()?.with_timezone(&Utc), rest))
+}
+
+struct Line {
+    pod: String,
+    ts: DateTime<Utc>,
+    text: String,
+}
+
+/// Follow one pod's sidecar output until the stream ends (container restart, pod gone).
+async fn follow_pod(pods: Api<Pod>, name: String, uid: String, container: String, since: Option<DateTime<Utc>>, tx: tokio::sync::mpsc::Sender<Line>) -> anyhow::Result<()> {
+    // sinceTime goes out rounded to the second, so start a second early and drop what was
+    // already delivered here. Lines with the same time as the position are sent again;
+    // the server keeps one copy per auditID.
+    let lp = LogParams {
+        container: Some(container),
+        follow: true,
+        timestamps: true,
+        since_time: since.map(|t| jiff::Timestamp::from_second(t.timestamp() - 1)).transpose()?,
+        ..Default::default()
+    };
+    let mut lines = pods.log_stream(&name, &lp).await?.lines();
+    while let Some(line) = lines.try_next().await? {
+        let Some((ts, text)) = split_timestamp(&line) else { continue };
+        if since.is_some_and(|s| ts < s) {
+            continue;
+        }
+        // The sidecar is `tail -F`; its own notices ("file truncated") are not entries.
+        if !text.trim_start().starts_with('{') {
+            continue;
+        }
+        tx.send(Line { pod: uid.clone(), ts, text: text.to_string() }).await?;
+    }
+    Ok(())
+}
+
+/// Collect lines into batches (up to MAX_BATCH, or 2 s after the first line), send each until
+/// the server accepts it, then record the new positions. While a batch is being retried the
+/// channel fills up and the followers wait, so nothing is dropped.
+async fn send_batches(mut rx: tokio::sync::mpsc::Receiver<Line>, sender: Sender, positions: Arc<Mutex<Positions>>, state: PathBuf) {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut marks: Positions = HashMap::new();
+    let add = |l: Line, buf: &mut Vec<u8>, marks: &mut Positions| {
+        buf.extend_from_slice(l.text.as_bytes());
+        buf.push(b'\n');
+        let m = marks.entry(l.pod).or_insert(l.ts);
+        *m = (*m).max(l.ts);
+    };
+    loop {
+        let Some(first) = rx.recv().await else { return };
+        add(first, &mut buf, &mut marks);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while buf.len() < MAX_BATCH {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(l)) => add(l, &mut buf, &mut marks),
+                _ => break,
+            }
+        }
+        let mut backoff = 1u64;
+        while let Err(e) = sender.send(&buf).await {
+            warn!(error = %e, retry_in = backoff, "send failed; will resend the same lines");
+            tokio::time::sleep(Duration::from_secs(backoff)).await;
+            backoff = (backoff * 2).min(60);
+        }
+        let snapshot = {
+            let mut p = positions.lock().unwrap();
+            for (pod, ts) in marks.drain() {
+                let e = p.entry(pod).or_insert(ts);
+                *e = (*e).max(ts);
+            }
+            p.clone()
+        };
+        if let Err(e) = save_positions(&state, &snapshot) {
+            warn!(error = %e, "could not save positions; a restart will resend some lines");
+        }
+        buf.clear();
+    }
+}
+
+fn container_running(pod: &Pod, container: &str) -> bool {
+    pod.status
+        .as_ref()
+        .and_then(|s| s.container_statuses.as_ref())
+        .is_some_and(|cs| cs.iter().any(|c| c.name == container && c.state.as_ref().is_some_and(|st| st.running.is_some())))
+}
+
+/// Find the Rancher pods every 15 s and keep one follower per pod.
+pub async fn run_rancher() -> anyhow::Result<()> {
+    let sender = Sender::from_env("rancher-audit")?;
+    let ns = env_or("AL_RANCHER_NAMESPACE", "cattle-system");
+    let selector = env_or("AL_RANCHER_SELECTOR", "app=rancher");
+    let container = env_or("AL_RANCHER_CONTAINER", "rancher-audit-log");
+    let state_dir = PathBuf::from(env_or("AL_STATE_DIR", "/var/lib/audit-loupe"));
+    fs::create_dir_all(&state_dir)?;
+    let state = state_dir.join("rancher-positions.json");
+    let positions = Arc::new(Mutex::new(load_positions(&state)));
+    let pods: Api<Pod> = Api::namespaced(kube::Client::try_default().await?, &ns);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Line>(4096);
+    tokio::spawn(send_batches(rx, sender, positions.clone(), state));
+    let following: Arc<Mutex<HashSet<String>>> = Default::default();
+    info!(namespace = %ns, selector = %selector, container = %container, "following the Rancher audit log");
+    let mut warned = false;
+    loop {
+        match pods.list(&ListParams::default().labels(&selector)).await {
+            Err(e) => warn!(error = %e, "listing Rancher pods failed"),
+            Ok(list) => {
+                let mut seen = HashSet::new();
+                for pod in list.items {
+                    let (Some(name), Some(uid)) = (pod.metadata.name.clone(), pod.metadata.uid.clone()) else { continue };
+                    seen.insert(uid.clone());
+                    if !container_running(&pod, &container) {
+                        if !warned {
+                            warn!(pod = %name, container = %container, "no running audit sidecar; is auditLog.enabled set on Rancher?");
+                            warned = true;
+                        }
+                        continue;
+                    }
+                    if !following.lock().unwrap().insert(uid.clone()) {
+                        continue;
+                    }
+                    let since = positions.lock().unwrap().get(&uid).copied();
+                    info!(pod = %name, ?since, "following");
+                    let (pods, tx, following, container) = (pods.clone(), tx.clone(), following.clone(), container.clone());
+                    tokio::spawn(async move {
+                        if let Err(e) = follow_pod(pods, name.clone(), uid.clone(), container, since, tx).await {
+                            warn!(pod = %name, error = %e, "log stream ended");
+                        }
+                        following.lock().unwrap().remove(&uid);
+                    });
+                }
+                // Forget pods that are gone; their logs went with them.
+                positions.lock().unwrap().retain(|uid, _| seen.contains(uid));
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(15)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kubelet_timestamps_are_split_off() {
+        let (ts, rest) = split_timestamp("2026-10-17T01:02:03.123456789Z {\"auditID\":\"a\"}").unwrap();
+        assert_eq!(ts.timestamp_subsec_nanos(), 123_456_789);
+        assert_eq!(rest, "{\"auditID\":\"a\"}");
+        assert!(split_timestamp("tail: file truncated").is_none());
+    }
+
+    #[test]
+    fn positions_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("rancher-positions.json");
+        assert!(load_positions(&p).is_empty());
+        let mut m = Positions::new();
+        m.insert("uid-1".into(), "2026-10-17T01:02:03.5Z".parse().unwrap());
+        save_positions(&p, &m).unwrap();
+        assert_eq!(load_positions(&p), m);
+    }
 
     #[test]
     fn partial_last_line_waits() {

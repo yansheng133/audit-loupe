@@ -95,15 +95,42 @@ impl Via {
     }
 }
 
+/// Which log a record came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Source {
+    /// A kube-apiserver audit log (audit.k8s.io/v1).
+    K8s,
+    /// The Rancher API audit log.
+    Rancher,
+}
+
+impl Source {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Source::K8s => "k8s",
+            Source::Rancher => "rancher",
+        }
+    }
+}
+
 /// One audit event reduced to what the UI needs.
 #[derive(Debug, Clone, Serialize)]
 pub struct Record {
     pub audit_id: String,
+    pub source: Source,
+    /// The cluster the action was aimed at, when the record says so itself (Rancher records of
+    /// requests proxied to `/k8s/clusters/<id>/`). Otherwise the collector's cluster is used.
+    pub cluster: Option<String>,
     pub ts: DateTime<Utc>,
     /// The person (or system component) the action is attributed to.
     pub actor: String,
     /// Identity-provider principal, when Rancher passes one along.
     pub principal: String,
+    /// Rancher user ID (`u-xxxxx` or `user-xxxxx`) when the person is a Rancher user. It is the
+    /// key for matching a Rancher record to the downstream record of the same action, and for
+    /// the user directory; the actor name is only a snapshot for display.
+    pub user_id: String,
     pub human: bool,
     pub via: Via,
     /// The account that actually called the API server.
@@ -128,7 +155,7 @@ const RANCHER_IMPERSONATOR: &str = "system:serviceaccount:cattle-impersonation-s
 const RANCHER_AGENT: &str = "system:serviceaccount:cattle-system:cattle";
 
 /// Rancher user IDs look like `u-xxxxx` (local and external users) or `user-xxxxx` (admin).
-fn is_rancher_user_id(name: &str) -> bool {
+pub fn is_rancher_user_id(name: &str) -> bool {
     name.starts_with("u-") || name.starts_with("user-")
 }
 
@@ -157,7 +184,7 @@ pub fn to_record(ev: &Event) -> Option<Record> {
     if ev.verb == "watch" {
         return None;
     }
-    let (actor, principal, via) = match &ev.impersonated_user {
+    let (actor, principal, via, user_id) = match &ev.impersonated_user {
         Some(imp) => {
             let actor = first(&imp.extra, "username").unwrap_or_else(|| imp.username.clone());
             let principal = first(&imp.extra, "principalid").unwrap_or_else(|| imp.username.clone());
@@ -169,10 +196,16 @@ pub fn to_record(ev: &Event) -> Option<Record> {
             } else {
                 Via::Impersonation
             };
-            (actor, principal, via)
+            let user_id = if is_rancher_user_id(&imp.username) { imp.username.clone() } else { String::new() };
+            (actor, principal, via, user_id)
         }
-        None if is_rancher_user_id(&ev.user.username) => (ev.user.username.clone(), String::new(), Via::Ace),
-        None => (ev.user.username.clone(), String::new(), Via::Direct),
+        None if is_rancher_user_id(&ev.user.username) => {
+            let u = &ev.user;
+            let actor = first(&u.extra, "username").unwrap_or_else(|| u.username.clone());
+            let principal = first(&u.extra, "principalid").unwrap_or_default();
+            (actor, principal, Via::Ace, u.username.clone())
+        }
+        None => (ev.user.username.clone(), String::new(), Via::Direct, String::new()),
     };
     let human = match ev.impersonated_user {
         Some(ref imp) => is_human(&imp.username),
@@ -183,9 +216,12 @@ pub fn to_record(ev: &Event) -> Option<Record> {
     let namespace = if o.resource == "namespaces" && o.api_group.is_empty() { String::new() } else { o.namespace };
     Some(Record {
         audit_id: ev.audit_id.clone(),
+        source: Source::K8s,
+        cluster: None,
         ts,
         actor,
         principal,
+        user_id,
         human,
         via,
         caller: ev.user.username.clone(),
@@ -252,6 +288,7 @@ mod tests {
         let r = to_record(&evs[0]).unwrap();
         assert_eq!(r.actor, "alice");
         assert_eq!(r.principal, "openldap_user://uid=alice,ou=people");
+        assert_eq!(r.user_id, "u-abc12");
         assert_eq!(r.via, Via::Rancher);
         assert!(r.human);
         assert_eq!(r.code, 200);
@@ -296,7 +333,7 @@ mod tests {
           "objectRef":{"resource":"deployments","namespace":"shop","name":"web","apiGroup":"apps"},
           "responseStatus":{"code":200},"stageTimestamp":"2026-10-14T02:00:00Z"}"#;
         let r = to_record(&parse_body(ace.as_bytes()).unwrap()[0]).unwrap();
-        assert_eq!(r.via, Via::Ace);
+        assert_eq!((r.via, r.user_id.as_str()), (Via::Ace, "u-abc12"));
     }
 
     #[test]

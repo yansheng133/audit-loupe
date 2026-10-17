@@ -4,6 +4,7 @@ mod collect;
 mod config;
 mod demo;
 mod diff;
+mod rancher;
 mod rules;
 mod store;
 mod watch;
@@ -21,7 +22,8 @@ async fn main() -> anyhow::Result<()> {
     match cmd.as_str() {
         "server" | "seed-demo" => {}
         "collect-file" => return collect::run_file().await,
-        other => anyhow::bail!("unknown command {other:?}; use server, collect-file or seed-demo"),
+        "collect-rancher" => return collect::run_rancher().await,
+        other => anyhow::bail!("unknown command {other:?}; use server, collect-file, collect-rancher or seed-demo"),
     }
     let cfg = Arc::new(config::Config::from_env()?);
     let store = store::Store::open(&cfg.db_path)?;

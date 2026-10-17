@@ -1,10 +1,10 @@
 //! SQLite storage for audit records, object versions and alerts.
 
-use crate::audit::Record;
+use crate::audit::{Record, Source, Via};
 use crate::diff::{diff, normalize, Change};
 use crate::rules::Alert;
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS events (
   verb TEXT NOT NULL, api_group TEXT NOT NULL, resource TEXT NOT NULL, subresource TEXT NOT NULL,
   namespace TEXT NOT NULL, name TEXT NOT NULL, code INTEGER NOT NULL,
   source_ip TEXT NOT NULL, user_agent TEXT NOT NULL, request_uri TEXT NOT NULL, request_object TEXT,
+  source TEXT NOT NULL DEFAULT 'k8s', user_id TEXT NOT NULL DEFAULT '', link_id INTEGER,
   UNIQUE(cluster, audit_id)
 );
 CREATE INDEX IF NOT EXISTS events_ts ON events(ts_ms);
@@ -52,6 +53,24 @@ CREATE INDEX IF NOT EXISTS versions_event ON versions(event_id);
 /// - baseline: first time this tool saw the object
 /// - added / modified / deleting / deleted: seen live by the watch
 /// - added_unseen / modified_unseen: found on a re-list after a gap (restart, lost watch)
+/// Columns added after the first release, for databases created before them.
+const ADDED_COLUMNS: &[(&str, &str)] = &[
+    ("source", "TEXT NOT NULL DEFAULT 'k8s'"),
+    ("user_id", "TEXT NOT NULL DEFAULT ''"),
+    ("link_id", "INTEGER"),
+];
+
+/// A Rancher record that was matched to the downstream record of the same action is shown
+/// through that downstream record; this hides the Rancher half so nothing is counted twice.
+const SHOWN: &str = "NOT (e.source='rancher' AND e.link_id IS NOT NULL)";
+
+/// Window for matching a Rancher record to the downstream record of the same action, as
+/// (Rancher time - downstream time). Rancher stamps the response time to the whole second,
+/// after the downstream call returned, so the difference is within -1 s .. +2 s; one more
+/// second each way allows for clock differences between nodes.
+const PAIR_MIN_MS: i64 = -2_000;
+const PAIR_MAX_MS: i64 = 3_000;
+
 pub const LINKABLE: &str = "('added','modified','deleting','deleted','added_unseen','modified_unseen')";
 
 /// Identifies one Kubernetes object.
@@ -64,10 +83,24 @@ pub struct ObjKey {
     pub name: String,
 }
 
+/// The Rancher half of an action, when it was matched to the downstream record.
+#[derive(Debug, Serialize)]
+pub struct RancherSide {
+    pub ts: String,
+    pub user_agent: String,
+    pub source_ip: String,
+    pub request_uri: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct EventRow {
     pub id: i64,
     pub cluster: String,
+    /// "k8s" or "rancher".
+    pub source: String,
+    pub user_id: String,
+    /// For a downstream record: the matching Rancher record (UI or kubectl, client address).
+    pub rancher: Option<RancherSide>,
     pub ts: String,
     pub actor: String,
     pub principal: String,
@@ -161,28 +194,78 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
+        let have: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('events')")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        for (col, ddl) in ADDED_COLUMNS {
+            if !have.iter().any(|h| h == col) {
+                conn.execute_batch(&format!("ALTER TABLE events ADD COLUMN {col} {ddl}"))?;
+            }
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS events_pair ON events(cluster, user_id, source, ts_ms);
+             CREATE INDEX IF NOT EXISTS events_link ON events(link_id);",
+        )?;
         Ok(Store { conn: Arc::new(Mutex::new(conn)) })
     }
 
-    /// Insert a batch in one transaction. Returns how many were new
-    /// (the webhook can resend batches, and exec sessions arrive twice).
+    /// Match a newly stored record to the other half of the same action: the Rancher record
+    /// of a request Rancher proxied, and the downstream record of it (impersonated). Either
+    /// can arrive first. Returns whether a match was made.
+    fn pair(tx: &Transaction, id: i64, cluster: &str, r: &Record) -> anyhow::Result<bool> {
+        if r.user_id.is_empty() || r.via != Via::Rancher {
+            return Ok(false);
+        }
+        let t = ms(&r.ts);
+        let (other, lo, hi) = match r.source {
+            Source::K8s => ("rancher", t + PAIR_MIN_MS, t + PAIR_MAX_MS),
+            Source::Rancher => ("k8s", t - PAIR_MAX_MS, t - PAIR_MIN_MS),
+        };
+        // Steve and Norman name some types differently from the Kubernetes API (singular,
+        // case), so the resource only has to agree up to a plural "s".
+        let hit: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM events WHERE cluster=?1 AND source=?2 AND user_id=?3 AND verb=?4
+                   AND namespace=?5 AND name=?6 AND subresource=?7 AND link_id IS NULL
+                   AND (resource=?8 OR resource=?8 || 's' OR ?8=resource || 's')
+                   AND ts_ms BETWEEN ?9 AND ?10
+                 ORDER BY abs(ts_ms - ?11), id LIMIT 1",
+                params![cluster, other, r.user_id, r.verb, r.namespace, r.name, r.subresource, r.resource, lo, hi, t],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(other_id) = hit else { return Ok(false) };
+        tx.execute("UPDATE events SET link_id=?1 WHERE id=?2", params![other_id, id])?;
+        tx.execute("UPDATE events SET link_id=?1 WHERE id=?2", params![id, other_id])?;
+        // A version may already have been credited to the Rancher half; the downstream
+        // record is the one shown, so it takes the version over.
+        let (k8s, rancher) = if r.source == Source::K8s { (id, other_id) } else { (other_id, id) };
+        tx.execute("UPDATE versions SET event_id=?1 WHERE event_id=?2", params![k8s, rancher])?;
+        Ok(true)
+    }
+
+    /// Insert a batch in one transaction. Returns how many were new (collectors resend a batch
+    /// that was not acknowledged, and exec sessions arrive twice). `cluster` is the sender's
+    /// cluster; a record that names its own target cluster (Rancher proxy) goes there.
     pub fn insert_events(&self, cluster: &str, batch: &[(Record, Vec<Alert>)]) -> anyhow::Result<usize> {
         let mut c = self.conn.lock().unwrap();
         let tx = c.transaction()?;
         let mut stored = 0;
         {
             let mut ins = tx.prepare_cached(
-                "INSERT OR IGNORE INTO events (cluster,audit_id,ts_ms,ts,actor,principal,human,via,caller,verb,api_group,resource,subresource,namespace,name,code,source_ip,user_agent,request_uri,request_object)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                "INSERT OR IGNORE INTO events (cluster,audit_id,ts_ms,ts,actor,principal,human,via,caller,verb,api_group,resource,subresource,namespace,name,code,source_ip,user_agent,request_uri,request_object,source,user_id)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
             )?;
             let mut al = tx.prepare_cached("INSERT INTO alerts (event_id, rule, severity) VALUES (?1,?2,?3)")?;
             for (r, alerts) in batch {
+                let cl = r.cluster.as_deref().unwrap_or(cluster);
                 // Request bodies are kept only for people; controller status writes are noise.
                 let body = if r.human { r.request_object.as_ref().map(|v| v.to_string()) } else { None };
                 let n = ins.execute(params![
-                    cluster, r.audit_id, ms(&r.ts), r.ts.to_rfc3339(), r.actor, r.principal, r.human as i64,
+                    cl, r.audit_id, ms(&r.ts), r.ts.to_rfc3339(), r.actor, r.principal, r.human as i64,
                     r.via.as_str(), r.caller, r.verb, r.api_group, r.resource, r.subresource, r.namespace, r.name,
-                    r.code, r.source_ip, r.user_agent, r.request_uri, body
+                    r.code, r.source_ip, r.user_agent, r.request_uri, body, r.source.as_str(), r.user_id
                 ])?;
                 if n == 0 {
                     continue;
@@ -192,6 +275,7 @@ impl Store {
                 for a in alerts {
                     al.execute(params![id, a.rule, a.severity])?;
                 }
+                Self::pair(&tx, id, cl, r)?;
             }
         }
         tx.commit()?;
@@ -306,7 +390,7 @@ impl Store {
                 "SELECT e.id FROM events e WHERE e.cluster=?1 AND e.api_group=?2 AND e.resource=?3 AND e.namespace=?4
                  AND (e.name=?5 OR (e.name='' AND e.verb IN ('create','deletecollection')))
                  AND e.verb IN {verbs} AND e.subresource IN ('','scale') AND e.code BETWEEN 200 AND 299
-                 AND e.ts_ms BETWEEN ?6 AND ?7
+                 AND e.ts_ms BETWEEN ?6 AND ?7 AND {SHOWN}
                  AND (e.verb = 'deletecollection' OR NOT EXISTS (SELECT 1 FROM versions v WHERE v.event_id = e.id))
                  ORDER BY e.ts_ms {order}, e.id {order} LIMIT 1"
             );
@@ -348,9 +432,12 @@ impl Store {
             "SELECT e.id,e.cluster,e.ts,e.actor,e.principal,e.human,e.via,e.caller,e.verb,e.api_group,e.resource,e.subresource,
                     e.namespace,e.name,e.code,e.source_ip,e.user_agent,e.request_uri,e.request_object,
                     (SELECT group_concat(rule) FROM alerts a WHERE a.event_id=e.id),
-                    (SELECT v.id FROM versions v WHERE v.event_id=e.id ORDER BY v.id DESC LIMIT 1)
-             FROM events e WHERE e.ts_ms BETWEEN ?1 AND ?2",
+                    (SELECT v.id FROM versions v WHERE v.event_id=e.id ORDER BY v.id DESC LIMIT 1),
+                    e.source,e.user_id,r.ts,r.user_agent,r.source_ip,r.request_uri
+             FROM events e LEFT JOIN events r ON r.id=e.link_id AND e.source='k8s'
+             WHERE e.ts_ms BETWEEN ?1 AND ?2",
         );
+        sql += &format!(" AND {SHOWN}");
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(q.from_ms), Box::new(q.to_ms)];
         if let Some(cl) = &q.cluster {
             args.push(Box::new(cl.clone()));
@@ -366,7 +453,8 @@ impl Store {
         if q.alerts_only {
             sql += " AND EXISTS (SELECT 1 FROM alerts a WHERE a.event_id=e.id)";
         } else if q.writes_only {
-            sql += &format!(" AND (e.verb IN {WRITE_VERBS} OR e.subresource IN ('exec','attach','portforward') OR EXISTS (SELECT 1 FROM alerts a WHERE a.event_id=e.id))");
+            // Rancher records are already reduced to changes, actions and logins at parse time.
+            sql += &format!(" AND (e.verb IN {WRITE_VERBS} OR e.subresource IN ('exec','attach','portforward') OR e.source='rancher' OR EXISTS (SELECT 1 FROM alerts a WHERE a.event_id=e.id))");
         }
         args.push(Box::new(q.limit));
         sql += &format!(" ORDER BY e.ts_ms DESC, e.id DESC LIMIT ?{}", args.len());
@@ -376,8 +464,14 @@ impl Store {
             .query_map(refs.as_slice(), |r| {
                 let ro: Option<String> = r.get(18)?;
                 let al: Option<String> = r.get(19)?;
+                let rts: Option<String> = r.get(23)?;
+                let rancher = match rts {
+                    Some(ts) => Some(RancherSide { ts, user_agent: r.get(24)?, source_ip: r.get(25)?, request_uri: r.get(26)? }),
+                    None => None,
+                };
                 Ok(EventRow {
-                    id: r.get(0)?, cluster: r.get(1)?, ts: r.get(2)?, actor: r.get(3)?, principal: r.get(4)?,
+                    id: r.get(0)?, cluster: r.get(1)?, source: r.get(21)?, user_id: r.get(22)?, rancher,
+                    ts: r.get(2)?, actor: r.get(3)?, principal: r.get(4)?,
                     human: r.get::<_, i64>(5)? == 1, via: r.get(6)?, caller: r.get(7)?, verb: r.get(8)?,
                     api_group: r.get(9)?, resource: r.get(10)?, subresource: r.get(11)?, namespace: r.get(12)?,
                     name: r.get(13)?, code: r.get(14)?, source_ip: r.get(15)?, user_agent: r.get(16)?, request_uri: r.get(17)?,
@@ -401,9 +495,10 @@ impl Store {
         let c = self.conn.lock().unwrap();
         let mut stmt = c.prepare(&format!(
             "SELECT actor, max(human), sum(CASE WHEN verb IN {WRITE_VERBS} THEN 1 ELSE 0 END),
-                    (SELECT count(*) FROM alerts a JOIN events e2 ON a.event_id=e2.id WHERE e2.actor=e.actor AND e2.ts_ms BETWEEN ?1 AND ?2),
+                    (SELECT count(*) FROM alerts a JOIN events e2 ON a.event_id=e2.id WHERE e2.actor=e.actor AND e2.ts_ms BETWEEN ?1 AND ?2
+                       AND NOT (e2.source='rancher' AND e2.link_id IS NOT NULL)),
                     max(ts)
-             FROM events e WHERE ts_ms BETWEEN ?1 AND ?2 GROUP BY actor ORDER BY max(human) DESC, 3 DESC"
+             FROM events e WHERE ts_ms BETWEEN ?1 AND ?2 AND {SHOWN} GROUP BY actor ORDER BY max(human) DESC, 3 DESC"
         ))?;
         let rows = stmt
             .query_map(params![from_ms, to_ms], |r| {
@@ -565,6 +660,86 @@ mod tests {
         let other = ObjKey { name: "api".into(), ..key() };
         s.insert_version(&other, "Deployment", "u2", &obj(1), "resync", t).unwrap();
         assert_eq!(s.history(&other).unwrap()[0].change, "added_unseen");
+    }
+
+    fn rancher_put(id: &str, ts: &str) -> Record {
+        let line = format!(r#"{{"auditID":"{id}","requestURI":"/k8s/clusters/c1/v1/apps.deployments/shop/web","method":"PATCH",
+          "user":{{"name":"u-1","extra":{{"username":["alice"]}}}},"responseCode":200,"responseTimestamp":"{ts}",
+          "requestHeader":{{"User-Agent":["kubectl/v1.35.0"]}}}}"#);
+        crate::rancher::to_record(&crate::rancher::parse_fixture(&line)[0]).unwrap()
+    }
+
+    fn all(s: &Store) -> Vec<EventRow> {
+        s.timeline(&Query { cluster: None, actor: None, from_ms: 0, to_ms: i64::MAX, humans_only: false, writes_only: false, alerts_only: false, limit: 50 }).unwrap()
+    }
+
+    #[test]
+    fn rancher_and_downstream_halves_become_one_row() {
+        // Downstream first, Rancher (whole seconds, a little later) second.
+        let s = Store::open(":memory:").unwrap();
+        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00.700Z"), &[]).unwrap();
+        s.insert_event("local", &rancher_put("r1", "2026-10-14T10:00:01+08:00"), &[]).unwrap();
+        let rows = all(&s);
+        assert_eq!(rows.len(), 1, "the Rancher half is hidden");
+        assert_eq!((rows[0].source.as_str(), rows[0].user_id.as_str()), ("k8s", "u-1"));
+        assert_eq!(rows[0].rancher.as_ref().unwrap().user_agent, "kubectl/v1.35.0");
+
+        // Rancher first; the downstream record arrives later and still pairs.
+        let s = Store::open(":memory:").unwrap();
+        s.insert_event("local", &rancher_put("r1", "2026-10-14T02:00:00Z"), &[]).unwrap();
+        assert_eq!(all(&s)[0].source, "rancher", "until then, the Rancher record stands alone");
+        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00.400Z"), &[]).unwrap();
+        assert_eq!(all(&s).len(), 1);
+    }
+
+    #[test]
+    fn pairing_needs_the_same_action_and_time() {
+        let s = Store::open(":memory:").unwrap();
+        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00Z"), &[]).unwrap();
+        // Too late: 10 s after.
+        s.insert_event("local", &rancher_put("r1", "2026-10-14T02:00:10Z"), &[]).unwrap();
+        // Other cluster.
+        let mut other = rancher_put("r2", "2026-10-14T02:00:01Z");
+        other.cluster = Some("c2".into());
+        s.insert_event("local", &other, &[]).unwrap();
+        assert_eq!(all(&s).len(), 3);
+        // Two edits in a row pair one to one, nearest first.
+        s.insert_event("c1", &patch("k2", "alice", "2026-10-14T02:00:09.800Z"), &[]).unwrap();
+        assert_eq!(all(&s).len(), 3);
+    }
+
+    #[test]
+    fn version_moves_to_the_downstream_half() {
+        let s = Store::open(":memory:").unwrap();
+        let t0 = Utc.with_ymd_and_hms(2026, 10, 14, 2, 0, 0).unwrap();
+        s.insert_version(&key(), "Deployment", "u1", &obj(1), "baseline", t0).unwrap();
+        let vid = s.insert_version(&key(), "Deployment", "u1", &obj(2), "modified", t0 + chrono::Duration::seconds(1)).unwrap().unwrap();
+        // Only Rancher's record so far: the version is credited to it.
+        s.insert_event("local", &rancher_put("r1", "2026-10-14T02:00:01Z"), &[]).unwrap();
+        assert_eq!(s.link_since(0).unwrap(), 1);
+        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00.900Z"), &[]).unwrap();
+        let rows = all(&s);
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].source.as_str(), rows[0].version_id), ("k8s", Some(vid)));
+    }
+
+    #[test]
+    fn old_databases_get_the_new_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        let p = path.to_str().unwrap();
+        Connection::open(p).unwrap().execute_batch(
+            "CREATE TABLE events (id INTEGER PRIMARY KEY, cluster TEXT NOT NULL, audit_id TEXT NOT NULL, ts_ms INTEGER NOT NULL, ts TEXT NOT NULL,
+               actor TEXT NOT NULL, principal TEXT NOT NULL, human INTEGER NOT NULL, via TEXT NOT NULL, caller TEXT NOT NULL,
+               verb TEXT NOT NULL, api_group TEXT NOT NULL, resource TEXT NOT NULL, subresource TEXT NOT NULL,
+               namespace TEXT NOT NULL, name TEXT NOT NULL, code INTEGER NOT NULL,
+               source_ip TEXT NOT NULL, user_agent TEXT NOT NULL, request_uri TEXT NOT NULL, request_object TEXT, UNIQUE(cluster, audit_id));
+             INSERT INTO events VALUES (1,'c1','old',0,'1970-01-01T00:00:00Z','bob','',1,'direct','bob','delete','','namespaces','','','x',200,'','','',NULL);").unwrap();
+        let s = Store::open(p).unwrap();
+        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00Z"), &[]).unwrap();
+        let rows = all(&s);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].source, "k8s", "existing rows default to the Kubernetes source");
     }
 
     #[test]

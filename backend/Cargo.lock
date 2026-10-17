@@ -136,6 +136,7 @@ dependencies = [
  "chrono-tz",
  "flate2",
  "futures",
+ "jiff",
  "k8s-openapi",
  "kube",
  "reqwest",
