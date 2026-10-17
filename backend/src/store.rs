@@ -862,10 +862,13 @@ impl Store {
         let mut out = Vec::new();
         for resource in ACCESS_TYPES {
             let mut st = c.prepare_cached(
-                "SELECT namespace, name, uid, body FROM versions WHERE id IN (
-                   SELECT max(id) FROM versions WHERE cluster=?1 AND api_group='management.cattle.io' AND resource=?2 AND observed_ms <= ?3
-                   GROUP BY namespace, name)
-                 AND change <> 'deleted'",
+                // Latest by time (then ID): delete versions can carry a different clock than
+                // the change before them, so ID order alone can be wrong for a past instant.
+                "SELECT namespace, name, uid, body FROM (
+                   SELECT namespace, name, uid, body, change,
+                          row_number() OVER (PARTITION BY namespace, name ORDER BY observed_ms DESC, id DESC) AS rn
+                   FROM versions WHERE cluster=?1 AND api_group='management.cattle.io' AND resource=?2 AND observed_ms <= ?3)
+                 WHERE rn = 1 AND change <> 'deleted'",
             )?;
             let rows: Vec<(String, String, String, String)> =
                 st.query_map(params![cluster, resource, at_ms], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?;
@@ -892,7 +895,9 @@ impl Store {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
         let _ = vid;
-        if change == "baseline" {
+        // Existed before tracking began, or its creation fell out of retention: the first
+        // version left is a later change, whose author is not the creator.
+        if !matches!(change.as_str(), "added" | "added_unseen") {
             return Ok((obs, true, None, false));
         }
         if let Some(eid) = eid {
@@ -917,9 +922,11 @@ impl Store {
         let c = self.conn.lock().unwrap();
         let latest = |resource: &str| -> anyhow::Result<Vec<(String, String, i64)>> {
             let mut st = c.prepare_cached(
-                "SELECT name, body, observed_ms FROM versions WHERE id IN (
-                   SELECT max(id) FROM versions WHERE cluster=?1 AND api_group='management.cattle.io' AND resource=?2 AND observed_ms <= ?3 GROUP BY name)
-                 AND change <> 'deleted'",
+                "SELECT name, body, observed_ms FROM (
+                   SELECT name, body, observed_ms, change,
+                          row_number() OVER (PARTITION BY name ORDER BY observed_ms DESC, id DESC) AS rn
+                   FROM versions WHERE cluster=?1 AND api_group='management.cattle.io' AND resource=?2 AND observed_ms <= ?3)
+                 WHERE rn = 1 AND change <> 'deleted'",
             )?;
             let rows = st.query_map(params![cluster, resource, at_ms], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
             Ok(rows)
@@ -1062,15 +1069,18 @@ impl Store {
         let c = self.conn.lock().unwrap();
         let rows = c
             .prepare(&format!(
-                "SELECT target, last_ok_ms, last_error, (SELECT count(*) FROM events e WHERE e.id > f.event_id AND {SHOWN}) FROM forward_cursor f ORDER BY target"
+                "SELECT target, last_ok_ms, last_error,
+                   (SELECT count(*) FROM events e WHERE e.id > f.event_id AND NOT (e.source='rancher' AND e.link_id > f.event_id)) FROM forward_cursor f ORDER BY target"
             ))?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<Result<_, _>>()?;
         Ok(rows)
     }
 
-    /// Records to forward: after the cursor, received at least the hold-back ago, and not the
-    /// hidden Rancher half of a paired action.
+    /// Records to forward: after the cursor, received at least the hold-back ago. The Rancher
+    /// half of a paired action is left out while its downstream record is still to be sent
+    /// (that one carries the Rancher fields); if the downstream record went out before the
+    /// pair was made, the Rancher half goes out on its own.
     pub fn forward_records(&self, after_id: i64, received_before_ms: i64, limit: i64) -> anyhow::Result<Vec<ForwardRecord>> {
         let c = self.conn.lock().unwrap();
         // Stop at the first record still inside the hold-back so the cursor never skips one.
@@ -1086,7 +1096,7 @@ impl Store {
                     (SELECT count(*) FROM alerts a WHERE a.event_id=e.id AND a.severity IN ('high','medium')),
                     r.user_agent, r.source_ip
              FROM events e LEFT JOIN events r ON r.id=e.link_id AND e.source='k8s'
-             WHERE e.id > ?1 AND e.id <= ?2 AND {SHOWN} ORDER BY e.id LIMIT ?3"
+             WHERE e.id > ?1 AND e.id <= ?2 AND NOT (e.source='rancher' AND e.link_id > ?1) ORDER BY e.id LIMIT ?3"
         ))?;
         let rows = st
             .query_map(params![after_id, upto, limit], |r| {
@@ -1794,8 +1804,12 @@ impl Store {
         // Events go oldest-first by ID, up to the first one still inside the retention, so each
         // cluster's chain stays one unbroken run; the last removed link becomes its new base.
         // Records that arrived late (old time, new ID) wait until everything before them goes.
+        // The newest record always stays: without AUTOINCREMENT, SQLite gives the next record
+        // max(id) + 1, so deleting the newest would let IDs repeat (cursors and the chain rely
+        // on IDs only growing).
         let last: Option<i64> = c.query_row(
-            "SELECT CASE WHEN EXISTS (SELECT 1 FROM events WHERE ts_ms >= ?1) THEN (SELECT min(id) - 1 FROM events WHERE ts_ms >= ?1) ELSE (SELECT max(id) FROM events) END",
+            "SELECT min(CASE WHEN EXISTS (SELECT 1 FROM events WHERE ts_ms >= ?1) THEN (SELECT min(id) - 1 FROM events WHERE ts_ms >= ?1) ELSE (SELECT max(id) FROM events) END,
+                       (SELECT max(id) - 1 FROM events))",
             params![cutoff],
             |r| r.get(0),
         )?;
@@ -1805,7 +1819,8 @@ impl Store {
                 "INSERT INTO chain_base (cluster, base_id, base_hash)
                    SELECT e.cluster, e.id, e.hash FROM events e
                    WHERE e.hash IS NOT NULL AND e.id = (SELECT max(id) FROM events x WHERE x.cluster = e.cluster AND x.id <= ?1 AND x.hash IS NOT NULL)
-                 ON CONFLICT(cluster) DO UPDATE SET base_id=excluded.base_id, base_hash=excluded.base_hash",
+                 ON CONFLICT(cluster) DO UPDATE SET base_id=excluded.base_id, base_hash=excluded.base_hash
+                   WHERE excluded.base_id > chain_base.base_id",
                 params![last],
             )?;
             // Keep events that kept versions still point at, so their author is not lost.
@@ -1814,7 +1829,7 @@ impl Store {
                 params![last],
             )?;
         }
-        c.execute("DELETE FROM anchors WHERE at_ms < ?1", params![cutoff])?;
+        c.execute("DELETE FROM anchors WHERE at_ms < ?1 AND id < (SELECT max(id) FROM anchors)", params![cutoff])?;
         c.execute("DELETE FROM gaps WHERE to_ms < ?1", params![cutoff])?;
         c.execute("DELETE FROM security_events WHERE ts_ms < ?1", params![cutoff])?;
         c.execute("DELETE FROM hourly WHERE hour_ms < ?1", params![cutoff])?;
@@ -2235,6 +2250,71 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0]["command"], "curl http://x/");
         assert!(s.security_for_pod("c1", "shop", "web-6c9f7d-2kq8v", 1_001_000, 1_100_000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn review_fixes_chain_base_and_id_reuse() {
+        let s = Store::open(":memory:").unwrap();
+        let t = Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap();
+        // id 1 is kept by prune (a version points at it), id 2 goes, id 3 stays.
+        s.insert_version(&key(), "Deployment", "u1", &obj(1), "baseline", t).unwrap();
+        s.insert_event("c1", &patch("a", "alice", "2026-09-01T00:00:00Z"), &[]).unwrap();
+        s.insert_version(&key(), "Deployment", "u1", &obj(2), "modified", t + chrono::Duration::seconds(1)).unwrap();
+        assert_eq!(s.link_since(0).unwrap(), 1);
+        s.insert_event("c1", &patch("b", "alice", "2026-09-02T00:00:00Z"), &[]).unwrap();
+        s.insert_event("c1", &patch("c", "alice", "2026-10-14T00:00:00Z"), &[]).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 10, 15, 0, 0, 0).unwrap();
+        s.prune(30, now).unwrap();
+        s.prune(30, now + chrono::Duration::hours(6)).unwrap();
+        let r = &s.verify_chain(None).unwrap()[0];
+        assert_eq!((r.base_id, r.first_bad_id), (2, None), "the base never moves back to a kept row");
+
+        // Everything old: the newest record stays, so IDs keep growing.
+        let s = Store::open(":memory:").unwrap();
+        for (i, ts) in ["2026-09-01T00:00:00Z", "2026-09-02T00:00:00Z"].iter().enumerate() {
+            s.insert_event("c1", &patch(&format!("p{i}"), "alice", ts), &[]).unwrap();
+        }
+        s.prune(30, now).unwrap();
+        s.insert_event("c1", &patch("new", "alice", "2026-10-14T00:00:00Z"), &[]).unwrap();
+        let ids: Vec<i64> = s.conn.lock().unwrap().prepare("SELECT id FROM events ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(ids, vec![2, 3]);
+        assert_eq!(s.verify_chain(None).unwrap()[0].first_bad_id, None);
+    }
+
+    #[test]
+    fn review_fixes_late_rancher_half_is_forwarded() {
+        let s = Store::open(":memory:").unwrap();
+        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00.700Z"), &[]).unwrap();
+        // The downstream record goes out first.
+        let first = s.forward_records(0, i64::MAX, 100).unwrap();
+        assert_eq!(first.len(), 1);
+        s.forward_done("t", Some(first[0].id), None, None).unwrap();
+        // The Rancher half arrives late and pairs with it: it must still be sent.
+        s.insert_event("local", &rancher_put("r1", "2026-10-14T10:00:01+08:00"), &[]).unwrap();
+        let late = s.forward_records(first[0].id, i64::MAX, 100).unwrap();
+        assert_eq!((late.len(), late[0].source.as_str()), (1, "rancher"));
+        // But a Rancher half paired before its partner was sent stays hidden.
+        let s = Store::open(":memory:").unwrap();
+        s.insert_event("local", &rancher_put("r1", "2026-10-14T10:00:01+08:00"), &[]).unwrap();
+        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00.700Z"), &[]).unwrap();
+        let both = s.forward_records(0, i64::MAX, 100).unwrap();
+        assert_eq!((both.len(), both[0].source.as_str(), both[0].rancher_user_agent.as_deref()), (1, "k8s", Some("kubectl/v1.35.0")));
+    }
+
+    #[test]
+    fn review_fixes_creator_unknown_after_retention() {
+        let s = Store::open(":memory:").unwrap();
+        let mk = |change: &str, at: DateTime<Utc>| {
+            let key = ObjKey { cluster: "local".into(), api_group: "management.cattle.io".into(), resource: "clusterroletemplatebindings".into(), namespace: "c-1".into(), name: "crtb-x".into() };
+            s.insert_version(&key, "ClusterRoleTemplateBinding", "b1", &json!({"clusterName":"c-1","roleTemplateName":"r","userName":"u-1","n":at.timestamp()}), change, at).unwrap()
+        };
+        let t = Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap();
+        mk("added", t);
+        mk("modified", t + chrono::Duration::days(4));
+        // Retention removes the creation; the first version left is a modification.
+        s.conn.lock().unwrap().execute("DELETE FROM versions WHERE change='added'", []).unwrap();
+        let o = s.access_objects("local", i64::MAX).unwrap();
+        assert!(o[0].before_tracking && o[0].created_by.is_none());
     }
 
     #[test]
