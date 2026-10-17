@@ -3,11 +3,25 @@
 在 Rancher 裡回答「誰、在什麼時候、透過什麼管道、對哪個物件、改了什麼」。
 Answers *who changed what, when, and how* across Rancher-managed Kubernetes clusters, inside the Rancher UI.
 
-**狀態：第一版（M1）開發中。** 目前的程式是從試吃版（M0）搬入並改名，只用合成資料驗證過。
-**Status: M1 in progress.** The code is the M0 tasting version moved in and renamed; verified with synthetic data only.
+**狀態：M1、M2 的程式完成，尚未在真實叢集跑過。** 後端 72 個測試通過；收集元件以假的 Kubernetes／SUSE Security API 跑過完整流程；介面以示意資料在獨立頁面驗證過，還沒載入 Rancher。實機驗證見 [`docs/lab/m1-m2-lab-task.md`](docs/lab/m1-m2-lab-task.md)。
+**Status: M1 and M2 code complete, not yet run on a real cluster.** 72 backend tests pass; collectors were run end to end against fake Kubernetes and SUSE Security APIs; the UI was checked with demo data in a standalone page, not yet inside Rancher.
 
 - 設計：[`docs/design.md`](docs/design.md)
+- 部署：[`docs/deploy.md`](docs/deploy.md)
 - 介面模型（示意資料，瀏覽器直接開）：[`mock/change-map.html`](mock/change-map.html)
+
+![變更地圖](docs/images/change-map.png)
+
+## 做得到的事 / What it does
+
+- **變更地圖**：被動過的物件依叢集、專案、namespace 分組；點物件看關係線、每一步操作、身分鏈（IdP 帳號 → Rancher 介面或 kubectl → 代為執行的帳號 → apiserver）與改前改後。Rancher 與下游兩份紀錄自動對成一筆。
+- **需要注意**：刪 namespace、權限變更、進入容器、繞過 Rancher、繞過 GitOps、變更窗口外的變更、刪除使用者等，同一人短時間內的連續動作合成一件。
+- **權限覆核**：任一時間點每個人有哪些 Rancher 權限、誰在什麼時候給的、兩個日期之間多了誰少了誰，匯出 CSV。
+- **使用者刪除之後**：名冊保留，刪除後重新加入的帳號合併顯示並可分開看。
+- **防竄改與 SIEM**：紀錄串成雜湊鏈，錨點與整理過的紀錄轉送 syslog、Splunk HEC 或 webhook。
+- **還原用 YAML**：產生改之前的內容，只產生、不套用。
+- **收集狀態**：每個收集元件的回報、中斷時段、找不到 audit log 的叢集。
+- **SUSE Security**：exec 之後被判定為違規的程序（不是完整指令紀錄）。
 
 ## 第一版的做法 / M1 approach
 
@@ -32,7 +46,10 @@ Answers *who changed what, when, and how* across Rancher-managed Kubernetes clus
 |---|---|
 | `backend/` | Rust（axum、kube-rs、SQLite）。`cargo test`；`audit-loupe seed-demo` 產生示意資料 |
 | `ui/pkg/audit-loupe/` | Rancher UI extension（UI extensions v3） |
-| `deploy/chart/` | Helm chart（第一版會改寫） |
+| `deploy/chart/` | Helm chart（server 與各收集元件，values 決定角色） |
+| `deploy/policy/` | RKE2 apiserver audit policy |
+| `scripts/` | 建置映像檔 |
+| `docs/lab/` | 實機驗證任務書 |
 | `mock/` | 介面設計模型 |
 | `docs/archive/m0/` | 試吃版的 webhook 做法與 lab 任務書，僅供參考 |
 
