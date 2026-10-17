@@ -3,6 +3,22 @@
 
 // ---------- text ----------
 const ZH = {
+  access: {
+    title: '權限覆核', at: '時間點', compareFrom: '比較起點', apply: '套用', csv: '匯出 CSV', people: '人員', search: '搜尋名字或 ID', pick: '選一個人',
+    groups: '群組', role: '權限', scope: '範圍', via: '取得方式', grantedBy: '授權者', grantedAt: '授權時間', direct: '直接授予', group: '群組',
+    global: '全域', cluster: '叢集', project: '專案', adminLike: '近似管理者', none: '這個時間點沒有任何權限。',
+    beforeTracking: '開始追蹤前就存在', automatic: 'Rancher 自動建立', derived: '由全域角色衍生', unknown: '不明', inferred: '推定',
+    changes: '期間的權限變化', subject: '對象', by: '由誰', when: '時間', added: '新增', removed: '移除', noChanges: '這段期間沒有權限變化。',
+    roleChanges: '角色定義變更', trackingSince: (t) => `比較起點早於開始追蹤的時間（${ t }）；在那之前就存在的權限不列為新增。`, cleanup: '刪除使用者後由 Rancher 自動清除', sync: 'Rancher 內建角色自行更新',
+    groupNote: '經群組取得的權限，依 Rancher 最後一次更新的群組資料（登入時、使用中每小時、每天排程；SAML 與 generic OIDC 只在登入時更新），可能落後最多一天。',
+  },
+  cov: {
+    title: '收集狀態', refresh: '重新整理', collector: '收集元件', instance: '執行個體', lastSeen: '最後回報', status: '狀態', report: '回報內容',
+    ok: '正常', silent: '沒有回報', gaps: '最近 7 天的中斷', stillSilent: '仍未恢復', chain: '紀錄完整性',
+    chainOk: (n) => `雜湊鏈完整（已驗證 ${ n } 筆）`, chainBroken: (id) => `雜湊鏈在第 ${ id } 筆對不上：紀錄可能被修改`,
+    forwarding: '轉送 SIEM', noForwarding: '沒有設定轉送目標。沒有外部錨點時，雜湊鏈只能偵測意外損毀。', pending: (n) => `待送 ${ n } 筆`,
+    kinds: { file: 'apiserver audit log', rancher: 'Rancher audit log', watch: '物件版本', neuvector: 'SUSE Security' },
+  },
   title: '變更地圖', crumb: '稽核', allClusters: '全部叢集', allProjects: '全部專案', allNs: '全部 namespace', everyone: '所有人',
   withSystem: '含系統元件', reset: '清除篩選', thisPeriod: '這段時間', changedObjects: '被動過的物件', evidence: '證據',
   evidenceHint: '誰、怎麼做的、改了什麼', added: '新增', modified: '修改', deleted: '刪除', readOnly: '只讀取／進入',
@@ -53,6 +69,22 @@ const ZH = {
 };
 
 const EN = {
+  access: {
+    title: 'Access review', at: 'As of', compareFrom: 'Compare from', apply: 'Apply', csv: 'Export CSV', people: 'People', search: 'Search name or ID', pick: 'Pick a person',
+    groups: 'Groups', role: 'Permission', scope: 'Scope', via: 'Obtained', grantedBy: 'Granted by', grantedAt: 'Granted at', direct: 'Direct', group: 'Group',
+    global: 'Global', cluster: 'Cluster', project: 'Project', adminLike: 'Admin-like', none: 'No permissions at this time.',
+    beforeTracking: 'Existed before tracking', automatic: 'Created by Rancher', derived: 'Derived from a global role', unknown: 'Unknown', inferred: 'inferred',
+    changes: 'Changes in the period', subject: 'Subject', by: 'By', when: 'When', added: 'Added', removed: 'Removed', noChanges: 'No permission changes in this period.',
+    roleChanges: 'Role definition changes', trackingSince: (t) => `The comparison starts before tracking began (${ t }); permissions that already existed are not listed as added.`, cleanup: 'Removed by Rancher after the user was deleted', sync: 'Built-in role updated by Rancher',
+    groupNote: 'Group-based permissions follow Rancher\'s last refresh of each user\'s groups (at login, hourly while in use, daily; SAML and generic OIDC only at login) and may lag by up to a day.',
+  },
+  cov: {
+    title: 'Collection status', refresh: 'Refresh', collector: 'Collector', instance: 'Instance', lastSeen: 'Last seen', status: 'Status', report: 'Report',
+    ok: 'OK', silent: 'Silent', gaps: 'Gaps in the last 7 days', stillSilent: 'still silent', chain: 'Record integrity',
+    chainOk: (n) => `Chain intact (${ n } records checked)`, chainBroken: (id) => `Chain breaks at record ${ id }: records may have been changed`,
+    forwarding: 'SIEM forwarding', noForwarding: 'No forwarding target set. Without external anchors the chain only detects accidental damage.', pending: (n) => `${ n } pending`,
+    kinds: { file: 'apiserver audit log', rancher: 'Rancher audit log', watch: 'Object versions', neuvector: 'SUSE Security' },
+  },
   title: 'Change map', crumb: 'Audit', allClusters: 'All clusters', allProjects: 'All projects', allNs: 'All namespaces', everyone: 'Everyone',
   withSystem: 'Include system components', reset: 'Clear filters', thisPeriod: 'This period', changedObjects: 'Objects touched', evidence: 'Evidence',
   evidenceHint: 'Who, how, and what changed', added: 'Added', modified: 'Modified', deleted: 'Deleted', readOnly: 'Read or entered only',

@@ -396,7 +396,9 @@ async fn access_diff(State(s): State<AppState>, Q(p): Q<DiffParams>) -> Response
         let after = crate::access::grants(&s.store.access_objects(cl, to)?);
         let (added, removed) = crate::access::diff(&before, &after);
         let mut changes = Vec::new();
-        for g in added {
+        // Bindings that existed before tracking began were not added in the period.
+        let tracking_since = after.iter().chain(before.iter()).map(|g| g.granted_ms).min();
+        for g in added.into_iter().filter(|g| !g.before_tracking) {
             let (at, by) = (Some(g.granted_ms), g.granted_by.clone());
             changes.push(crate::access::Change { change: "added", grant: g, at_ms: at, by, reason: None });
         }
@@ -409,7 +411,7 @@ async fn access_diff(State(s): State<AppState>, Q(p): Q<DiffParams>) -> Response
             let (at, by, reason) = s.store.access_removal(cl, resource, &g.binding_namespace, &g.binding_name, &g.subject, from, to)?;
             changes.push(crate::access::Change { change: "removed", grant: g, at_ms: at, by, reason });
         }
-        Ok(json!({"from": from, "to": to, "changes": changes, "roleChanges": s.store.role_changes(cl, from, to)?}))
+        Ok(json!({"from": from, "to": to, "trackingSinceMs": tracking_since, "changes": changes, "roleChanges": s.store.role_changes(cl, from, to)?}))
     };
     match run() {
         Ok(v) => Json(v).into_response(),

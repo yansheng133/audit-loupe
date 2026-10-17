@@ -3,8 +3,10 @@
 // experimental product registration API.
 export const PRODUCT = 'audit-loupe';
 export const BLANK_CLUSTER = '_';
+export const PAGES = ['changes', 'access', 'coverage'];
 export const PAGE = 'changes';
-export const ROUTE = `${ PRODUCT }-c-cluster-${ PAGE }`;
+export const routeName = (page) => `${ PRODUCT }-c-cluster-${ page }`;
+export const ROUTE = routeName(PAGE);
 
 export function init($plugin, store) {
   const { product, virtualType, basicType } = $plugin.DSL(store, PRODUCT);
@@ -17,11 +19,14 @@ export function init($plugin, store) {
     to:                  { name: ROUTE, params: { product: PRODUCT, cluster: BLANK_CLUSTER } },
   });
 
-  virtualType({
-    labelKey: 'auditLoupe.nav.changes',
-    name:     PAGE,
-    route:    { name: ROUTE, params: { product: PRODUCT, cluster: BLANK_CLUSTER } },
+  PAGES.forEach((page, i) => {
+    virtualType({
+      labelKey: `auditLoupe.nav.${ page }`,
+      name:     page,
+      weight:   100 - i,
+      route:    { name: routeName(page), params: { product: PRODUCT, cluster: BLANK_CLUSTER } },
+    });
   });
 
-  basicType([PAGE]);
+  basicType(PAGES);
 }

@@ -3,3 +3,5 @@ product:
 auditLoupe:
   nav:
     changes: Change Map
+    access: Access Review
+    coverage: Collection Status

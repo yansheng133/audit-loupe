@@ -1,15 +1,19 @@
 import ChangeMap from './pages/ChangeMap.vue';
-import {
-  PRODUCT, BLANK_CLUSTER, PAGE, ROUTE
-} from './product';
+import AccessReview from './pages/AccessReview.vue';
+import Coverage from './pages/Coverage.vue';
+import { PRODUCT, BLANK_CLUSTER, routeName } from './product';
+
+const page = (name, component) => ({
+  name:      routeName(name),
+  path:      `/${ PRODUCT }/c/:cluster/${ name }`,
+  component,
+  meta:      {
+    product: PRODUCT, cluster: BLANK_CLUSTER, pkg: PRODUCT
+  },
+});
 
 export default [
-  {
-    name:      ROUTE,
-    path:      `/${ PRODUCT }/c/:cluster/${ PAGE }`,
-    component: ChangeMap,
-    meta:      {
-      product: PRODUCT, cluster: BLANK_CLUSTER, pkg: PRODUCT
-    },
-  },
+  page('changes', ChangeMap),
+  page('access', AccessReview),
+  page('coverage', Coverage),
 ];
