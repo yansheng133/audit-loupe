@@ -185,6 +185,22 @@ async fn history(State(s): State<AppState>, Q(p): Q<HistoryParams>) -> Response 
 }
 
 #[derive(Deserialize)]
+struct RelatedParams {
+    cluster: String,
+    kind: String,
+    #[serde(default)]
+    namespace: String,
+    name: String,
+}
+
+async fn related(State(s): State<AppState>, Q(p): Q<RelatedParams>) -> Response {
+    match s.store.related(&p.cluster, &p.kind, &p.namespace, &p.name) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+#[derive(Deserialize)]
 struct AlertParams {
     from: Option<DateTime<Utc>>,
     to: Option<DateTime<Utc>>,
@@ -221,6 +237,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/timeline", get(timeline))
         .route("/api/objects", get(objects))
         .route("/api/history", get(history))
+        .route("/api/related", get(related))
         .route("/api/alerts", get(alerts))
         .with_state(state)
 }

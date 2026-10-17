@@ -5,6 +5,7 @@ mod config;
 mod demo;
 mod diff;
 mod rancher;
+mod relations;
 mod rules;
 mod store;
 mod watch;

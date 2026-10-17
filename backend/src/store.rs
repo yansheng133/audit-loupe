@@ -6,8 +6,9 @@ use crate::rules::Alert;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
+use crate::relations::{extract, pod_template, selector_matches};
 use crate::watch::ObjMsg;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
@@ -49,6 +50,14 @@ CREATE TABLE IF NOT EXISTS versions (
 CREATE INDEX IF NOT EXISTS versions_obj ON versions(cluster, api_group, resource, namespace, name, id);
 CREATE INDEX IF NOT EXISTS versions_unlinked ON versions(event_id, observed_ms);
 CREATE INDEX IF NOT EXISTS versions_event ON versions(event_id);
+CREATE INDEX IF NOT EXISTS versions_kind ON versions(cluster, kind, namespace, name, id);
+CREATE TABLE IF NOT EXISTS relations (
+  cluster TEXT NOT NULL, from_kind TEXT NOT NULL, from_ns TEXT NOT NULL, from_name TEXT NOT NULL,
+  rel TEXT NOT NULL, to_kind TEXT NOT NULL, to_ns TEXT NOT NULL, to_name TEXT NOT NULL, selector TEXT
+);
+CREATE INDEX IF NOT EXISTS relations_from ON relations(cluster, from_kind, from_ns, from_name);
+CREATE INDEX IF NOT EXISTS relations_to ON relations(cluster, to_kind, to_ns, to_name);
+CREATE INDEX IF NOT EXISTS relations_sel ON relations(cluster, from_ns) WHERE selector IS NOT NULL;
 CREATE TABLE IF NOT EXISTS users (
   user_id TEXT NOT NULL, uid TEXT NOT NULL,
   display_name TEXT NOT NULL, username TEXT NOT NULL, principal_ids TEXT NOT NULL,
@@ -180,6 +189,18 @@ pub struct UserLife {
 }
 
 #[derive(Debug, Serialize)]
+pub struct RelatedRow {
+    /// "out": this object points at the other; "in": the other points at this one.
+    pub direction: &'static str,
+    pub rel: String,
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+    /// Last change seen (not counting the first sighting), when the object is tracked.
+    pub last_change: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct ActorRow {
     /// The Rancher user ID when there is one, otherwise the name; what to filter by.
     pub key: String,
@@ -206,6 +227,8 @@ pub struct Query {
     pub alerts_only: bool,
     pub limit: i64,
 }
+
+const WORKLOAD_KINDS: &str = "('Deployment','StatefulSet','DaemonSet','Job','CronJob')";
 
 const WRITE_VERBS: &str = "('create','update','patch','delete','deletecollection')";
 
@@ -332,6 +355,73 @@ impl Store {
         )
         .optional()?
         .is_some())
+    }
+
+    /// Objects related to one object, both ways. Selector relations (Service, NetworkPolicy)
+    /// are matched against the current pod labels of workloads in the namespace.
+    pub fn related(&self, cluster: &str, kind: &str, ns: &str, name: &str) -> anyhow::Result<Vec<RelatedRow>> {
+        let c = self.conn.lock().unwrap();
+        let mut out: Vec<RelatedRow> = Vec::new();
+        let workloads = |c: &Connection| -> anyhow::Result<Vec<(String, String, Map<String, Value>)>> {
+            let mut st = c.prepare_cached(&format!(
+                "SELECT kind, name, body FROM versions WHERE id IN (
+                   SELECT max(id) FROM versions WHERE cluster=?1 AND namespace=?2 AND kind IN {WORKLOAD_KINDS} GROUP BY kind, name)
+                 AND change <> 'deleted'"
+            ))?;
+            let rows: Vec<(String, String, String)> = st.query_map(params![cluster, ns], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+            Ok(rows
+                .into_iter()
+                .filter_map(|(k, n, b)| {
+                    let body: Value = serde_json::from_str(&b).ok()?;
+                    let labels = pod_template(&k, &body)?.pointer("/metadata/labels")?.as_object()?.clone();
+                    Some((k, n, labels))
+                })
+                .collect())
+        };
+        // Outgoing.
+        let mut st = c.prepare_cached("SELECT rel, to_kind, to_ns, to_name, selector FROM relations WHERE cluster=?1 AND from_kind=?2 AND from_ns=?3 AND from_name=?4")?;
+        let rows: Vec<(String, String, String, String, Option<String>)> =
+            st.query_map(params![cluster, kind, ns, name], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<Result<_, _>>()?;
+        drop(st);
+        for (rel, tk, tns, tn, sel) in rows {
+            match sel.and_then(|s| serde_json::from_str::<Value>(&s).ok()) {
+                Some(sel) => {
+                    for (wk, wn, labels) in workloads(&c)? {
+                        if selector_matches(&sel, &labels) {
+                            out.push(RelatedRow { direction: "out", rel: rel.clone(), kind: wk, namespace: ns.into(), name: wn, last_change: None });
+                        }
+                    }
+                }
+                None => out.push(RelatedRow { direction: "out", rel, kind: tk, namespace: tns, name: tn, last_change: None }),
+            }
+        }
+        // Incoming by name.
+        let mut st = c.prepare_cached("SELECT rel, from_kind, from_ns, from_name FROM relations WHERE cluster=?1 AND to_kind=?2 AND to_ns=?3 AND to_name=?4")?;
+        let rows: Vec<(String, String, String, String)> =
+            st.query_map(params![cluster, kind, ns, name], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?;
+        drop(st);
+        out.extend(rows.into_iter().map(|(rel, k, n, nm)| RelatedRow { direction: "in", rel, kind: k, namespace: n, name: nm, last_change: None }));
+        // Incoming by selector, when this object is a workload.
+        let mine = workloads(&c)?.into_iter().find(|(k, n, _)| k == kind && n == name).map(|(_, _, l)| l);
+        if let Some(labels) = mine {
+            let mut st = c.prepare_cached("SELECT rel, from_kind, from_name, selector FROM relations WHERE cluster=?1 AND from_ns=?2 AND selector IS NOT NULL")?;
+            let rows: Vec<(String, String, String, String)> =
+                st.query_map(params![cluster, ns], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?;
+            drop(st);
+            for (rel, k, n, sel) in rows {
+                if serde_json::from_str::<Value>(&sel).is_ok_and(|s| selector_matches(&s, &labels)) {
+                    out.push(RelatedRow { direction: "in", rel, kind: k, namespace: ns.into(), name: n, last_change: None });
+                }
+            }
+        }
+        // When each related object last changed, if it is tracked at all.
+        let mut st = c.prepare_cached(
+            "SELECT observed FROM versions WHERE cluster=?1 AND kind=?2 AND namespace=?3 AND name=?4 AND change <> 'baseline' ORDER BY id DESC LIMIT 1",
+        )?;
+        for r in out.iter_mut() {
+            r.last_change = st.query_row(params![cluster, r.kind, r.namespace, r.name], |row| row.get(0)).optional()?;
+        }
+        Ok(out)
     }
 
     /// Keep the user directory current. One row per lifetime of a user ID: an external
@@ -502,6 +592,19 @@ impl Store {
             params![key.cluster, key.api_group, key.resource, kind, key.namespace, key.name, uid, ms(&at), at.to_rfc3339(), change, body.to_string()],
         )?;
         let id = c.last_insert_rowid();
+        // Relations follow the latest version; a deleted object points at nothing.
+        c.execute(
+            "DELETE FROM relations WHERE cluster=?1 AND from_kind=?2 AND from_ns=?3 AND from_name=?4",
+            params![key.cluster, kind, key.namespace, key.name],
+        )?;
+        if change != "deleted" {
+            let mut ins = c.prepare_cached(
+                "INSERT INTO relations (cluster, from_kind, from_ns, from_name, rel, to_kind, to_ns, to_name, selector) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            )?;
+            for r in extract(kind, &key.namespace, obj) {
+                ins.execute(params![key.cluster, kind, key.namespace, key.name, r.rel, r.to_kind, r.to_namespace, r.to_name, r.selector.map(|s| s.to_string())])?;
+            }
+        }
         if key.api_group == "management.cattle.io" && key.resource == "users" {
             Self::record_user(&c, &key.name, uid, obj, change, at)?;
         }
@@ -976,6 +1079,32 @@ mod tests {
         let q = Query { cluster: None, actor: Some("u-1".into()), from_ms: 0, to_ms: i64::MAX, humans_only: true, writes_only: true, alerts_only: false, limit: 50 };
         assert_eq!(s.timeline(&q).unwrap().len(), 2);
         assert_eq!(s.users().unwrap()[0].1.len(), 2);
+    }
+
+    #[test]
+    fn relations_both_ways_and_through_selectors() {
+        let s = Store::open(":memory:").unwrap();
+        let t = Utc.with_ymd_and_hms(2026, 10, 14, 2, 0, 0).unwrap();
+        let dep = json!({"metadata":{"name":"web","namespace":"shop"},"spec":{"template":{"metadata":{"labels":{"app":"web"}},
+            "spec":{"volumes":[{"name":"c","configMap":{"name":"web-config"}}],"containers":[{"name":"web"}]}}}});
+        s.insert_version(&key(), "Deployment", "d1", &dep, "baseline", t).unwrap();
+        let svc = ObjKey { api_group: "".into(), resource: "services".into(), ..key() };
+        s.insert_version(&svc, "Service", "s1", &json!({"metadata":{"name":"web"},"spec":{"selector":{"app":"web"}}}), "baseline", t).unwrap();
+        let cm = ObjKey { api_group: "".into(), resource: "configmaps".into(), name: "web-config".into(), ..key() };
+        s.insert_version(&cm, "ConfigMap", "c1", &json!({"metadata":{"name":"web-config"},"data":{"a":"1"}}), "baseline", t).unwrap();
+        s.insert_version(&cm, "ConfigMap", "c1", &json!({"metadata":{"name":"web-config"},"data":{"a":"2"}}), "modified", t + chrono::Duration::minutes(5)).unwrap();
+
+        let r = s.related("c1", "Deployment", "shop", "web").unwrap();
+        let has = |d: &str, rel: &str, k: &str| r.iter().any(|x| x.direction == d && x.rel == rel && x.kind == k);
+        assert!(has("out", "mounts", "ConfigMap") && has("in", "selects", "Service"), "{r:?}");
+        assert!(r.iter().find(|x| x.kind == "ConfigMap").unwrap().last_change.is_some(), "the ConfigMap changed");
+        let r = s.related("c1", "Service", "shop", "web").unwrap();
+        assert_eq!((r[0].direction, r[0].kind.as_str(), r[0].name.as_str()), ("out", "Deployment", "web"));
+        // Labels change: the Service no longer selects it.
+        let mut moved = dep.clone();
+        moved["spec"]["template"]["metadata"]["labels"]["app"] = json!("web-v2");
+        s.insert_version(&key(), "Deployment", "d1", &moved, "modified", t + chrono::Duration::minutes(9)).unwrap();
+        assert!(s.related("c1", "Service", "shop", "web").unwrap().is_empty());
     }
 
     #[test]
