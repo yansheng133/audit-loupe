@@ -225,6 +225,8 @@ spec:
           env:
             {{- include "al.collectorEnv" . | nindent 12 }}
             - { name: AL_AUDIT_LOG, value: {{ printf "/host-logs/%s" $c.file.logFile | quote }} }
+            - name: NODE_NAME
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
             - { name: AL_STATE_DIR, value: /state }
           # The audit log is root-owned (0600); root without any capability can read
           # its own files. Everything else stays locked down.

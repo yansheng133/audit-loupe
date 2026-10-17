@@ -9,7 +9,7 @@ use serde::Serialize;
 use crate::integrity::{link, Fields};
 use crate::relations::{extract, pod_template, selector_matches};
 use crate::watch::ObjMsg;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -85,6 +85,14 @@ CREATE TABLE IF NOT EXISTS forward_cursor (
   target TEXT PRIMARY KEY, event_id INTEGER NOT NULL DEFAULT 0, anchor_id INTEGER NOT NULL DEFAULT 0,
   last_ok_ms INTEGER, last_error TEXT
 );
+CREATE TABLE IF NOT EXISTS heartbeats (
+  cluster TEXT NOT NULL, collector TEXT NOT NULL, instance TEXT NOT NULL, last_ms INTEGER NOT NULL, details TEXT NOT NULL,
+  PRIMARY KEY (cluster, collector, instance)
+);
+CREATE TABLE IF NOT EXISTS gaps (
+  id INTEGER PRIMARY KEY, cluster TEXT NOT NULL, collector TEXT NOT NULL, instance TEXT NOT NULL, from_ms INTEGER NOT NULL, to_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS gaps_time ON gaps(to_ms);
 CREATE TABLE IF NOT EXISTS listing (
   cluster TEXT NOT NULL, api_group TEXT NOT NULL, resource TEXT NOT NULL, first INTEGER NOT NULL,
   PRIMARY KEY (cluster, api_group, resource)
@@ -257,6 +265,17 @@ pub struct RoleChange {
     pub by: Option<String>,
     /// "rancher_sync": a built-in role Rancher changed itself (typically on upgrade).
     pub reason: Option<&'static str>,
+}
+
+/// Three missed heartbeats (one a minute) count as a gap.
+const GAP_MS: i64 = 180_000;
+
+#[derive(Debug, Serialize)]
+pub struct CoverageRow {
+    pub cluster: String,
+    pub collectors: Vec<Value>,
+    /// Silences of a collector; toMs null means it is still silent.
+    pub gaps: Vec<Value>,
 }
 
 pub struct RestoreSource {
@@ -1467,6 +1486,61 @@ impl Store {
         }))
     }
 
+    /// A collector checked in. A silence longer than three heartbeats is recorded as a gap.
+    pub fn heartbeat(&self, cluster: &str, collector: &str, instance: &str, details: &Value, now_ms: i64) -> anyhow::Result<()> {
+        let c = self.conn.lock().unwrap();
+        let prev: Option<i64> = c
+            .query_row("SELECT last_ms FROM heartbeats WHERE cluster=?1 AND collector=?2 AND instance=?3", params![cluster, collector, instance], |r| r.get(0))
+            .optional()?;
+        if let Some(p) = prev.filter(|p| now_ms - p > GAP_MS) {
+            c.execute("INSERT INTO gaps (cluster, collector, instance, from_ms, to_ms) VALUES (?1,?2,?3,?4,?5)", params![cluster, collector, instance, p, now_ms])?;
+        }
+        c.execute(
+            "INSERT INTO heartbeats (cluster, collector, instance, last_ms, details) VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(cluster, collector, instance) DO UPDATE SET last_ms=excluded.last_ms, details=excluded.details",
+            params![cluster, collector, instance, now_ms, details.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Per cluster: each collector's last check-in and report, and gaps in the range
+    /// (including a silence still going on).
+    pub fn coverage(&self, from_ms: i64, to_ms: i64, now_ms: i64) -> anyhow::Result<Vec<CoverageRow>> {
+        let c = self.conn.lock().unwrap();
+        let beats: Vec<(String, String, String, i64, String)> = c
+            .prepare("SELECT cluster, collector, instance, last_ms, details FROM heartbeats ORDER BY cluster, collector, instance")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+            .collect::<Result<_, _>>()?;
+        let gaps: Vec<(String, String, String, i64, i64)> = c
+            .prepare("SELECT cluster, collector, instance, from_ms, to_ms FROM gaps WHERE to_ms >= ?1 AND from_ms <= ?2 ORDER BY from_ms")?
+            .query_map(params![from_ms, to_ms], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+            .collect::<Result<_, _>>()?;
+        let mut out: Vec<CoverageRow> = Vec::new();
+        let row = |out: &mut Vec<CoverageRow>, cl: &str| -> usize {
+            match out.iter().position(|r| r.cluster == cl) {
+                Some(i) => i,
+                None => {
+                    out.push(CoverageRow { cluster: cl.to_string(), collectors: vec![], gaps: vec![] });
+                    out.len() - 1
+                }
+            }
+        };
+        for (cl, col, inst, last, details) in beats {
+            let i = row(&mut out, &cl);
+            let stale = now_ms - last > GAP_MS;
+            out[i].collectors.push(json!({"collector": col, "instance": inst, "lastMs": last, "stale": stale,
+                                          "details": serde_json::from_str::<Value>(&details).unwrap_or(Value::Null)}));
+            if stale && last <= to_ms {
+                out[i].gaps.push(json!({"collector": col, "instance": inst, "fromMs": last, "toMs": null}));
+            }
+        }
+        for (cl, col, inst, f, t) in gaps {
+            let i = row(&mut out, &cl);
+            out[i].gaps.push(json!({"collector": col, "instance": inst, "fromMs": f, "toMs": t}));
+        }
+        Ok(out)
+    }
+
     /// Labels of a namespace as last seen.
     pub fn namespace_labels(&self, cluster: &str, ns: &str) -> anyhow::Result<Option<serde_json::Map<String, Value>>> {
         let c = self.conn.lock().unwrap();
@@ -1697,6 +1771,7 @@ impl Store {
             )?;
         }
         c.execute("DELETE FROM anchors WHERE at_ms < ?1", params![cutoff])?;
+        c.execute("DELETE FROM gaps WHERE to_ms < ?1", params![cutoff])?;
         c.execute("DELETE FROM hourly WHERE hour_ms < ?1", params![cutoff])?;
         c.execute("DELETE FROM stories WHERE last_ms < ?1", params![cutoff])?;
         Ok(n + m)
@@ -2083,6 +2158,22 @@ mod tests {
         s.insert_event("c1", &r, &[]).unwrap();
         assert_eq!(s.gitops_bypasses(0, i64::MAX).unwrap().len(), 1);
         assert_eq!(fleet_marker(&json!({"metadata":{"annotations":{"objectset.rio.cattle.io/id":"default-shop"}}})).as_deref(), Some("objectset/default-shop"));
+    }
+
+    #[test]
+    fn silent_collectors_become_gaps() {
+        let s = Store::open(":memory:").unwrap();
+        let t0 = 1_000_000_000_000;
+        s.heartbeat("c1", "file", "node-1", &json!({"auditLog":"present"}), t0).unwrap();
+        s.heartbeat("c1", "file", "node-1", &json!({}), t0 + 60_000).unwrap();
+        // Ten minutes of silence, then it comes back.
+        s.heartbeat("c1", "file", "node-1", &json!({}), t0 + 660_000).unwrap();
+        s.heartbeat("c1", "watch", "pod-a", &json!({}), t0).unwrap();
+        let cov = s.coverage(0, i64::MAX, t0 + 700_000).unwrap();
+        let c1 = &cov[0];
+        let gaps: Vec<(String, Option<i64>)> = c1.gaps.iter().map(|g| (g["collector"].as_str().unwrap().to_string(), g["toMs"].as_i64())).collect();
+        assert!(gaps.contains(&("file".into(), Some(t0 + 660_000))), "closed gap: {gaps:?}");
+        assert!(gaps.contains(&("watch".into(), None)), "watch is still silent: {gaps:?}");
     }
 
     #[test]

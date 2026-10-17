@@ -207,6 +207,7 @@ pub fn resources_from_env() -> Vec<String> {
 /// Resolve each configured resource (retrying until the API serves it) and watch it.
 pub async fn run() -> anyhow::Result<()> {
     let sender = Sender::from_env("k8s-object")?;
+    let health = crate::collect::heartbeat("watch")?;
     let specs = resources_from_env();
     let client = Client::try_default().await?;
     let (tx, rx) = tokio::sync::mpsc::channel::<Line>(4096);
@@ -214,13 +215,14 @@ pub async fn run() -> anyhow::Result<()> {
     info!(resources = specs.len(), "watching");
     let mut tasks = Vec::new();
     for spec in specs {
-        let (client, tx) = (client.clone(), tx.clone());
+        let (client, tx, health) = (client.clone(), tx.clone(), health.clone());
         tasks.push(tokio::spawn(async move {
             let mut delay = 5;
             loop {
                 match resolve(&client, &spec).await {
                     Ok(Some(ar)) => {
                         info!(resource = %spec, "watching");
+                        crate::collect::set(&health, &spec, serde_json::json!("watching"));
                         if let Err(e) = watch_one(client.clone(), ar, tx.clone()).await {
                             warn!(resource = %spec, error = %e, "watch stopped");
                         }
@@ -228,6 +230,7 @@ pub async fn run() -> anyhow::Result<()> {
                     }
                     Ok(None) => {
                         info!(resource = %spec, "not served by this cluster; skipped");
+                        crate::collect::set(&health, &spec, serde_json::json!("not served"));
                         return;
                     }
                     Err(e) if e.to_string().contains("never watched") || e.to_string().contains("expected group") => {

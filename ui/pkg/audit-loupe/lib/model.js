@@ -21,7 +21,7 @@ const ZH = {
   sev: { high: '高', medium: '中', low: '低' }, records: (n, who, t) => `${ n } 筆・最後 ${ who } ${ t }`,
   deletedUser: '已刪除', readded: (n) => `曾刪除後重新加入（${ n } 段）`, lifetime: (a, b) => `${ a } ～ ${ b || '現在' }`, split: '分開看', merge: '合併看',
   storyBurst: (who, m, n) => `${ who } 在 ${ m } 分鐘內連續 ${ n } 筆高權限操作`,
-  coverage: '收集範圍：', covFull: '完整：apiserver audit ＋ 物件版本', covRancher: '經 Rancher 的操作', covObjects: '只知道改了什麼', covAudit: '只有 apiserver audit', covNone: '這段時間沒有資料',
+  coverage: '收集範圍：', covFull: '完整：apiserver audit ＋ 物件版本', covRancher: '經 Rancher 的操作', covObjects: '只知道改了什麼', covAudit: '只有 apiserver audit', covNone: '這段時間沒有資料', covGap: (n) => `收集中斷（${ n } 段）`, covNoAudit: '找不到 apiserver audit log，audit 可能沒開',
   via: {
     ui: 'Rancher 介面', kubectl: 'Rancher kubectl', rancher: '經 Rancher', direct: '繞過 Rancher', ace: 'ACE 直連', imp: '其他代理身分', controller: '系統元件', unknown: '收集中斷'
   },
@@ -70,7 +70,7 @@ const EN = {
   sev: { high: 'High', medium: 'Medium', low: 'Low' }, records: (n, who, t) => `${ n } · last ${ who } ${ t }`,
   deletedUser: 'Deleted', readded: (n) => `Deleted and re-added (${ n } periods)`, lifetime: (a, b) => `${ a } – ${ b || 'now' }`, split: 'Split', merge: 'Merge',
   storyBurst: (who, m, n) => `${ who }: ${ n } privileged actions within ${ m } minutes`,
-  coverage: 'Collected: ', covFull: 'Full: apiserver audit + object versions', covRancher: 'Actions through Rancher', covObjects: 'What changed only', covAudit: 'apiserver audit only', covNone: 'No data in this period',
+  coverage: 'Collected: ', covFull: 'Full: apiserver audit + object versions', covRancher: 'Actions through Rancher', covObjects: 'What changed only', covAudit: 'apiserver audit only', covNone: 'No data in this period', covGap: (n) => `Collection gaps (${ n })`, covNoAudit: 'No apiserver audit log found; audit may be off',
   via: {
     ui: 'Rancher UI', kubectl: 'Rancher kubectl', rancher: 'Through Rancher', direct: 'Bypassed Rancher', ace: 'Authorized endpoint', imp: 'Other impersonation', controller: 'System component', unknown: 'Collection gap'
   },
@@ -459,8 +459,17 @@ export function identityChain(ev, obj, actor, T) {
   return { hops, note: r.rancher ? C.paired : (ev.via === 'ace' || ev.via === 'imp' ? '' : C.downstreamOnly) };
 }
 
-// Coverage label for a cluster from what it sent in the period.
-export function coverageOf(row, T) {
+// Coverage label for a cluster from what it sent in the period and its collectors' gaps.
+export function coverageOf(row, T, cov) {
+  const gaps = (cov?.gaps || []).length;
+  const missingLog = (cov?.collectors || []).some((c) => c.collector === 'file' && c.details?.auditLog === 'missing');
+
+  if (gaps) {
+    return { label: T.covGap(gaps), tone: 'deleted' };
+  }
+  if (missingLog) {
+    return { label: T.covNoAudit, tone: 'deleted' };
+  }
   if (!row) {
     return { label: T.covNone, tone: 'none' };
   }

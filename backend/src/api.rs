@@ -51,6 +51,19 @@ async fn ingest(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> R
             return (StatusCode::FORBIDDEN, "only the Rancher cluster's collector may send Rancher records").into_response();
         }
         "k8s-object" => return ingest_objects(s, cluster, &body).await,
+        "heartbeat" => {
+            let v: serde_json::Value = match serde_json::from_slice(&body) {
+                Ok(v) => v,
+                Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+            };
+            let str_of = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("unknown").to_string();
+            let (col, inst) = (str_of("collector"), str_of("instance"));
+            let details = v.get("details").cloned().unwrap_or_default();
+            return match s.store.heartbeat(&cluster, &col, &inst, &details, Utc::now().timestamp_millis()) {
+                Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                Err(e) => err(e),
+            };
+        }
         _ => return (StatusCode::BAD_REQUEST, format!("unsupported source {source:?}")).into_response(),
     };
     let store = s.store.clone();
@@ -247,6 +260,15 @@ async fn restore(State(s): State<AppState>, Q(p): Q<RestoreParams>) -> Response 
         body,
     )
         .into_response()
+}
+
+/// Collectors per cluster: last check-in, their own report, and gaps in the range.
+async fn coverage(State(s): State<AppState>, Q(r): Q<Range>) -> Response {
+    let (f, t) = r.bounds();
+    match s.store.coverage(f, t, Utc::now().timestamp_millis()) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => err(e),
+    }
 }
 
 /// Changes people made to objects Fleet deploys, and whether Fleet put them back.
@@ -467,6 +489,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/related", get(related))
         .route("/api/hourly", get(hourly))
         .route("/api/integrity", get(integrity))
+        .route("/api/coverage", get(coverage))
         .route("/api/restore", get(restore))
         .route("/api/gitops", get(gitops))
         .route("/api/forwarding", get(forwarding))

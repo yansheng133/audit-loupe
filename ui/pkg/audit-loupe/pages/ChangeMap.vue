@@ -42,6 +42,7 @@ export default {
       model:      { OBJ: {}, ACTORS: {}, EVENTS: [] },
       stories:    [],
       clusters:   [],
+      coverageRows: [],
       work:       [9, 18],
       loading:    false,
       error:      null,
@@ -117,7 +118,7 @@ export default {
       const out = {};
 
       this.clusterOptions.forEach(([c]) => {
-        out[c] = coverageOf(this.clusters.find((x) => x.cluster === c), this.T);
+        out[c] = coverageOf(this.clusters.find((x) => x.cluster === c), this.T, this.coverageRows.find((x) => x.cluster === c));
       });
 
       return out;
@@ -219,7 +220,7 @@ export default {
           this.$store.dispatch('management/findAll', { type: 'management.cattle.io.cluster' }).catch(() => {}),
           this.$store.dispatch('management/findAll', { type: 'management.cattle.io.project' }).catch(() => {}),
         ]);
-        const [info, rows, unattributed, actors, stories, clusters, nsProjects] = await Promise.all([
+        const [info, rows, unattributed, actors, stories, clusters, nsProjects, coverageRows] = await Promise.all([
           getJson('/api/info'),
           getJson('/api/timeline', { ...range, all: 1, limit: LIMIT }),
           getJson('/api/unattributed', range),
@@ -227,6 +228,7 @@ export default {
           getJson('/api/stories', range),
           getJson('/api/clusters', range),
           getJson('/api/projects'),
+          getJson('/api/coverage', range).catch(() => []),
         ]);
         const [ws, we] = String(info.workHours || '9-18').split('-').map(Number);
 
@@ -237,6 +239,7 @@ export default {
         });
         this.stories = stories;
         this.clusters = clusters;
+        this.coverageRows = coverageRows;
         this.openFirstStory();
       } catch (e) {
         console.error('audit-loupe: load failed', e); // eslint-disable-line no-console

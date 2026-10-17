@@ -166,9 +166,39 @@ pub fn next_source(path: &Path, pos: &Position) -> Next {
     }
 }
 
+/// What a collector reports about itself every minute (coverage page).
+pub type Health = Arc<Mutex<serde_json::Map<String, serde_json::Value>>>;
+
+pub fn set(h: &Health, key: &str, v: serde_json::Value) {
+    h.lock().unwrap().insert(key.to_string(), v);
+}
+
+/// Send a heartbeat every minute, with or without data, so the server can tell a quiet
+/// cluster from a collector that stopped.
+pub fn heartbeat(collector: &'static str) -> anyhow::Result<Health> {
+    let sender = Sender::from_env("heartbeat")?;
+    let health: Health = Default::default();
+    let h = health.clone();
+    let instance = std::env::var("NODE_NAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "unknown".into());
+    tokio::spawn(async move {
+        // Let the collector fill in its report before the first beat.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        loop {
+            let details = serde_json::Value::Object(h.lock().unwrap().clone());
+            let body = serde_json::json!({"collector": collector, "instance": instance, "version": env!("CARGO_PKG_VERSION"), "details": details});
+            if let Err(e) = sender.send(body.to_string().as_bytes()).await {
+                warn!(error = %e, "heartbeat failed");
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    });
+    Ok(health)
+}
+
 /// Follow the audit log forever.
 pub async fn run_file() -> anyhow::Result<()> {
     let sender = Sender::from_env("k8s-audit")?;
+    let health = heartbeat("file")?;
     let path = PathBuf::from(env_or("AL_AUDIT_LOG", "/var/lib/rancher/rke2/server/logs/audit.log"));
     let state_dir = PathBuf::from(env_or("AL_STATE_DIR", "/var/lib/audit-loupe"));
     fs::create_dir_all(&state_dir)?;
@@ -177,7 +207,14 @@ pub async fn run_file() -> anyhow::Result<()> {
     info!(file = %path.display(), ?pos, "following audit log");
     let mut backoff = 1u64;
     loop {
-        let (source, restart) = match next_source(&path, &pos) {
+        let next = next_source(&path, &pos);
+        set(&health, "auditLog", serde_json::json!(if next == Next::Missing { "missing" } else { "present" }));
+        if let Ok(m) = fs::metadata(&path) {
+            if m.ino() == pos.inode {
+                set(&health, "lagBytes", serde_json::json!(m.len().saturating_sub(pos.offset)));
+            }
+        }
+        let (source, restart) = match next {
             Next::Missing => {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
@@ -212,6 +249,7 @@ pub async fn run_file() -> anyhow::Result<()> {
                 pos.offset += consumed;
                 pos.save(&state)?;
                 backoff = 1;
+                set(&health, "lastSentMs", serde_json::json!(chrono::Utc::now().timestamp_millis()));
             }
             Err(e) => {
                 warn!(error = %e, retry_in = backoff, "send failed; will resend the same lines");
@@ -339,6 +377,7 @@ fn container_running(pod: &Pod, container: &str) -> bool {
 /// Find the Rancher pods every 15 s and keep one follower per pod.
 pub async fn run_rancher() -> anyhow::Result<()> {
     let sender = Sender::from_env("rancher-audit")?;
+    let health = heartbeat("rancher")?;
     let ns = env_or("AL_RANCHER_NAMESPACE", "cattle-system");
     let selector = env_or("AL_RANCHER_SELECTOR", "app=rancher");
     let container = env_or("AL_RANCHER_CONTAINER", "rancher-audit-log");
@@ -380,6 +419,8 @@ pub async fn run_rancher() -> anyhow::Result<()> {
                         following.lock().unwrap().remove(&uid);
                     });
                 }
+                set(&health, "podsFollowing", serde_json::json!(following.lock().unwrap().len()));
+                set(&health, "sidecarMissing", serde_json::json!(warned));
                 // Forget pods that are gone; their logs went with them.
                 positions.lock().unwrap().retain(|uid, _| seen.contains(uid));
             }
