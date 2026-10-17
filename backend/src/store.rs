@@ -259,6 +259,17 @@ pub struct RoleChange {
     pub reason: Option<&'static str>,
 }
 
+pub struct RestoreSource {
+    pub cluster: String,
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+    pub change: String,
+    pub observed: String,
+    pub by: Option<String>,
+    pub before: Option<Value>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct GitopsRow {
     pub event_id: i64,
@@ -1420,6 +1431,40 @@ impl Store {
             })?
             .collect::<Result<_, _>>()?;
         Ok(rows)
+    }
+
+    /// For a stored version: the object's previous version (what to restore), and who made
+    /// the change. None when the version does not exist.
+    pub fn restore_source(&self, vid: i64) -> anyhow::Result<Option<RestoreSource>> {
+        let c = self.conn.lock().unwrap();
+        let row: Option<(String, String, String, String, String, String, String, String, Option<i64>)> = c
+            .query_row(
+                "SELECT cluster, api_group, resource, kind, namespace, name, change, observed, event_id FROM versions WHERE id=?1",
+                params![vid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
+            )
+            .optional()?;
+        let Some((cluster, group, resource, kind, ns, name, change, observed, eid)) = row else { return Ok(None) };
+        let before: Option<String> = c
+            .query_row(
+                "SELECT body FROM versions WHERE cluster=?1 AND api_group=?2 AND resource=?3 AND namespace=?4 AND name=?5 AND id < ?6 ORDER BY id DESC LIMIT 1",
+                params![cluster, group, resource, ns, name, vid],
+                |r| r.get(0),
+            )
+            .optional()?;
+        // A deletion stores the last state seen; restoring "before the delete" means that.
+        let before = match (change.as_str(), before) {
+            ("deleted", None) => c.query_row("SELECT body FROM versions WHERE id=?1", params![vid], |r| r.get(0)).optional()?,
+            (_, b) => b,
+        };
+        let by: Option<String> = match eid {
+            Some(e) => c.query_row("SELECT actor FROM events WHERE id=?1", params![e], |r| r.get(0)).optional()?,
+            None => None,
+        };
+        Ok(Some(RestoreSource {
+            cluster, kind, namespace: ns, name, change, observed, by,
+            before: before.and_then(|b| serde_json::from_str(&b).ok()),
+        }))
     }
 
     /// Labels of a namespace as last seen.

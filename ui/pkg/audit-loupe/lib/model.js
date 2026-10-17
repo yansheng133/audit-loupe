@@ -44,6 +44,7 @@ const ZH = {
   },
   noteExec: '在容器裡下了哪些指令，audit log 不會記錄。', noteSecret: 'Secret 不保存版本，只記錄誰在何時存取。', noteConfigMap: 'ConfigMap 的值預設遮蔽，只顯示哪個鍵變了。',
   noteGone: '物件已不在叢集裡；顯示的是最後看到的內容。',
+  restore: '下載還原用 YAML', restoreHint: '這次變更之前的內容；只產生檔案，不會套用。',
   rel: {
     owned_by: '屬於', mounts: '掛載', reads: '讀取', runs_as: '以此身分執行', pulls_with: '拉映像用', selects: '選到', applies_to: '套用到', routes_to: '導流到',
     uses_tls: '使用憑證', attached_to: '掛在', grants_role: '授予角色', grants_to: '授予給', scales: '自動調整', on: '範圍'
@@ -92,6 +93,7 @@ const EN = {
   },
   noteExec: 'The commands typed inside the container are not in the audit log.', noteSecret: 'Secrets are not versioned; only who accessed them and when.', noteConfigMap: 'ConfigMap values are masked; only which key changed is shown.',
   noteGone: 'The object is gone; this is the last content seen.',
+  restore: 'Download restore YAML', restoreHint: 'The state before this change; generated only, never applied.',
   rel: {
     owned_by: 'owned by', mounts: 'mounts', reads: 'reads', runs_as: 'runs as', pulls_with: 'pulls with', selects: 'selects', applies_to: 'applies to', routes_to: 'routes to',
     uses_tls: 'uses certificate', attached_to: 'attached to', grants_role: 'grants role', grants_to: 'grants to', scales: 'scales', on: 'scope'

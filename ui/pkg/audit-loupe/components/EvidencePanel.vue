@@ -1,5 +1,6 @@
 <script>
 import { identityChain, RULE_SEV } from '../lib/model';
+import { baseUrl } from '../lib/api';
 
 // Right column: every action on the selected object this day, then for the chosen one who
 // did it (identity chain), what it changed, and the related objects.
@@ -29,6 +30,13 @@ export default {
     },
     chain() {
       return this.ev ? identityChain(this.ev, this.obj, this.ACTORS[this.ev.actor], this.T) : null;
+    },
+    // The version this action produced; restoring means the state before it.
+    restoreUrl() {
+      const r = this.ev?.raw;
+      const vid = r?.unattributed ? r.id : r?.version_id;
+
+      return vid && this.ev.change && this.ev.change !== 'added' ? `${ baseUrl() }/api/restore?version_id=${ vid }` : null;
     },
     rel() {
       return this.related.map((r) => ({
@@ -126,7 +134,7 @@ export default {
       </div>
 
       <div
-        v-if="ev && (ev.diff.length || ev.note || rel.length)"
+        v-if="ev && (ev.diff.length || ev.note || rel.length || restoreUrl)"
         class="evidence"
       >
         <h3>{{ ev.diff.length ? T.whatChanged(ev.hhmm) : T.notes(ev.hhmm) }}</h3>
@@ -149,6 +157,17 @@ export default {
         >
           {{ ev.note }}
         </p>
+        <div
+          v-if="restoreUrl"
+          class="impact"
+        >
+          <a
+            class="linkbtn"
+            :href="restoreUrl"
+            download
+          >{{ T.restore }}</a>
+          <span class="muted">{{ T.restoreHint }}</span>
+        </div>
         <div
           v-if="rel.length"
           class="impact"

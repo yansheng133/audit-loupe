@@ -211,6 +211,44 @@ async fn integrity(State(s): State<AppState>, Q(p): Q<ChainParams>) -> Response 
     }
 }
 
+#[derive(Deserialize)]
+struct RestoreParams {
+    version_id: i64,
+}
+
+/// The object as it was before a stored change, as YAML to review and apply by hand.
+async fn restore(State(s): State<AppState>, Q(p): Q<RestoreParams>) -> Response {
+    let src = match s.store.restore_source(p.version_id) {
+        Ok(Some(x)) => x,
+        Ok(None) => return (StatusCode::NOT_FOUND, Json(json!({"error": "no such version"}))).into_response(),
+        Err(e) => return err(e),
+    };
+    let target = if src.namespace.is_empty() { src.name.clone() } else { format!("{}/{}", src.namespace, src.name) };
+    let Some(before) = src.before else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "this change created the object; there is no earlier state. Undoing it means deleting the object.",
+                        "command": format!("kubectl delete {} {}{}", src.kind.to_lowercase(), src.name, if src.namespace.is_empty() { String::new() } else { format!(" -n {}", src.namespace) })})),
+        )
+            .into_response();
+    };
+    let header = vec![
+        format!("Audit Loupe restore file: {} {} in cluster {}", src.kind, target, src.cluster),
+        format!("State before the change seen at {} ({}) by {}", src.observed, src.change, src.by.as_deref().unwrap_or("an unknown actor")),
+        "Generated only; nothing was applied. Review it, then: kubectl apply -f <this file> (against that cluster).".into(),
+    ];
+    let body = crate::restore::restore_file(&before, &header);
+    let file = format!("restore-{}-{}-{}.yaml", src.kind.to_lowercase(), src.name, p.version_id);
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "application/yaml; charset=utf-8".to_string()),
+            (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=\"{file}\"")),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 /// Changes people made to objects Fleet deploys, and whether Fleet put them back.
 async fn gitops(State(s): State<AppState>, Q(r): Q<Range>) -> Response {
     let (f, t) = r.bounds();
@@ -429,6 +467,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/related", get(related))
         .route("/api/hourly", get(hourly))
         .route("/api/integrity", get(integrity))
+        .route("/api/restore", get(restore))
         .route("/api/gitops", get(gitops))
         .route("/api/forwarding", get(forwarding))
         .route("/api/integrity/anchor", get(integrity_anchor))
@@ -525,6 +564,31 @@ mod tests {
         let rows = st.store.timeline(&Query { cluster: None, actor: None, from_ms: 0, to_ms: i64::MAX, humans_only: false, writes_only: false, alerts_only: false, limit: 10 }).unwrap();
         assert!(rows[0].alerts.contains(&"outside_change_window".to_string()), "{:?}", rows[0].alerts);
         assert!(!rows[0].alerts.contains(&"off_hours".to_string()), "windows replace the working-hours rule");
+    }
+
+    #[tokio::test]
+    async fn restore_gives_the_state_before_the_change() {
+        let st = state();
+        let key = ObjKey { cluster: "c1".into(), api_group: "apps".into(), resource: "deployments".into(), namespace: "shop".into(), name: "web".into() };
+        let t = chrono::Utc::now();
+        let v1 = serde_json::json!({"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"web","namespace":"shop","uid":"u"},"spec":{"replicas":3}});
+        let first = st.store.insert_version(&key, "Deployment", "u", &v1, "baseline", t).unwrap().unwrap();
+        let mut v2 = v1.clone();
+        v2["spec"]["replicas"] = serde_json::json!(9);
+        let second = st.store.insert_version(&key, "Deployment", "u", &v2, "modified", t).unwrap().unwrap();
+        let get = |id: i64| {
+            let app = router(st.clone());
+            async move {
+                let res = app.oneshot(Request::get(format!("/api/restore?version_id={id}")).body(Body::empty()).unwrap()).await.unwrap();
+                let code = res.status();
+                (code, String::from_utf8(axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap())
+            }
+        };
+        let (code, yaml) = get(second).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(yaml.contains("replicas: 3") && !yaml.contains("uid"), "{yaml}");
+        let (code, _) = get(first).await;
+        assert_eq!(code, StatusCode::CONFLICT, "the first sighting has nothing before it");
     }
 
     #[tokio::test]

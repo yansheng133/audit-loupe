@@ -9,6 +9,7 @@ mod forward;
 mod integrity;
 mod rancher;
 mod relations;
+mod restore;
 mod rules;
 mod store;
 mod watch;
