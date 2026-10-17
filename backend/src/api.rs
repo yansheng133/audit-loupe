@@ -185,6 +185,30 @@ async fn history(State(s): State<AppState>, Q(p): Q<HistoryParams>) -> Response 
 }
 
 #[derive(Deserialize)]
+struct ClusterRange {
+    cluster: Option<String>,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+    hours: Option<i64>,
+}
+
+async fn hourly(State(s): State<AppState>, Q(p): Q<ClusterRange>) -> Response {
+    let (f, t) = Range { from: p.from, to: p.to, hours: p.hours }.bounds();
+    match s.store.hourly(p.cluster.as_deref().filter(|c| !c.is_empty()), f, t) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+async fn stories(State(s): State<AppState>, Q(p): Q<ClusterRange>) -> Response {
+    let (f, t) = Range { from: p.from, to: p.to, hours: p.hours }.bounds();
+    match s.store.stories(p.cluster.as_deref().filter(|c| !c.is_empty()), f, t) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+#[derive(Deserialize)]
 struct RelatedParams {
     cluster: String,
     kind: String,
@@ -238,6 +262,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/objects", get(objects))
         .route("/api/history", get(history))
         .route("/api/related", get(related))
+        .route("/api/hourly", get(hourly))
+        .route("/api/stories", get(stories))
         .route("/api/alerts", get(alerts))
         .with_state(state)
 }

@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS events (
   verb TEXT NOT NULL, api_group TEXT NOT NULL, resource TEXT NOT NULL, subresource TEXT NOT NULL,
   namespace TEXT NOT NULL, name TEXT NOT NULL, code INTEGER NOT NULL,
   source_ip TEXT NOT NULL, user_agent TEXT NOT NULL, request_uri TEXT NOT NULL, request_object TEXT,
-  source TEXT NOT NULL DEFAULT 'k8s', user_id TEXT NOT NULL DEFAULT '', link_id INTEGER,
+  source TEXT NOT NULL DEFAULT 'k8s', user_id TEXT NOT NULL DEFAULT '', link_id INTEGER, story_id INTEGER,
   UNIQUE(cluster, audit_id)
 );
 CREATE INDEX IF NOT EXISTS events_ts ON events(ts_ms);
@@ -58,6 +58,17 @@ CREATE TABLE IF NOT EXISTS relations (
 CREATE INDEX IF NOT EXISTS relations_from ON relations(cluster, from_kind, from_ns, from_name);
 CREATE INDEX IF NOT EXISTS relations_to ON relations(cluster, to_kind, to_ns, to_name);
 CREATE INDEX IF NOT EXISTS relations_sel ON relations(cluster, from_ns) WHERE selector IS NOT NULL;
+CREATE TABLE IF NOT EXISTS hourly (
+  cluster TEXT NOT NULL, hour_ms INTEGER NOT NULL, actor_key TEXT NOT NULL, human INTEGER NOT NULL,
+  writes INTEGER NOT NULL, alerts INTEGER NOT NULL,
+  PRIMARY KEY (cluster, hour_ms, actor_key)
+);
+CREATE TABLE IF NOT EXISTS stories (
+  id INTEGER PRIMARY KEY, cluster TEXT NOT NULL, actor_key TEXT NOT NULL, via TEXT NOT NULL,
+  severity TEXT NOT NULL, first_ms INTEGER NOT NULL, last_ms INTEGER NOT NULL, count INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS stories_actor ON stories(cluster, actor_key, via, last_ms);
+CREATE INDEX IF NOT EXISTS stories_time ON stories(last_ms);
 CREATE TABLE IF NOT EXISTS users (
   user_id TEXT NOT NULL, uid TEXT NOT NULL,
   display_name TEXT NOT NULL, username TEXT NOT NULL, principal_ids TEXT NOT NULL,
@@ -79,6 +90,7 @@ const ADDED_COLUMNS: &[(&str, &str)] = &[
     ("source", "TEXT NOT NULL DEFAULT 'k8s'"),
     ("user_id", "TEXT NOT NULL DEFAULT ''"),
     ("link_id", "INTEGER"),
+    ("story_id", "INTEGER"),
 ];
 
 /// A Rancher record that was matched to the downstream record of the same action is shown
@@ -189,6 +201,41 @@ pub struct UserLife {
 }
 
 #[derive(Debug, Serialize)]
+pub struct HourRow {
+    pub hour_ms: i64,
+    pub actor_key: String,
+    pub human: bool,
+    pub writes: i64,
+    pub alerts: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StoryEvent {
+    pub id: i64,
+    pub ts: String,
+    pub verb: String,
+    pub resource: String,
+    pub subresource: String,
+    pub namespace: String,
+    pub name: String,
+    pub alerts: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StoryRow {
+    pub id: i64,
+    pub cluster: String,
+    pub actor_key: String,
+    pub actor: String,
+    pub via: String,
+    pub severity: String,
+    pub first_ms: i64,
+    pub last_ms: i64,
+    pub count: i64,
+    pub events: Vec<StoryEvent>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct RelatedRow {
     /// "out": this object points at the other; "in": the other points at this one.
     pub direction: &'static str,
@@ -232,6 +279,14 @@ const WORKLOAD_KINDS: &str = "('Deployment','StatefulSet','DaemonSet','Job','Cro
 
 const WRITE_VERBS: &str = "('create','update','patch','delete','deletecollection')";
 
+/// Whether a record counts as a change on the time axis: the same rule as the default timeline.
+fn counts(r: &Record, alerts: &[Alert]) -> bool {
+    crate::audit::is_write(&r.verb)
+        || matches!(r.subresource.as_str(), "exec" | "attach" | "portforward")
+        || r.source == Source::Rancher
+        || !alerts.is_empty()
+}
+
 fn ms(t: &DateTime<Utc>) -> i64 {
     t.timestamp_millis()
 }
@@ -272,9 +327,9 @@ impl Store {
     /// Match a newly stored record to the other half of the same action: the Rancher record
     /// of a request Rancher proxied, and the downstream record of it (impersonated). Either
     /// can arrive first. Returns whether a match was made.
-    fn pair(tx: &Transaction, id: i64, cluster: &str, r: &Record) -> anyhow::Result<bool> {
+    fn pair(tx: &Transaction, id: i64, cluster: &str, r: &Record) -> anyhow::Result<Option<i64>> {
         if r.user_id.is_empty() || r.via != Via::Rancher {
-            return Ok(false);
+            return Ok(None);
         }
         let t = ms(&r.ts);
         let (other, lo, hi) = match r.source {
@@ -294,14 +349,132 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()?;
-        let Some(other_id) = hit else { return Ok(false) };
+        let Some(other_id) = hit else { return Ok(None) };
         tx.execute("UPDATE events SET link_id=?1 WHERE id=?2", params![other_id, id])?;
         tx.execute("UPDATE events SET link_id=?1 WHERE id=?2", params![id, other_id])?;
         // A version may already have been credited to the Rancher half; the downstream
         // record is the one shown, so it takes the version over.
         let (k8s, rancher) = if r.source == Source::K8s { (id, other_id) } else { (other_id, id) };
         tx.execute("UPDATE versions SET event_id=?1 WHERE event_id=?2", params![k8s, rancher])?;
-        Ok(true)
+        Ok(Some(other_id))
+    }
+
+    fn bump(tx: &Transaction, cluster: &str, t: i64, key: &str, human: bool, writes: i64, alerts: i64) -> anyhow::Result<()> {
+        let hour = t - t.rem_euclid(3_600_000);
+        tx.execute(
+            "INSERT INTO hourly (cluster, hour_ms, actor_key, human, writes, alerts) VALUES (?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(cluster, hour_ms, actor_key) DO UPDATE SET writes=writes+excluded.writes, alerts=alerts+excluded.alerts,
+               human=max(human, excluded.human)",
+            params![cluster, hour, key, human as i64, writes, alerts],
+        )?;
+        Ok(())
+    }
+
+    /// Take a Rancher record back out of the hourly counts and its story, once it turned out
+    /// to be the other half of a downstream record.
+    fn uncount(tx: &Transaction, id: i64) -> anyhow::Result<()> {
+        let (cluster, t, key, human, story, alerts): (String, i64, String, i64, Option<i64>, i64) = tx.query_row(
+            &format!("SELECT cluster, ts_ms, {ACTOR_KEY}, human, story_id, (SELECT count(*) FROM alerts WHERE event_id=events.id) FROM events WHERE id=?1"),
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )?;
+        Self::bump(tx, &cluster, t, &key, human == 1, -1, -((alerts > 0) as i64))?;
+        if let Some(sid) = story {
+            tx.execute("UPDATE events SET story_id=NULL WHERE id=?1", params![id])?;
+            tx.execute("UPDATE stories SET count=count-1 WHERE id=?1", params![sid])?;
+            tx.execute("DELETE FROM stories WHERE id=?1 AND count<=0", params![sid])?;
+        }
+        Ok(())
+    }
+
+    /// Medium and high risk actions by the same person, the same way in, on the same cluster
+    /// within 10 minutes of each other read as one story ("needs attention" list).
+    fn add_to_story(tx: &Transaction, id: i64, cluster: &str, key: &str, via: &str, t: i64, alerts: &[Alert]) -> anyhow::Result<()> {
+        const GAP: i64 = 10 * 60_000;
+        let sev = if alerts.iter().any(|a| a.severity == "high") { "high" } else { "medium" };
+        let hit: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM stories WHERE cluster=?1 AND actor_key=?2 AND via=?3 AND last_ms >= ?4 AND first_ms <= ?5
+                 ORDER BY abs(last_ms - ?6) LIMIT 1",
+                params![cluster, key, via, t - GAP, t + GAP, t],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let sid = match hit {
+            Some(sid) => {
+                tx.execute(
+                    "UPDATE stories SET first_ms=min(first_ms, ?2), last_ms=max(last_ms, ?2), count=count+1,
+                       severity=CASE WHEN severity='high' OR ?3='high' THEN 'high' ELSE 'medium' END WHERE id=?1",
+                    params![sid, t, sev],
+                )?;
+                sid
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO stories (cluster, actor_key, via, severity, first_ms, last_ms, count) VALUES (?1,?2,?3,?4,?5,?5,1)",
+                    params![cluster, key, via, sev, t],
+                )?;
+                tx.last_insert_rowid()
+            }
+        };
+        tx.execute("UPDATE events SET story_id=?1 WHERE id=?2", params![sid, id])?;
+        Ok(())
+    }
+
+    /// Hourly change counts per person, for the time axis.
+    pub fn hourly(&self, cluster: Option<&str>, from_ms: i64, to_ms: i64) -> anyhow::Result<Vec<HourRow>> {
+        let c = self.conn.lock().unwrap();
+        let mut st = c.prepare(
+            "SELECT hour_ms, actor_key, max(human), sum(writes), sum(alerts) FROM hourly
+             WHERE hour_ms BETWEEN ?1 AND ?2 AND (?3 IS NULL OR cluster=?3) GROUP BY hour_ms, actor_key HAVING sum(writes) > 0 ORDER BY hour_ms",
+        )?;
+        let rows = st
+            .query_map(params![from_ms - 3_600_000, to_ms, cluster], |r| {
+                Ok(HourRow { hour_ms: r.get(0)?, actor_key: r.get(1)?, human: r.get::<_, i64>(2)? == 1, writes: r.get(3)?, alerts: r.get(4)? })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Stories in the range, most serious first, each with its events.
+    pub fn stories(&self, cluster: Option<&str>, from_ms: i64, to_ms: i64) -> anyhow::Result<Vec<StoryRow>> {
+        let c = self.conn.lock().unwrap();
+        let mut st = c.prepare(
+            "SELECT id, cluster, actor_key, via, severity, first_ms, last_ms, count FROM stories
+             WHERE last_ms >= ?1 AND first_ms <= ?2 AND (?3 IS NULL OR cluster=?3)
+             ORDER BY CASE severity WHEN 'high' THEN 0 ELSE 1 END, first_ms",
+        )?;
+        let mut rows: Vec<StoryRow> = st
+            .query_map(params![from_ms, to_ms, cluster], |r| {
+                Ok(StoryRow {
+                    id: r.get(0)?, cluster: r.get(1)?, actor_key: r.get(2)?, via: r.get(3)?, severity: r.get(4)?,
+                    first_ms: r.get(5)?, last_ms: r.get(6)?, count: r.get(7)?, actor: String::new(), events: vec![],
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        drop(st);
+        let mut ev = c.prepare_cached(
+            "SELECT id, ts, verb, resource, subresource, namespace, name, actor,
+                    (SELECT group_concat(rule) FROM alerts a WHERE a.event_id=events.id)
+             FROM events WHERE story_id=?1 ORDER BY ts_ms",
+        )?;
+        for s in rows.iter_mut() {
+            s.events = ev
+                .query_map(params![s.id], |r| {
+                    let al: Option<String> = r.get(8)?;
+                    Ok(StoryEvent {
+                        id: r.get(0)?, ts: r.get(1)?, verb: r.get(2)?, resource: r.get(3)?, subresource: r.get(4)?,
+                        namespace: r.get(5)?, name: r.get(6)?, alerts: al.map(|a| a.split(',').map(String::from).collect()).unwrap_or_default(),
+                    })
+                })?
+                .collect::<Result<_, _>>()?;
+            let snapshot: Option<String> = c.query_row("SELECT actor FROM events WHERE story_id=?1 ORDER BY ts_ms DESC LIMIT 1", params![s.id], |r| r.get(0)).optional()?;
+            let directory: Option<String> = c
+                .query_row("SELECT display_name FROM users WHERE user_id=?1 ORDER BY created_ms DESC LIMIT 1", params![s.actor_key], |r| r.get(0))
+                .optional()?;
+            s.actor = directory.or(snapshot).unwrap_or_else(|| s.actor_key.clone());
+        }
+        Ok(rows)
     }
 
     /// Insert a batch in one transaction. Returns how many were new (collectors resend a batch
@@ -334,7 +507,22 @@ impl Store {
                 for a in alerts {
                     al.execute(params![id, a.rule, a.severity])?;
                 }
-                Self::pair(&tx, id, cl, r)?;
+                let paired = Self::pair(&tx, id, cl, r)?;
+                let key = if r.user_id.is_empty() { r.actor.as_str() } else { r.user_id.as_str() };
+                let t = ms(&r.ts);
+                match (r.source, paired) {
+                    // The downstream record is the one shown; this half was never counted.
+                    (Source::Rancher, Some(_)) => continue,
+                    // This record takes over from a Rancher half that was counted on its own.
+                    (Source::K8s, Some(other)) => Self::uncount(&tx, other)?,
+                    _ => {}
+                }
+                if counts(r, alerts) {
+                    Self::bump(&tx, cl, t, key, r.human, 1, !alerts.is_empty() as i64)?;
+                }
+                if alerts.iter().any(|a| matches!(a.severity, "high" | "medium")) {
+                    Self::add_to_story(&tx, id, cl, key, r.via.as_str(), t, alerts)?;
+                }
             }
         }
         tx.commit()?;
@@ -852,6 +1040,8 @@ impl Store {
             "DELETE FROM events WHERE ts_ms < ?1 AND id NOT IN (SELECT event_id FROM versions WHERE event_id IS NOT NULL)",
             params![cutoff],
         )?;
+        c.execute("DELETE FROM hourly WHERE hour_ms < ?1", params![cutoff])?;
+        c.execute("DELETE FROM stories WHERE last_ms < ?1", params![cutoff])?;
         Ok(n + m)
     }
 }
@@ -1105,6 +1295,37 @@ mod tests {
         moved["spec"]["template"]["metadata"]["labels"]["app"] = json!("web-v2");
         s.insert_version(&key(), "Deployment", "d1", &moved, "modified", t + chrono::Duration::minutes(9)).unwrap();
         assert!(s.related("c1", "Service", "shop", "web").unwrap().is_empty());
+    }
+
+    fn direct(id: &str, verb: &str, resource: &str, name: &str, ts: &str) -> Record {
+        let ev = format!(r#"{{"auditID":"{id}","stage":"ResponseComplete","verb":"{verb}","user":{{"username":"system:admin"}},
+          "objectRef":{{"resource":"{resource}","name":"{name}","apiGroup":"rbac.authorization.k8s.io"}},"responseStatus":{{"code":200}},"stageTimestamp":"{ts}"}}"#);
+        to_record(&parse_body(ev.as_bytes()).unwrap()[0]).unwrap()
+    }
+
+    #[test]
+    fn risky_bursts_become_one_story_and_hours_are_counted() {
+        let s = Store::open(":memory:").unwrap();
+        let cfg = Config::test();
+        for (id, ts) in [("a", "2026-10-14T15:00:00Z"), ("b", "2026-10-14T15:06:00Z"), ("c", "2026-10-14T15:30:00Z")] {
+            let r = direct(id, "create", "clusterrolebindings", id, ts);
+            s.insert_event("c1", &r, &evaluate(&r, &cfg)).unwrap();
+        }
+        let st = s.stories(None, 0, i64::MAX).unwrap();
+        assert_eq!(st.iter().map(|x| x.count).collect::<Vec<_>>(), vec![2, 1], "15:00 and 15:06 together, 15:30 alone");
+        assert_eq!(st[0].actor, "system:admin");
+        let h = s.hourly(None, 0, i64::MAX).unwrap();
+        assert_eq!((h.len(), h[0].writes, h[0].alerts), (1, 3, 3));
+    }
+
+    #[test]
+    fn a_paired_rancher_half_is_not_counted_twice() {
+        let s = Store::open(":memory:").unwrap();
+        s.insert_event("local", &rancher_put("r1", "2026-10-14T02:00:01Z"), &[]).unwrap();
+        assert_eq!(s.hourly(None, 0, i64::MAX).unwrap()[0].writes, 1);
+        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00.900Z"), &[]).unwrap();
+        let h = s.hourly(None, 0, i64::MAX).unwrap();
+        assert_eq!(h.iter().map(|x| x.writes).sum::<i64>(), 1, "{h:?}");
     }
 
     #[test]

@@ -126,9 +126,12 @@ async fn resolve(client: &Client, spec: &str) -> anyhow::Result<Option<ApiResour
         anyhow::bail!("{plural} are never watched");
     }
     // Only the one group, so an unavailable aggregated API elsewhere does not matter.
+    // A group the cluster does not serve (Gateway API not installed, Rancher types on a
+    // downstream cluster) is a discovery error, not a 404.
     let g = match discovery::group(client, &group).await {
         Ok(g) => g,
         Err(kube::Error::Api(e)) if e.code == 404 => return Ok(None),
+        Err(kube::Error::Discovery(kube::error::DiscoveryError::MissingApiGroup(_))) => return Ok(None),
         Err(e) => return Err(e.into()),
     };
     Ok(g.versioned_resources(&version).into_iter().find(|(ar, _)| ar.plural == plural).map(|(ar, _)| ar))
