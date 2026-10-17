@@ -136,13 +136,15 @@ flowchart LR
 3. **刪除後的連帶清除**：Rancher 刪除使用者後自動清掉的權限綁定（CRTB、PRTB 等），標為「刪除使用者後由 Rancher 自動清除」，不算成高風險操作。
 4. **對不起來就照實標示**：Audit Loupe 安裝前就被刪的人、或紀錄沒帶 IdP 欄位的路徑，顯示「無法辨識的使用者 `u-xxxxx`」，不猜。
 
-**同一個人被刪後又重新加入**（新的 `u-xxxxx`）：
+**同一個人被刪後又重新加入**：
 
-- 以 IdP principal（AD、LDAP、Keycloak 等外部帳號）相同為條件，合併成同一個人。
-- Rancher 本機帳號一律不合併：同名不代表同一個人。
-- 介面上一定要看得出是合併的結果：人名旁加「已合併 N 個帳號」標籤，展開可看到每個 `u-xxxxx` 的建立與刪除時間、各自的操作筆數。
-- 可以把合併的帳號分開來看，分開後每個 `u-xxxxx` 各自一列。M1 只做檢視切換：每位使用者在自己的畫面上展開或分開，不影響別人、不需要寫入權限。由管理者永久標記「這兩個帳號不是同一個人」需要寫入 API、權限控管，標記本身也要留稽核紀錄，等實際遇到誤合併再做。
-- 合併只影響顯示與統計，資料庫裡每筆事件仍保留原本的 `u-xxxxx`，所以分開或合併都不需要改寫資料。
+- Rancher 為外部 IdP 使用者產生 ID 的方式是 `u-` 加上 principal 的 SHA-256 前 10 碼（`pkg/auth/providers/common/usermanager.go`）。所以同一個 IdP 帳號被刪除後再登入，會拿回**同一個** `u-xxxxx`，只是 User 物件的 UID 不同。
+- 因此合併的依據是 `u-xxxxx` 本身，一個 `u-xxxxx` 可能有好幾段「生命期」，以 User 物件的 UID 區分。名冊記錄每一段的 UID、建立時間、刪除時間。
+- Rancher 本機帳號的 ID 是隨機產生的，刪除後重建會是不同的 `u-xxxxx`，一律不合併：同名不代表同一個人。
+- 介面上一定要看得出來：曾被刪除又重新加入的人，名字旁加「曾刪除後重新加入（N 段）」標籤，展開可看到每一段的建立與刪除時間、各自的操作筆數。
+- 可以分開來看，分開後每一段各自一列。M1 只做檢視切換：每位使用者在自己的畫面上展開或分開，不影響別人、不需要寫入權限。
+- 每筆事件寫入時記下當時那一段的 UID，所以分開或合併都不需要改寫資料。
+- 同一個人換了 IdP（例如從 LDAP 換到 OIDC）會變成不同 principal、不同 `u-xxxxx`，這種情況不自動合併。
 
 ## 5. 流量控管
 
@@ -193,9 +195,11 @@ lab 實測時要量：每座叢集每秒幾筆、過濾前後差多少、每天�
 6. 四種情境在畫面上是否正確：經 Rancher 介面、經 Rancher kubectl、用節點管理者憑證繞過 Rancher、收集元件中斷。
 7. 過濾前後的紀錄量與儲存空間。
 8. UI extension 整頁版面。
-9. Steve URI 的實際形式：型別名稱是複數（`apps.deployments`）還是單數；兩段路徑（`/v1/<型別>/<x>`）在新增、修改、刪除時的意義。
-10. `user.identity` 欄位從哪個 Rancher 版本開始有、`audit-log-username` 預設是否開啟。
-11. 經 ACE（Authorized Cluster Endpoint）直連下游時，下游紀錄是否帶 IdP 欄位；刪除使用者後 Rancher 自動清除了哪些物件；被刪除的 `u-xxxxx` 是否可能被重新使用。
+9. Rancher 本身內建 Fleet 的版本有沒有 `fleet.cattle.io/managed-by-*` 標籤；local cluster 上 Fleet agent 的 namespace（`cattle-fleet-local-system` 或其他）；Fleet 自動改回時 audit log 裡的動詞。
+10. SUSE Security 在 Monitor 模式下，對 exec 進去執行的指令會不會產生違規事件（zero-drift 對 exec 有例外）。
+11. Steve URI 的實際形式：型別名稱是複數（`apps.deployments`）還是單數；兩段路徑（`/v1/<型別>/<x>`）在新增、修改、刪除時的意義。
+12. `user.identity` 欄位從哪個 Rancher 版本開始有、`audit-log-username` 預設是否開啟。
+13. 經 ACE（Authorized Cluster Endpoint）直連下游時，下游紀錄是否帶 IdP 欄位；刪除使用者後 Rancher 自動清除了哪些物件；被刪除的 `u-xxxxx` 是否可能被重新使用。
 
 ## 9. 分階段
 
@@ -208,6 +212,57 @@ lab 實測時要量：每座叢集每秒幾筆、過濾前後差多少、每天�
 | 5 | UI extension 改為全域頁面與新版面 |
 | 6 | Helm chart（server、各 collector）、RKE2 policy、部署說明 |
 | 7 | lab 實測與報告 |
+
+### 9.1 M2：從「看得到」到「拿得出來給稽核看」
+
+M1 完成、lab 驗證過後再做。順序依「稽核最常問、資料已經有」排：
+
+| PR | 內容 | 要點 |
+|---|---|---|
+| 8 | 權限覆核 | 見 9.2 |
+| 9 | 防竄改與轉送 SIEM | 見 9.3 |
+| 10 | 繞過 GitOps | 見 9.4 |
+| 11 | 變更窗口 | 取代「非上班時間」規則：依叢集、namespace 標籤設定核准的時段，窗口外的正式環境寫入標中風險。之後可再加 ITSM 變更單號欄位比對（各家系統不同，先不做） |
+| 12 | 產生還原用的 YAML | 從已存的版本產出「改之前」的 YAML，只產生、不套用；Audit Loupe 不需要、也不會有寫入叢集的權限。Secret 不在版本範圍內，所以不會產出含機密的內容 |
+| 13 | 涵蓋度健康頁 | 每座叢集：audit 有沒有開、收集元件最後回報時間、延遲、缺口時段。收集元件每分鐘送一次心跳（空批次也送），後端以心跳判斷缺口 |
+| 14 | SUSE Security 違規事件 | 見 9.5 |
+
+### 9.2 權限覆核（已查證，Rancher 原始碼 main，2026-10-16）
+
+要回答：「某人現在有哪些權限、是誰在什麼時候給的」，以及「兩個日期之間，多了誰、少了誰」。
+
+- **要存版本的物件**（local cluster，`management.cattle.io`）：GlobalRole、GlobalRoleBinding、RoleTemplate、ClusterRoleTemplateBinding、ProjectRoleTemplateBinding、Project、User、UserAttribute。
+- **有效權限要自己算**：Rancher 沒有任何物件或狀態存放算好的有效權限。由 binding 找到 RoleTemplate，沿 `roleTemplateNames` 遞迴展開、合併 rules；`external: true` 的改讀同名 ClusterRole。因為每個版本都存了，所以可以算出任一時間點的狀態。
+- **內建角色會在 Rancher 升級時改變**：`builtin: true` 的角色在 Rancher 啟動時重新同步，沒有操作者。這類變更標為「Rancher 升級帶來的權限變化」，不歸給任何人。
+- **衍生的 binding**：GlobalRole 帶 `inheritedClusterRoles` 時，Rancher 會自動產生帶 `authz.management.cattle.io/grb-owner` 標籤的 CRTB。這類標為衍生，歸到原本那筆 GlobalRoleBinding。
+- **誰給的**：binding 物件上沒有建立者（webhook 只對 Cluster、Project 加 `creatorId`）。建立者只能從 audit log 對出來，這正是 Audit Loupe 獨有的價值。自動產生的 binding（`creator-*`、新使用者預設的 `grb-*`）標為 Rancher 自動建立。
+- **binding 的 subject 會補值**：只寫 `userPrincipalName` 的 binding，之後控制器會補上 `userName`（反之亦然）。比對時以 `userName` 為準，第一版沒有時往後找。
+- **經群組取得的權限只能盡力而為**：使用者屬於哪些群組只記在 UserAttribute，而且只是「上次更新時」的狀態。更新時機：登入時、使用 API 時超過 `auth-user-info-max-age-seconds`（預設 3600 秒）、每天排程（`auth-user-info-resync-cron`，預設 `0 0 * * *`）。SAML（Shibboleth 除外）與 generic OIDC 只在登入時更新。所以畫面上經群組取得的權限一律標「依 Rancher 最後一次更新的群組資料，可能落後最多一天」，SAML、generic OIDC 標「只在登入時更新」。
+- **UserAttribute 雜訊**：`LastRefresh`、`LastLogin` 每次更新都會變，存版本前要先去掉，只在群組真的改變時才存新版本。
+- **輸出**：畫面一頁加 CSV 匯出，欄位：人、權限、範圍（全域／叢集／專案）、取得方式（直接或經群組）、授權者、授權時間。季度比對輸出新增、移除兩張表。
+
+### 9.3 防竄改與轉送 SIEM
+
+- **雜湊鏈**：每座叢集一條鏈，寫入時每筆事件存 `hash = SHA-256(前一筆 hash + 本筆正規化內容)`。畫面與 API 可以驗證某段時間的鏈是否完整。
+- **錨點**：鏈只放在同一個資料庫裡，改資料的人也可以重算整條鏈。所以每小時把最新的 hash 送到資料庫以外的地方（SIEM、或寫入有 Object Lock 的 S3 相容儲存空間），之後拿外部的錨點比對才有意義。文件要寫清楚：沒有設定外部錨點時，雜湊鏈只能偵測意外損毀，不能證明沒被刻意竄改。
+- **轉送 SIEM**：送的是整理過的事件（身分鏈、叢集、物件、風險），不是原始 log。三種出口：syslog over TLS（RFC 5424，內容 JSON）、Splunk HEC、通用 webhook。送出失敗時排隊重送，畫面顯示積壓量。
+- **定位**：Audit Loupe 幫 SIEM 補上 Kubernetes 的上下文，不取代 SIEM。長期保存交給客戶既有的 SIEM 或儲存，Audit Loupe 本身維持 30 天。
+
+### 9.4 繞過 GitOps（已查證，Fleet 原始碼 main，2026-10-16）
+
+- **判斷物件由 Fleet 管理**：看物件本身的 `objectset.rio.cattle.io/id` annotation，或較新 Fleet 加的 `fleet.cattle.io/managed-by-kind`、`managed-by-namespace`、`managed-by-name` 標籤（後者還能指出是哪個 GitRepo）。只有 Helm 的標籤（`app.kubernetes.io/managed-by=Helm`）不算，任何 Helm release 都有。
+- **Fleet 自己的寫入**：Fleet agent 以 `system:serviceaccount:cattle-fleet-system:fleet-agent` 寫入；有設定時會再代為執行某個 service account（audit log 裡 `user` 是 fleet-agent、`impersonatedUser` 是那個 SA）。local cluster 的 namespace 可能不同，從 Fleet Cluster 物件的 `status.agent.namespace` 讀。
+- **規則**：人對 Fleet 管理的物件寫入，標「繞過 GitOps」（中風險），畫面顯示是哪個 GitRepo 管的。
+- **之後的結果**：Fleet 的 `correctDrift` 預設關閉，只偵測、不改回。若之後在同一物件看到 fleet-agent 的寫入，標「已被 Fleet 改回」；沒有就標「仍與 Git 不一致」，並可對照 BundleDeployment 的 `status.modifiedStatus`。
+
+### 9.5 SUSE Security 違規事件（已查證，NeuVector 原始碼與文件 5.6，2026-10-14）
+
+原本想回答「exec 進去之後跑了什麼」，查證後範圍要縮小：
+
+- SUSE Security 不會記錄每個程序。Discover 模式只學習、不產生事件；Monitor、Protect 模式只在程序不在允許清單時產生違規事件。另有內建可疑程序偵測（nmap、nc、ssh、反向 shell 等），任何模式都會報。所以**拿不到完整的指令紀錄**，只拿得到被判定為違規或可疑的程序。
+- 有一支記錄最近 400 個程序的 API（`/v1/workload/:id/process_history`），但文件沒有記載、資料只在記憶體、容器結束就消失，不採用。
+- **做法**：以唯讀 API key（只給「Security Event」讀取權限，可限定 namespace）定期讀 `/v1/log/security`，用 namespace、Pod、時間窗對到 exec 事件。父程序是 runc、containerd-shim 的視為經 exec 啟動。控制器只保留各類最近 4096 筆，要常讀或改用 syslog 推送。
+- **畫面用語**：一律寫「SUSE Security 判定為違規的程序」，不寫「執行過的指令」，避免讓人以為是完整紀錄。
 
 ## 10. 依據
 
