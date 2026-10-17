@@ -1,0 +1,164 @@
+{{- if .Values.server.enabled }}
+{{- if not .Values.server.tokens.existingSecret }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: audit-loupe-tokens
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "al.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  tokens: |
+    {{- range .Values.server.tokens.inline }}
+    {{ required "each server.tokens.inline entry needs cluster" .cluster }} {{ required "each server.tokens.inline entry needs token" .token }}
+    {{- end }}
+---
+{{- end }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: audit-loupe-data
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "al.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- with .Values.server.persistence.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.server.persistence.size }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: audit-loupe
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "al.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  replicas: 1
+  # One SQLite file on a ReadWriteOnce volume: never two pods at once.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {{- include "al.selector" . | nindent 6 }}
+      app.kubernetes.io/component: server
+  template:
+    metadata:
+      labels: {{- include "al.selector" . | nindent 8 }}
+        app.kubernetes.io/component: server
+      annotations:
+        checksum/tokens: {{ toJson .Values.server.tokens | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        fsGroup: 65532
+      containers:
+        - name: server
+          image: {{ include "al.serverImage" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [server]
+          env:
+            - { name: AL_DB_PATH, value: /data/audit-loupe.db }
+            - { name: AL_INGEST_TOKENS_FILE, value: /etc/audit-loupe/tokens/tokens }
+            - { name: AL_CLUSTER, value: {{ .Values.server.cluster | quote }} }
+            - { name: AL_RANCHER_CLUSTER, value: {{ .Values.server.rancherCluster | quote }} }
+            - { name: AL_TZ, value: {{ .Values.server.timezone | quote }} }
+            - { name: AL_WORK_HOURS, value: {{ .Values.server.workHours | quote }} }
+            - { name: AL_WORK_DAYS, value: {{ .Values.server.workDays | quote }} }
+            - { name: AL_RETENTION_DAYS, value: {{ .Values.server.retentionDays | quote }} }
+          ports:
+            - { name: api, containerPort: 8080 }
+            - { name: ingest, containerPort: 8081 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: api }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: ingest }
+            periodSeconds: 20
+          securityContext: {{- include "al.securityContext" . | nindent 12 }}
+          resources: {{- toYaml .Values.server.resources | nindent 12 }}
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: tokens, mountPath: /etc/audit-loupe/tokens, readOnly: true }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: audit-loupe-data
+        - name: tokens
+          secret:
+            secretName: {{ .Values.server.tokens.existingSecret | default "audit-loupe-tokens" }}
+            items: [{ key: tokens, path: tokens }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  # The UI reaches this through the Rancher service proxy, by this exact name and port:
+  # /api/v1/namespaces/audit-loupe-system/services/http:audit-loupe:8080/proxy
+  name: audit-loupe
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "al.labels" . | nindent 4 }}
+spec:
+  selector: {{- include "al.selector" . | nindent 4 }}
+    app.kubernetes.io/component: server
+  ports:
+    - { name: http, port: 8080, targetPort: api }
+    - { name: ingest, port: 8081, targetPort: ingest }
+{{- if .Values.server.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  # Only the ingest port is exposed; the read API stays behind Rancher's proxy.
+  name: audit-loupe-ingest
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "al.labels" . | nindent 4 }}
+  {{- with .Values.server.ingress.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.server.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if .Values.server.ingress.tlsSecret }}
+  tls:
+    - hosts: [{{ required "server.ingress.host is required" .Values.server.ingress.host | quote }}]
+      secretName: {{ .Values.server.ingress.tlsSecret }}
+  {{- end }}
+  rules:
+    - host: {{ required "server.ingress.host is required" .Values.server.ingress.host | quote }}
+      http:
+        paths:
+          - path: /ingest/
+            pathType: Prefix
+            backend:
+              service:
+                name: audit-loupe
+                port: { name: ingest }
+{{- end }}
+{{- if .Values.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: audit-loupe
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "al.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "al.selector" . | nindent 6 }}
+      app.kubernetes.io/component: server
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        # Collectors in this namespace.
+        - podSelector: {}
+        {{- range .Values.networkPolicy.allowFromCIDRs }}
+        - ipBlock: { cidr: {{ . | quote }} }
+        {{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,65 @@
+# kube-apiserver audit policy for Audit Loupe (RKE2).
+#
+# Records what a person or a component changed, who read Secrets, and who opened a shell
+# or a port-forward. Leaves out reads, watches and the steady background traffic, which
+# are most of the volume and say nothing about who changed what.
+#
+# Rules are matched top to bottom; the first match decides.
+#
+# Rancher-provisioned RKE2: put this file's content (not a path) in the cluster's
+#   spec.rkeConfig.machineGlobalConfig."audit-policy-file"
+# Standalone RKE2: save as /etc/rancher/rke2/audit-policy.yaml and set
+#   audit-policy-file: /etc/rancher/rke2/audit-policy.yaml   (in /etc/rancher/rke2/config.yaml)
+# RKE2 then writes /var/lib/rancher/rke2/server/logs/audit.log with its default rotation.
+# Do not pass the policy through kube-apiserver-arg: RKE2 would not set the log path and
+# rotation for you.
+apiVersion: audit.k8s.io/v1
+kind: Policy
+# The request is logged once, when the response is complete (exec/attach/port-forward
+# also log ResponseStarted, which is when the session opens).
+omitStages: ["RequestReceived"]
+rules:
+  # --- Background traffic: never logged ---------------------------------------------
+  - level: None
+    userGroups: ["system:nodes"]
+  - level: None
+    users: ["system:kube-proxy", "system:apiserver"]
+  - level: None
+    resources:
+      - group: coordination.k8s.io
+        resources: ["leases"]
+      - group: ""
+        resources: ["events", "endpoints"]
+      - group: events.k8s.io
+        resources: ["events"]
+      - group: discovery.k8s.io
+        resources: ["endpointslices"]
+      # Authentication and authorization checks (webhooks, Rancher's agents): frequent,
+      # and not changes to anything.
+      - group: authentication.k8s.io
+        resources: ["tokenreviews"]
+      - group: authorization.k8s.io
+        resources: ["subjectaccessreviews", "selfsubjectaccessreviews", "selfsubjectrulesreviews", "localsubjectaccessreviews"]
+  - level: None
+    nonResourceURLs: ["/healthz*", "/livez*", "/readyz*", "/version", "/metrics", "/openapi/*", "/api", "/api/*", "/apis", "/apis/*"]
+
+  # --- Never log bodies of Secrets, ConfigMaps or issued tokens --------------------------
+  # Who read or changed them, and when, is enough; the values must not end up in a log.
+  - level: Metadata
+    verbs: ["get", "list", "create", "update", "patch", "delete", "deletecollection"]
+    resources:
+      - group: ""
+        resources: ["secrets", "configmaps", "serviceaccounts/token"]
+
+  # --- Shells and port-forwards: who and when ------------------------------------------
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["pods/exec", "pods/attach", "pods/portforward"]
+
+  # --- Every other change: with the request body (what was sent) ------------------------
+  - level: Request
+    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+
+  # --- Reads and watches of everything else: not logged --------------------------------
+  - level: None

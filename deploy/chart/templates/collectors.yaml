@@ -1,0 +1,252 @@
+{{- $c := .Values.collector }}
+{{- if or $c.watch.enabled $c.rancher.enabled $c.file.enabled }}
+{{- if not $c.token.existingSecret }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: audit-loupe-collector-token
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "al.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  token: {{ required "collector.token.value or collector.token.existingSecret is required" $c.token.value | quote }}
+---
+{{- end }}
+{{- end }}
+{{- if $c.watch.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: audit-loupe-watch
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "al.labels" . | nindent 4 }}
+---
+# Read-only on the watched types. ConfigMap values are hashed before they leave the
+# cluster, but this account can read them, so keep its token in this namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: audit-loupe-watch
+  labels: {{- include "al.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [configmaps, services, namespaces, serviceaccounts]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, daemonsets]
+    verbs: [get, list, watch]
+  - apiGroups: [batch]
+    resources: [cronjobs]
+    verbs: [get, list, watch]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses, networkpolicies]
+    verbs: [get, list, watch]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [roles, rolebindings, clusterroles, clusterrolebindings]
+    verbs: [get, list, watch]
+  - apiGroups: [autoscaling]
+    resources: [horizontalpodautoscalers]
+    verbs: [get, list, watch]
+  - apiGroups: [gateway.networking.k8s.io]
+    resources: [httproutes]
+    verbs: [get, list, watch]
+  {{- if $c.watch.rancherTypes }}
+  - apiGroups: [management.cattle.io]
+    resources: [globalroles, globalrolebindings, roletemplates, clusterroletemplatebindings, projectroletemplatebindings, projects, users, userattributes]
+    verbs: [get, list, watch]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: audit-loupe-watch
+  labels: {{- include "al.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: audit-loupe-watch
+subjects:
+  - kind: ServiceAccount
+    name: audit-loupe-watch
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: audit-loupe-watch
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "al.labels" . | nindent 4 }}
+    app.kubernetes.io/component: collect-watch
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {{- include "al.selector" . | nindent 6 }}
+      app.kubernetes.io/component: collect-watch
+  template:
+    metadata:
+      labels: {{- include "al.selector" . | nindent 8 }}
+        app.kubernetes.io/component: collect-watch
+    spec:
+      serviceAccountName: audit-loupe-watch
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: collect-watch
+          image: {{ include "al.collectorImage" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [collect-watch]
+          env:
+            {{- include "al.collectorEnv" . | nindent 12 }}
+            {{- with $c.watch.resources }}
+            - { name: AL_WATCH_RESOURCES, value: {{ . | quote }} }
+            {{- end }}
+            - { name: AL_WATCH_RANCHER, value: {{ $c.watch.rancherTypes | quote }} }
+          securityContext: {{- include "al.securityContext" . | nindent 12 }}
+          resources: {{- toYaml $c.watch.resourcesSpec | nindent 12 }}
+          volumeMounts: {{- include "al.collectorMounts" . | nindent 12 }}
+      volumes: {{- include "al.collectorVolumes" . | nindent 8 }}
+---
+{{- end }}
+{{- if $c.rancher.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: audit-loupe-rancher
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "al.labels" . | nindent 4 }}
+---
+# Only the Rancher pods' logs, only in Rancher's namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: audit-loupe-rancher-logs
+  namespace: {{ $c.rancher.namespace }}
+  labels: {{- include "al.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [pods/log]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: audit-loupe-rancher-logs
+  namespace: {{ $c.rancher.namespace }}
+  labels: {{- include "al.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: audit-loupe-rancher-logs
+subjects:
+  - kind: ServiceAccount
+    name: audit-loupe-rancher
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: audit-loupe-rancher
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "al.labels" . | nindent 4 }}
+    app.kubernetes.io/component: collect-rancher
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {{- include "al.selector" . | nindent 6 }}
+      app.kubernetes.io/component: collect-rancher
+  template:
+    metadata:
+      labels: {{- include "al.selector" . | nindent 8 }}
+        app.kubernetes.io/component: collect-rancher
+    spec:
+      serviceAccountName: audit-loupe-rancher
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: collect-rancher
+          image: {{ include "al.collectorImage" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [collect-rancher]
+          env:
+            {{- include "al.collectorEnv" . | nindent 12 }}
+            - { name: AL_RANCHER_NAMESPACE, value: {{ $c.rancher.namespace | quote }} }
+            - { name: AL_RANCHER_SELECTOR, value: {{ $c.rancher.selector | quote }} }
+            - { name: AL_RANCHER_CONTAINER, value: {{ $c.rancher.container | quote }} }
+            # Positions are lost with the pod; a new pod re-reads what Rancher's sidecar
+            # still has and the server keeps one copy per auditID.
+            - { name: AL_STATE_DIR, value: /state }
+          securityContext: {{- include "al.securityContext" . | nindent 12 }}
+          resources: {{- toYaml $c.rancher.resourcesSpec | nindent 12 }}
+          volumeMounts:
+            {{- include "al.collectorMounts" . | nindent 12 }}
+            - { name: state, mountPath: /state }
+      volumes:
+        {{- include "al.collectorVolumes" . | nindent 8 }}
+        - { name: state, emptyDir: {} }
+---
+{{- end }}
+{{- if $c.file.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: audit-loupe-file
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "al.labels" . | nindent 4 }}
+    app.kubernetes.io/component: collect-file
+spec:
+  selector:
+    matchLabels: {{- include "al.selector" . | nindent 6 }}
+      app.kubernetes.io/component: collect-file
+  template:
+    metadata:
+      labels: {{- include "al.selector" . | nindent 8 }}
+        app.kubernetes.io/component: collect-file
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector: {{- toYaml $c.file.nodeSelector | nindent 8 }}
+      tolerations: {{- toYaml $c.file.tolerations | nindent 8 }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: collect-file
+          image: {{ include "al.collectorImage" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [collect-file]
+          env:
+            {{- include "al.collectorEnv" . | nindent 12 }}
+            - { name: AL_AUDIT_LOG, value: {{ printf "/host-logs/%s" $c.file.logFile | quote }} }
+            - { name: AL_STATE_DIR, value: /state }
+          # The audit log is root-owned (0600); root without any capability can read
+          # its own files. Everything else stays locked down.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsUser: 0
+            runAsNonRoot: false
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
+          resources: {{- toYaml $c.file.resourcesSpec | nindent 12 }}
+          volumeMounts:
+            {{- include "al.collectorMounts" . | nindent 12 }}
+            - { name: logs, mountPath: /host-logs, readOnly: true }
+            - { name: state, mountPath: /state }
+      volumes:
+        {{- include "al.collectorVolumes" . | nindent 8 }}
+        - name: logs
+          hostPath: { path: {{ $c.file.logDir | quote }}, type: Directory }
+        # Survives pod restarts, so a restart resumes instead of resending the whole file.
+        - name: state
+          hostPath: { path: {{ $c.file.stateDir | quote }}, type: DirectoryOrCreate }
+{{- end }}

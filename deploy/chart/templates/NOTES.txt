@@ -1,12 +1,17 @@
-audit-loupe is running in {{ .Release.Namespace }}.
-
-Next: point kube-apiserver's audit webhook at http://{{ .Values.service.clusterIP }}:{{ .Values.service.ingestPort }}/ingest/k8s-audit
-using the token in Secret {{ .Release.Namespace }}/audit-loupe-ingest. See deploy/rke2/README.md in the source repository.
-
-The Rancher UI extension reaches this service through the Rancher service proxy. Users need
-"get" on services/proxy in {{ .Release.Namespace }} to see the pages. That grants a read view of
-changes across the whole cluster, so give it only to people who may audit the cluster.
-{{- if not .Values.networkPolicy.allowFromCIDRs }}
-
-WARNING: networkPolicy.allowFromCIDRs is empty, so any pod in the cluster can call the read API.
+Audit Loupe {{ .Chart.AppVersion }} in {{ .Release.Namespace }}:
+{{- if .Values.server.enabled }}
+- server: the UI reaches it through the Rancher service proxy (service audit-loupe, port 8080).
+  Users need "get" on services/proxy in {{ .Release.Namespace }} of this cluster to see audit data.
+{{- end }}
+{{- if .Values.collector.watch.enabled }}
+- collect-watch: object versions{{ if .Values.collector.watch.rancherTypes }} (with Rancher permission types){{ end }}.
+{{- end }}
+{{- if .Values.collector.rancher.enabled }}
+- collect-rancher: Rancher API audit log from {{ .Values.collector.rancher.namespace }} (needs auditLog.enabled=true, destination sidecar).
+{{- end }}
+{{- if .Values.collector.file.enabled }}
+- collect-file: kube-apiserver audit log on control-plane nodes (needs RKE2 audit enabled, and Pod Security "privileged" on this namespace).
+{{- end }}
+{{- if or .Values.collector.watch.enabled .Values.collector.rancher.enabled .Values.collector.file.enabled }}
+Collectors send to {{ .Values.collector.ingest.url }}.
 {{- end }}

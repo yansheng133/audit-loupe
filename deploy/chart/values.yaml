@@ -1,46 +1,113 @@
-# Name shown in the UI for this cluster.
-clusterName: downstream
+# Audit Loupe installs per cluster. The same chart serves every role:
+#   - the server (one cluster only; by default Rancher's own, local)
+#   - collectors that push to it (every cluster that should be audited)
+# Install into the namespace audit-loupe-system (the UI looks for the server there).
+
+# ---------------------------------------------------------------------------
+# Server: stores what collectors send and serves the UI (through the Rancher
+# service proxy). Enable in exactly one cluster.
+server:
+  enabled: false
+  # Name of the cluster the server runs in, as Rancher calls it (local for Rancher's own).
+  cluster: local
+  # The cluster Rancher runs in. Only its collector may send Rancher API audit records.
+  rancherCluster: local
+  # One token per cluster that sends data: the server tells clusters apart by token,
+  # never by what a collector claims. Either name an existing Secret with key "tokens"
+  # (lines "<cluster-id> <token>"), or list them here.
+  tokens:
+    existingSecret: ""
+    # - cluster: local
+    #   token: <openssl rand -hex 32>
+    inline: []
+  timezone: Asia/Taipei
+  workHours: "9-18"
+  workDays: "1-5"
+  retentionDays: 30
+  persistence:
+    # SQLite on a volume. Empty storageClass uses the cluster default; RKE2 ships none.
+    storageClass: ""
+    size: 5Gi
+  # Collectors in other clusters reach the ingest port through this Ingress. TLS is
+  # terminated here; collectors verify it (collector.ingest.caSecret for a private CA).
+  ingress:
+    enabled: false
+    className: ""
+    host: ""
+    tlsSecret: ""
+    annotations: {}
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { memory: 512Mi }
+
+# ---------------------------------------------------------------------------
+# Collectors: what this cluster sends, and where.
+collector:
+  ingest:
+    # Collectors in the server's own cluster can use the in-cluster address:
+    #   http://audit-loupe.audit-loupe-system.svc:8081
+    # Others use the server's Ingress: https://<server.ingress.host>
+    url: ""
+    # Secret with key ca.crt, when the ingest endpoint uses a private CA.
+    caSecret: ""
+  # This cluster's token (the server maps it to the cluster). Existing Secret with key
+  # "token", or set the value here.
+  token:
+    existingSecret: ""
+    value: ""
+
+  # Object versions: what changed. Every cluster.
+  watch:
+    enabled: false
+    # "group/version/resource" list; empty uses the built-in default. Secrets are never watched.
+    resources: ""
+    # On the Rancher cluster: also Rancher's role and binding types (for the access review).
+    rancherTypes: false
+    resourcesSpec:
+      requests: { cpu: 20m, memory: 64Mi }
+      limits: { memory: 256Mi }
+
+  # Rancher API audit log, read from the rancher-audit-log sidecar. The Rancher cluster
+  # only; needs Rancher's auditLog.enabled=true with destination sidecar.
+  rancher:
+    enabled: false
+    namespace: cattle-system
+    selector: app=rancher
+    container: rancher-audit-log
+    resourcesSpec:
+      requests: { cpu: 20m, memory: 32Mi }
+      limits: { memory: 128Mi }
+
+  # kube-apiserver audit log on RKE2 server nodes (a DaemonSet on control-plane nodes,
+  # reading the log file read-only). Needs audit logging enabled in RKE2 (see
+  # deploy/policy/rke2-audit-policy.yaml) and a namespace that allows hostPath
+  # (Pod Security "privileged" on audit-loupe-system).
+  file:
+    enabled: false
+    logDir: /var/lib/rancher/rke2/server/logs
+    logFile: audit.log
+    stateDir: /var/lib/audit-loupe
+    nodeSelector:
+      node-role.kubernetes.io/control-plane: "true"
+    tolerations:
+      - operator: Exists
+    resourcesSpec:
+      requests: { cpu: 20m, memory: 32Mi }
+      limits: { memory: 128Mi }
 
 image:
-  repository: docker.io/CHANGE-ME/audit-loupe
-  tag: "0.1.0"
+  server:
+    repository: docker.io/yansheng133/audit-loupe-server
+    tag: ""   # defaults to the chart's appVersion
+  collector:
+    repository: docker.io/yansheng133/audit-loupe-collector
+    tag: ""
   pullPolicy: IfNotPresent
+  pullSecrets: []
 
-# Fixed ClusterIP so kube-apiserver (host network) can reach the audit webhook
-# without cluster DNS. Use the low "static" band of the service CIDR to avoid
-# colliding with dynamic allocation (RKE2 default 10.43.0.0/16: 10.43.0.2-10.43.0.255,
-# but not .1 or .10). Check that it is free first.
-service:
-  clusterIP: 10.43.0.200
-  port: 8080        # read API for the UI (via Rancher service proxy)
-  ingestPort: 8081  # audit webhook receiver
-
-# Shared secret the audit webhook sends as a bearer token. Leave empty to generate one.
-ingestToken: ""
-
-# Resources whose versions are stored ("group/version/resource", core group as "v1/...").
-# Secrets are never watched. ConfigMap values are stored as hashes only.
-watchResources: ""
-
-timezone: Asia/Taipei
-workHours: "9-18"
-workDays: "1-5"
-retentionDays: 90
-
-persistence:
-  enabled: true
-  # Empty uses the cluster's default StorageClass. RKE2 does not ship one;
-  # with enabled: false the data lives in an emptyDir and is lost on restart.
-  storageClass: ""
-  size: 2Gi
-
-# Optional: restrict who can reach the pod. Requests from kube-apiserver (webhook and
-# Rancher service proxy) come from the control-plane nodes' host network, so list those
-# node addresses (or their subnet) here. Leave empty to not create a NetworkPolicy.
-# Without it, any pod in the cluster can call the read API directly.
+# Optional: who may reach the server pod. The UI comes through kube-apiserver (service
+# proxy), which runs on control-plane nodes' host network; list those addresses or their
+# subnet, plus where collectors and the ingress controller connect from.
 networkPolicy:
+  enabled: false
   allowFromCIDRs: []
-
-resources:
-  requests: { cpu: 50m, memory: 64Mi }
-  limits: { memory: 256Mi }

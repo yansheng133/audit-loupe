@@ -1,6 +1,7 @@
 apiVersion: v2
 name: audit-loupe
-description: Who changed what in this cluster - audit webhook receiver, object version tracker and API for the audit-loupe Rancher UI extension
+description: Audit Loupe - who changed what across Rancher-managed clusters. One chart for every role; values decide what runs in this cluster (the server, and the collectors that push to it).
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 0.2.0
+appVersion: "0.2.0"
+kubeVersion: ">= 1.30.0-0"
