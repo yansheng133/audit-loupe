@@ -199,6 +199,15 @@ async fn integrity(State(s): State<AppState>, Q(p): Q<ChainParams>) -> Response 
     }
 }
 
+/// Changes people made to objects Fleet deploys, and whether Fleet put them back.
+async fn gitops(State(s): State<AppState>, Q(r): Q<Range>) -> Response {
+    let (f, t) = r.bounds();
+    match s.store.gitops_bypasses(f, t) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => err(e),
+    }
+}
+
 /// Forwarding targets: last success, last error, records still to send.
 async fn forwarding(State(s): State<AppState>) -> Response {
     match s.store.forward_status() {
@@ -407,6 +416,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/related", get(related))
         .route("/api/hourly", get(hourly))
         .route("/api/integrity", get(integrity))
+        .route("/api/gitops", get(gitops))
         .route("/api/forwarding", get(forwarding))
         .route("/api/integrity/anchor", get(integrity_anchor))
         .route("/api/access", get(access))

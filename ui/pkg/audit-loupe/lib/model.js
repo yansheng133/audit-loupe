@@ -31,7 +31,8 @@ const ZH = {
   refused: '，被拒絕', failed: (c) => `（失敗 ${ c }）`,
   rules: {
     namespace_deleted: '刪除 namespace', rbac_changed: '權限變更', pod_exec: '進入容器', secret_read: '讀取 Secret', bypassed_rancher: '繞過 Rancher',
-    off_hours: '非上班時間', forbidden: '被拒絕', user_deleted: '刪除使用者', credential_issued: '發出憑證', login_failed: '登入失敗', unattributed: '無法歸屬'
+    off_hours: '非上班時間', forbidden: '被拒絕', user_deleted: '刪除使用者', credential_issued: '發出憑證', login_failed: '登入失敗', unattributed: '無法歸屬',
+    gitops_bypassed: '繞過 GitOps', outside_change_window: '變更窗口外'
   },
   chain: {
     idp: 'IdP 帳號', through: '經由', viaUi: 'Rancher 介面', viaKubectl: 'Rancher 的 kubeconfig', viaRancher: 'Rancher', impersonating: '代為執行', wrote: '寫入',
@@ -78,7 +79,8 @@ const EN = {
   refused: ', refused', failed: (c) => ` (failed ${ c })`,
   rules: {
     namespace_deleted: 'Namespace deleted', rbac_changed: 'Permissions changed', pod_exec: 'Exec into container', secret_read: 'Secret read', bypassed_rancher: 'Bypassed Rancher',
-    off_hours: 'Outside working hours', forbidden: 'Refused', user_deleted: 'User deleted', credential_issued: 'Credential issued', login_failed: 'Login failed', unattributed: 'Unattributed'
+    off_hours: 'Outside working hours', forbidden: 'Refused', user_deleted: 'User deleted', credential_issued: 'Credential issued', login_failed: 'Login failed', unattributed: 'Unattributed',
+    gitops_bypassed: 'Bypassed GitOps', outside_change_window: 'Outside change window'
   },
   chain: {
     idp: 'IdP account', through: 'Through', viaUi: 'Rancher UI', viaKubectl: 'Rancher kubeconfig', viaRancher: 'Rancher', impersonating: 'Acting as', wrote: 'Wrote to',
@@ -112,6 +114,7 @@ export const SEV_RANK = { high: 0, medium: 1, low: 2 };
 export const RULE_SEV = {
   namespace_deleted: 'high', rbac_changed: 'medium', pod_exec: 'medium', bypassed_rancher: 'medium', user_deleted: 'medium',
   secret_read: 'low', off_hours: 'low', forbidden: 'low', credential_issued: 'low', login_failed: 'low', unattributed: 'low',
+  gitops_bypassed: 'medium', outside_change_window: 'medium',
 };
 
 const KINDS = {

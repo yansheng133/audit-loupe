@@ -260,6 +260,32 @@ pub struct RoleChange {
 }
 
 #[derive(Debug, Serialize)]
+pub struct GitopsRow {
+    pub event_id: i64,
+    pub cluster: String,
+    pub ts: String,
+    pub actor: String,
+    pub verb: String,
+    pub resource: String,
+    pub namespace: String,
+    pub name: String,
+    /// "<kind>/<namespace>/<name>" of the Fleet source when the labels say, else the objectset ID.
+    pub source: Option<String>,
+    /// When Fleet wrote the object again afterwards (drift correction). None: still differs
+    /// from Git, as far as the audit log shows (correctDrift is off by default).
+    pub reverted_at: Option<String>,
+}
+
+/// The Fleet source of a deployed object, from its markers.
+pub fn fleet_marker(body: &Value) -> Option<String> {
+    let label = |k: &str| body.pointer(&format!("/metadata/labels/{}", k.replace('/', "~1"))).and_then(Value::as_str);
+    if let (Some(kind), Some(name)) = (label("fleet.cattle.io/managed-by-kind"), label("fleet.cattle.io/managed-by-name")) {
+        return Some(format!("{kind}/{}/{name}", label("fleet.cattle.io/managed-by-namespace").unwrap_or("")));
+    }
+    body.pointer("/metadata/annotations/objectset.rio.cattle.io~1id").and_then(Value::as_str).map(|id| format!("objectset/{id}"))
+}
+
+#[derive(Debug, Serialize)]
 pub struct ChainReport {
     pub cluster: String,
     /// Records before this were removed by retention; the chain is checked from here.
@@ -472,6 +498,52 @@ impl Store {
         Ok(Some(other_id))
     }
 
+    /// Whether the object's latest stored version is deployed by Fleet, and from which source.
+    /// Fleet marks what it deploys with its objectset ID annotation (all versions) and, in
+    /// newer versions, labels naming the GitRepo. Helm's own labels are not enough: any Helm
+    /// release has them.
+    fn fleet_source(c: &Connection, cluster: &str, group: &str, resource: &str, ns: &str, name: &str) -> anyhow::Result<Option<String>> {
+        let body: Option<String> = c
+            .query_row(
+                "SELECT body FROM versions WHERE cluster=?1 AND api_group=?2 AND resource=?3 AND namespace=?4 AND name=?5 ORDER BY id DESC LIMIT 1",
+                params![cluster, group, resource, ns, name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(body) = body.and_then(|b| serde_json::from_str::<Value>(&b).ok()) else { return Ok(None) };
+        Ok(fleet_marker(&body))
+    }
+
+    /// Fleet-managed objects people changed in the range, and whether Fleet put them back.
+    pub fn gitops_bypasses(&self, from_ms: i64, to_ms: i64) -> anyhow::Result<Vec<GitopsRow>> {
+        let c = self.conn.lock().unwrap();
+        let mut st = c.prepare(&format!(
+            "SELECT e.id, e.cluster, e.ts, e.ts_ms, e.actor, e.verb, e.api_group, e.resource, e.namespace, e.name FROM events e
+             JOIN alerts a ON a.event_id=e.id AND a.rule='gitops_bypassed'
+             WHERE e.ts_ms BETWEEN ?1 AND ?2 AND {SHOWN} ORDER BY e.ts_ms"
+        ))?;
+        let rows: Vec<(i64, String, String, i64, String, String, String, String, String, String)> = st
+            .query_map(params![from_ms, to_ms], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?)))?
+            .collect::<Result<_, _>>()?;
+        drop(st);
+        let mut out = Vec::new();
+        for (id, cluster, ts, ts_ms, actor, verb, group, resource, ns, name) in rows {
+            let source = Self::fleet_source(&c, &cluster, &group, &resource, &ns, &name)?;
+            // Fleet's agent writing the same object afterwards: drift correction put it back.
+            let reverted: Option<String> = c
+                .query_row(
+                    "SELECT ts FROM events WHERE cluster=?1 AND api_group=?2 AND resource=?3 AND namespace=?4 AND name=?5 AND ts_ms > ?6
+                       AND caller LIKE 'system:serviceaccount:cattle-fleet%:fleet-agent' AND verb IN ('update','patch','create')
+                       AND code BETWEEN 200 AND 299 ORDER BY ts_ms LIMIT 1",
+                    params![cluster, group, resource, ns, name, ts_ms],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            out.push(GitopsRow { event_id: id, cluster, ts, actor, verb, resource, namespace: ns, name, source, reverted_at: reverted });
+        }
+        Ok(out)
+    }
+
     fn bump(tx: &Transaction, cluster: &str, t: i64, key: &str, human: bool, writes: i64, alerts: i64) -> anyhow::Result<()> {
         let hour = t - t.rem_euclid(3_600_000);
         tx.execute(
@@ -631,6 +703,14 @@ impl Store {
                     "INSERT INTO chain (cluster, head_id, head_hash) VALUES (?1,?2,?3) ON CONFLICT(cluster) DO UPDATE SET head_id=excluded.head_id, head_hash=excluded.head_hash",
                     params![cl, id, h],
                 )?;
+                // A person writing to an object Fleet deploys: the change is not in Git.
+                let mut alerts = alerts.clone();
+                if r.human && crate::audit::is_write(&r.verb) && (200..300).contains(&r.code) && !r.name.is_empty() {
+                    if Self::fleet_source(&tx, cl, &r.api_group, &r.resource, &r.namespace, &r.name)?.is_some() {
+                        alerts.push(Alert { rule: "gitops_bypassed", severity: "medium" });
+                    }
+                }
+                let alerts = &alerts;
                 for a in alerts {
                     al.execute(params![id, a.rule, a.severity])?;
                 }
@@ -1918,6 +1998,31 @@ mod tests {
         let r = &s.verify_chain(None).unwrap()[0];
         assert_eq!(r.first_bad_id, Some(3));
         assert_eq!(s.check_anchor("c1", anchor.event_id, &anchor.hash).unwrap(), "chain_broken");
+    }
+
+    #[test]
+    fn edits_to_fleet_objects_are_flagged_and_reverts_seen() {
+        let s = Store::open(":memory:").unwrap();
+        let t = Utc.with_ymd_and_hms(2026, 10, 14, 1, 0, 0).unwrap();
+        let fleet = json!({"metadata":{"name":"web","namespace":"shop","labels":{"fleet.cattle.io/managed-by-kind":"gitrepo","fleet.cattle.io/managed-by-namespace":"fleet-default","fleet.cattle.io/managed-by-name":"shop-apps"}},"spec":{"replicas":3}});
+        s.insert_version(&key(), "Deployment", "u1", &fleet, "baseline", t).unwrap();
+        let r = patch("h1", "alice", "2026-10-14T02:00:00Z");
+        s.insert_event("c1", &r, &[]).unwrap();
+        let fleet_fix = r#"{"auditID":"f1","stage":"ResponseComplete","verb":"patch","user":{"username":"system:serviceaccount:cattle-fleet-system:fleet-agent"},
+          "objectRef":{"resource":"deployments","namespace":"shop","name":"web","apiGroup":"apps"},"responseStatus":{"code":200},"stageTimestamp":"2026-10-14T02:00:06Z"}"#;
+        s.insert_event("c1", &to_record(&parse_body(fleet_fix.replace('\n', " ").as_bytes()).unwrap()[0]).unwrap(), &[]).unwrap();
+        let g = s.gitops_bypasses(0, i64::MAX).unwrap();
+        assert_eq!(g.len(), 1, "only the person's edit");
+        assert_eq!(g[0].source.as_deref(), Some("gitrepo/fleet-default/shop-apps"));
+        assert!(g[0].reverted_at.is_some());
+        // An object not deployed by Fleet: no flag.
+        let other = ObjKey { name: "api".into(), ..key() };
+        s.insert_version(&other, "Deployment", "u2", &obj(1), "baseline", t).unwrap();
+        let mut r = patch("h2", "alice", "2026-10-14T03:00:00Z");
+        r.name = "api".into();
+        s.insert_event("c1", &r, &[]).unwrap();
+        assert_eq!(s.gitops_bypasses(0, i64::MAX).unwrap().len(), 1);
+        assert_eq!(fleet_marker(&json!({"metadata":{"annotations":{"objectset.rio.cattle.io/id":"default-shop"}}})).as_deref(), Some("objectset/default-shop"));
     }
 
     #[test]
