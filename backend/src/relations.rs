@@ -94,11 +94,10 @@ pub fn extract(kind: &str, ns: &str, obj: &Value) -> Vec<Rel> {
             out.push(to("owned_by", k, ns, n));
         }
     }
-    if let Some(t) = pod_template(kind, obj) {
-        if let Some(spec) = t.get("spec") {
+    if let Some(t) = pod_template(kind, obj)
+        && let Some(spec) = t.get("spec") {
             pod_spec_refs(spec, ns, &mut out);
         }
-    }
     match kind {
         "Service" => {
             if let Some(sel) = obj.pointer("/spec/selector").and_then(Value::as_object).filter(|m| !m.is_empty()) {
@@ -190,11 +189,10 @@ pub fn extract(kind: &str, ns: &str, obj: &Value) -> Vec<Rel> {
 /// DoesNotExist). An empty selector matches everything, as NetworkPolicy's podSelector does.
 pub fn selector_matches(sel: &Value, labels: &Map<String, Value>) -> bool {
     let get = |k: &str| labels.get(k).and_then(Value::as_str);
-    if let Some(ml) = sel.get("matchLabels").and_then(Value::as_object) {
-        if !ml.iter().all(|(k, v)| get(k) == v.as_str()) {
+    if let Some(ml) = sel.get("matchLabels").and_then(Value::as_object)
+        && !ml.iter().all(|(k, v)| get(k) == v.as_str()) {
             return false;
         }
-    }
     for e in sel.get("matchExpressions").and_then(Value::as_array).into_iter().flatten() {
         let key = e.get("key").and_then(Value::as_str).unwrap_or("");
         let values: Vec<&str> = e.get("values").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();

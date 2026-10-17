@@ -159,12 +159,11 @@ mod tests {
                 p.stdin.take().unwrap().write_all(y.as_bytes())?;
                 p.wait_with_output()
             });
-        if let Ok(o) = parsed {
-            if o.status.success() {
+        if let Ok(o) = parsed
+            && o.status.success() {
                 let back: Value = serde_json::from_slice(&o.stdout).unwrap();
                 assert_eq!(back, clean(&v), "{y}");
             }
-        }
     }
 
     #[test]

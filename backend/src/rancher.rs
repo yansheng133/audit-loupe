@@ -210,11 +210,10 @@ fn header<'a>(h: &'a HashMap<String, Vec<String>>, name: &str) -> Option<&'a str
 
 fn client_ip(e: &Entry) -> String {
     // Behind an ingress, remoteAddr is the ingress; the first forwarded address is the client.
-    if let Some(xff) = header(&e.request_header, "X-Forwarded-For") {
-        if let Some(first) = xff.split(',').map(str::trim).find(|s| !s.is_empty()) {
+    if let Some(xff) = header(&e.request_header, "X-Forwarded-For")
+        && let Some(first) = xff.split(',').map(str::trim).find(|s| !s.is_empty()) {
             return first.to_string();
         }
-    }
     match e.remote_addr.rsplit_once(':') {
         Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host.trim_matches(['[', ']']).to_string(),
         _ => e.remote_addr.clone(),
@@ -402,7 +401,7 @@ mod tests {
         let line = r#"{"auditID":"l1","requestURI":"/v3-public/localProviders/local?action=login","method":"POST",
           "user":{"name":"system:unauthenticated"},"userLoginName":"admin","remoteAddr":"[fd00::5]:443","responseCode":401,
           "responseTimestamp":"2026-10-14T02:00:00Z"}"#;
-        let r = to_record(&parse_fixture(&line)[0]).unwrap();
+        let r = to_record(&parse_fixture(line)[0]).unwrap();
         assert_eq!((r.actor.as_str(), r.verb.as_str(), r.code), ("admin", "login", 401));
         assert_eq!((r.user_id.as_str(), r.source_ip.as_str()), ("", "fd00::5"));
         assert!(r.human);

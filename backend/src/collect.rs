@@ -209,11 +209,10 @@ pub async fn run_file() -> anyhow::Result<()> {
     loop {
         let next = next_source(&path, &pos);
         set(&health, "auditLog", serde_json::json!(if next == Next::Missing { "missing" } else { "present" }));
-        if let Ok(m) = fs::metadata(&path) {
-            if m.ino() == pos.inode {
+        if let Ok(m) = fs::metadata(&path)
+            && m.ino() == pos.inode {
                 set(&health, "lagBytes", serde_json::json!(m.len().saturating_sub(pos.offset)));
             }
-        }
         let (source, restart) = match next {
             Next::Missing => {
                 tokio::time::sleep(Duration::from_secs(5)).await;

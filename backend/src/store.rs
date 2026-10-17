@@ -743,11 +743,10 @@ impl Store {
                 )?;
                 // A person writing to an object Fleet deploys: the change is not in Git.
                 let mut alerts = alerts.clone();
-                if r.human && crate::audit::is_write(&r.verb) && (200..300).contains(&r.code) && !r.name.is_empty() {
-                    if Self::fleet_source(&tx, cl, &r.api_group, &r.resource, &r.namespace, &r.name)?.is_some() {
+                if r.human && crate::audit::is_write(&r.verb) && (200..300).contains(&r.code) && !r.name.is_empty()
+                    && Self::fleet_source(&tx, cl, &r.api_group, &r.resource, &r.namespace, &r.name)?.is_some() {
                         alerts.push(Alert { rule: "gitops_bypassed", severity: "medium" });
                     }
-                }
                 let alerts = &alerts;
                 for a in alerts {
                     al.execute(params![id, a.rule, a.severity])?;
@@ -1683,13 +1682,12 @@ impl Store {
             .collect::<Result<_, _>>()?;
         drop(stmt);
         for row in rows.iter_mut() {
-            if let Some(vid) = row.version_id {
-                if let Some((changes, change, body)) = Self::version_detail(&c, vid)? {
+            if let Some(vid) = row.version_id
+                && let Some((changes, change, body)) = Self::version_detail(&c, vid)? {
                     row.changes = Some(changes);
                     row.change = Some(change);
                     row.body = body;
                 }
-            }
         }
         Ok(rows)
     }
