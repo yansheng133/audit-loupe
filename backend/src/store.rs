@@ -87,6 +87,7 @@ CREATE TABLE IF NOT EXISTS forward_cursor (
 );
 CREATE TABLE IF NOT EXISTS heartbeats (
   cluster TEXT NOT NULL, collector TEXT NOT NULL, instance TEXT NOT NULL, last_ms INTEGER NOT NULL, details TEXT NOT NULL,
+  first_ms INTEGER,
   PRIMARY KEY (cluster, collector, instance)
 );
 CREATE TABLE IF NOT EXISTS gaps (
@@ -493,6 +494,14 @@ impl Store {
             if !have.iter().any(|h| h == col) {
                 conn.execute_batch(&format!("ALTER TABLE events ADD COLUMN {col} {ddl}"))?;
             }
+        }
+        // 0.2.1: when an instance first checked in, so a replaced pod's gap ends where its successor began.
+        let beat_cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('heartbeats')")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        if !beat_cols.iter().any(|h| h == "first_ms") {
+            conn.execute_batch("ALTER TABLE heartbeats ADD COLUMN first_ms INTEGER")?;
         }
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS events_pair ON events(cluster, user_id, source, ts_ms);
@@ -1530,24 +1539,33 @@ impl Store {
         if let Some(p) = prev.filter(|p| now_ms - p > GAP_MS) {
             c.execute("INSERT INTO gaps (cluster, collector, instance, from_ms, to_ms) VALUES (?1,?2,?3,?4,?5)", params![cluster, collector, instance, p, now_ms])?;
         }
+        c.execute(
+            "INSERT INTO heartbeats (cluster, collector, instance, last_ms, details, first_ms) VALUES (?1,?2,?3,?4,?5,?4)
+             ON CONFLICT(cluster, collector, instance) DO UPDATE SET last_ms=excluded.last_ms, details=excluded.details",
+            params![cluster, collector, instance, now_ms, details.to_string()],
+        )?;
         // watch, rancher and neuvector run as one pod per cluster: a new pod name replaces the
         // old one, so a silent old instance ends its gap here instead of staying "still silent"
-        // forever. collect-file runs one per node, where another node checking in proves nothing.
+        // forever. The gap ends where the earliest instance still reporting after it began (rows
+        // from before 0.2.1 have no first_ms: now). A rollout hands over within GAP_MS: no gap.
+        // collect-file runs one per node, where another node checking in proves nothing.
         if collector != "file" {
             let stale: Vec<(String, i64)> = c
                 .prepare("SELECT instance, last_ms FROM heartbeats WHERE cluster=?1 AND collector=?2 AND instance<>?3 AND ?4 - last_ms > ?5")?
                 .query_map(params![cluster, collector, instance, now_ms, GAP_MS], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<Result<_, _>>()?;
             for (old, last) in stale {
-                c.execute("INSERT INTO gaps (cluster, collector, instance, from_ms, to_ms) VALUES (?1,?2,?3,?4,?5)", params![cluster, collector, old, last, now_ms])?;
+                let next: i64 = c.query_row(
+                    "SELECT MIN(COALESCE(first_ms, ?4)) FROM heartbeats WHERE cluster=?1 AND collector=?2 AND instance<>?3 AND last_ms > ?5",
+                    params![cluster, collector, old, now_ms, last],
+                    |r| r.get(0),
+                )?;
+                if next - last > GAP_MS {
+                    c.execute("INSERT INTO gaps (cluster, collector, instance, from_ms, to_ms) VALUES (?1,?2,?3,?4,?5)", params![cluster, collector, old, last, next])?;
+                }
                 c.execute("DELETE FROM heartbeats WHERE cluster=?1 AND collector=?2 AND instance=?3", params![cluster, collector, old])?;
             }
         }
-        c.execute(
-            "INSERT INTO heartbeats (cluster, collector, instance, last_ms, details) VALUES (?1,?2,?3,?4,?5)
-             ON CONFLICT(cluster, collector, instance) DO UPDATE SET last_ms=excluded.last_ms, details=excluded.details",
-            params![cluster, collector, instance, now_ms, details.to_string()],
-        )?;
         Ok(())
     }
 
@@ -1998,6 +2016,32 @@ mod tests {
         // One file collector per node: node-1 is still silent.
         assert!(gaps.contains(&("file".into(), "node-1".into(), None)), "{gaps:?}");
         assert_eq!(cov[0].collectors.iter().filter(|c| c["collector"] == "watch").count(), 1);
+    }
+
+    #[test]
+    fn rollout_handover_is_not_a_gap() {
+        let s = Store::open(":memory:").unwrap();
+        let t0 = 1_000_000_000_000;
+        // rolling update: new pod checks in 70 s after the old one's last report, both every 60 s
+        s.heartbeat("c1", "watch", "pod-a", &json!({}), t0).unwrap();
+        s.heartbeat("c1", "rancher", "r-a", &json!({}), t0).unwrap();
+        s.heartbeat("c1", "rancher", "r-b", &json!({}), t0 - 30_000).unwrap(); // overlap: started before r-a stopped
+        for i in 0..6 {
+            s.heartbeat("c1", "watch", "pod-b", &json!({}), t0 + 70_000 + i * 60_000).unwrap();
+            s.heartbeat("c1", "rancher", "r-b", &json!({}), t0 + 30_000 + i * 60_000).unwrap();
+        }
+        let cov = s.coverage(0, i64::MAX, t0 + 400_000).unwrap();
+        assert!(cov[0].gaps.is_empty(), "{:?}", cov[0].gaps);
+        assert_eq!(cov[0].collectors.len(), 2);
+
+        // pod-b stops; pod-c comes 10 minutes later: the gap ends when pod-c began, not when noticed
+        let t1 = t0 + 70_000 + 5 * 60_000;
+        for i in 0..5 {
+            s.heartbeat("c1", "watch", "pod-c", &json!({}), t1 + 600_000 + i * 60_000).unwrap();
+        }
+        let cov = s.coverage(0, i64::MAX, t1 + 900_000).unwrap();
+        let gaps: Vec<(i64, Option<i64>)> = cov[0].gaps.iter().filter(|g| g["collector"] == "watch").map(|g| (g["fromMs"].as_i64().unwrap(), g["toMs"].as_i64())).collect();
+        assert_eq!(gaps, vec![(t1, Some(t1 + 600_000))]);
     }
 
     fn rancher_put(id: &str, ts: &str) -> Record {
