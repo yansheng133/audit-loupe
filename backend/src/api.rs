@@ -143,6 +143,14 @@ async fn actors(State(s): State<AppState>, Q(r): Q<Range>) -> Response {
     }
 }
 
+/// The user directory: every lifetime of every Rancher user seen, deleted ones included.
+async fn users(State(s): State<AppState>) -> Response {
+    match s.store.users() {
+        Ok(rows) => Json(rows.into_iter().map(|(id, lives)| json!({"userId": id, "lifetimes": lives})).collect::<Vec<_>>()).into_response(),
+        Err(e) => err(e),
+    }
+}
+
 #[derive(Deserialize)]
 struct ObjectsParams {
     cluster: Option<String>,
@@ -209,6 +217,7 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/info", get(info))
         .route("/api/actors", get(actors))
+        .route("/api/users", get(users))
         .route("/api/timeline", get(timeline))
         .route("/api/objects", get(objects))
         .route("/api/history", get(history))

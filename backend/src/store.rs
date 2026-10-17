@@ -49,6 +49,12 @@ CREATE TABLE IF NOT EXISTS versions (
 CREATE INDEX IF NOT EXISTS versions_obj ON versions(cluster, api_group, resource, namespace, name, id);
 CREATE INDEX IF NOT EXISTS versions_unlinked ON versions(event_id, observed_ms);
 CREATE INDEX IF NOT EXISTS versions_event ON versions(event_id);
+CREATE TABLE IF NOT EXISTS users (
+  user_id TEXT NOT NULL, uid TEXT NOT NULL,
+  display_name TEXT NOT NULL, username TEXT NOT NULL, principal_ids TEXT NOT NULL,
+  local INTEGER NOT NULL, created_ms INTEGER NOT NULL, deleted_ms INTEGER,
+  PRIMARY KEY (user_id, uid)
+);
 CREATE TABLE IF NOT EXISTS listing (
   cluster TEXT NOT NULL, api_group TEXT NOT NULL, resource TEXT NOT NULL, first INTEGER NOT NULL,
   PRIMARY KEY (cluster, api_group, resource)
@@ -68,6 +74,9 @@ const ADDED_COLUMNS: &[(&str, &str)] = &[
 
 /// A Rancher record that was matched to the downstream record of the same action is shown
 /// through that downstream record; this hides the Rancher half so nothing is counted twice.
+/// What groups records into one person: the Rancher user ID, else the name.
+const ACTOR_KEY: &str = "CASE WHEN user_id<>'' THEN user_id ELSE actor END";
+
 const SHOWN: &str = "NOT (e.source='rancher' AND e.link_id IS NOT NULL)";
 
 /// Window for matching a Rancher record to the downstream record of the same action, as
@@ -157,13 +166,34 @@ pub struct ObjectRow {
     pub last_change: String,
 }
 
+/// One lifetime of a Rancher user ID (between creation and deletion of one User object).
+#[derive(Debug, Serialize, Clone)]
+pub struct UserLife {
+    pub uid: String,
+    pub display_name: String,
+    pub principal_ids: Vec<String>,
+    pub local: bool,
+    pub created_ms: i64,
+    pub deleted_ms: Option<i64>,
+    /// Changes made in this lifetime within the requested range (filled by `actors`).
+    pub writes: i64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ActorRow {
+    /// The Rancher user ID when there is one, otherwise the name; what to filter by.
+    pub key: String,
+    /// Name to show: the directory's latest name, else the name in the newest record.
     pub actor: String,
+    pub user_id: String,
     pub human: bool,
     pub writes: i64,
     pub alerts: i64,
     pub last_seen: String,
+    /// The latest lifetime ended (the user is deleted now).
+    pub deleted: bool,
+    /// Known lifetimes; more than one means deleted and re-added, shown merged with a note.
+    pub lifetimes: Vec<UserLife>,
 }
 
 pub struct Query {
@@ -304,6 +334,67 @@ impl Store {
         .is_some())
     }
 
+    /// Keep the user directory current. One row per lifetime of a user ID: an external
+    /// user deleted and later re-added gets the same `u-xxxxx` (Rancher derives it from the
+    /// principal) but a new object UID. Rows are never removed, so names stay known after
+    /// the user is gone.
+    fn record_user(c: &Connection, user_id: &str, uid: &str, obj: &Value, change: &str, at: DateTime<Utc>) -> anyhow::Result<()> {
+        if change == "deleted" {
+            c.execute("UPDATE users SET deleted_ms=?3 WHERE user_id=?1 AND uid=?2 AND deleted_ms IS NULL", params![user_id, uid, ms(&at)])?;
+            return Ok(());
+        }
+        let s = |p: &str| obj.pointer(p).and_then(Value::as_str).unwrap_or("").to_string();
+        let username = s("/username");
+        let display = [s("/displayName"), username.clone(), user_id.to_string()].into_iter().find(|v| !v.is_empty()).unwrap_or_default();
+        let principals: Vec<String> = obj
+            .get("principalIds")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let local = principals.iter().any(|p| p.starts_with("local://"));
+        let created = obj
+            .pointer("/metadata/creationTimestamp")
+            .and_then(Value::as_str)
+            .and_then(|t| t.parse::<DateTime<Utc>>().ok())
+            .unwrap_or(at);
+        c.execute(
+            "INSERT INTO users (user_id, uid, display_name, username, principal_ids, local, created_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(user_id, uid) DO UPDATE SET display_name=excluded.display_name, username=excluded.username,
+               principal_ids=excluded.principal_ids, local=excluded.local",
+            params![user_id, uid, display, username, serde_json::to_string(&principals)?, local as i64, ms(&created)],
+        )?;
+        Ok(())
+    }
+
+    /// Lifetimes of the given user IDs, oldest first.
+    fn lifetimes(c: &Connection, user_id: &str) -> anyhow::Result<Vec<UserLife>> {
+        let mut stmt = c.prepare_cached(
+            "SELECT uid, display_name, principal_ids, local, created_ms, deleted_ms FROM users WHERE user_id=?1 ORDER BY created_ms",
+        )?;
+        let rows = stmt
+            .query_map(params![user_id], |r| {
+                let p: String = r.get(2)?;
+                Ok(UserLife {
+                    uid: r.get(0)?,
+                    display_name: r.get(1)?,
+                    principal_ids: serde_json::from_str(&p).unwrap_or_default(),
+                    local: r.get::<_, i64>(3)? == 1,
+                    created_ms: r.get(4)?,
+                    deleted_ms: r.get(5)?,
+                    writes: 0,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn users(&self) -> anyhow::Result<Vec<(String, Vec<UserLife>)>> {
+        let c = self.conn.lock().unwrap();
+        let ids: Vec<String> = c.prepare("SELECT DISTINCT user_id FROM users ORDER BY user_id")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+        ids.into_iter().map(|id| Ok((id.clone(), Self::lifetimes(&c, &id)?))).collect()
+    }
+
     /// Apply a batch from `collect-watch`. Returns how many versions were stored.
     pub fn apply_objects(&self, cluster: &str, msgs: &[ObjMsg]) -> anyhow::Result<usize> {
         let mut stored = 0;
@@ -410,7 +501,11 @@ impl Store {
             "INSERT INTO versions (cluster,api_group,resource,kind,namespace,name,uid,observed_ms,observed,change,body) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![key.cluster, key.api_group, key.resource, kind, key.namespace, key.name, uid, ms(&at), at.to_rfc3339(), change, body.to_string()],
         )?;
-        Ok(Some(c.last_insert_rowid()))
+        let id = c.last_insert_rowid();
+        if key.api_group == "management.cattle.io" && key.resource == "users" {
+            Self::record_user(&c, &key.name, uid, obj, change, at)?;
+        }
+        Ok(Some(id))
     }
 
     /// Match recent unlinked versions to the audit event that caused them. Audit
@@ -502,8 +597,9 @@ impl Store {
             sql += &format!(" AND e.cluster=?{}", args.len());
         }
         if let Some(a) = &q.actor {
+            // A user ID (all its lifetimes) or, for callers without one, the name.
             args.push(Box::new(a.clone()));
-            sql += &format!(" AND e.actor=?{}", args.len());
+            sql += &format!(" AND (e.user_id=?{n} OR (e.user_id='' AND e.actor=?{n}))", n = args.len());
         }
         if q.humans_only {
             sql += " AND e.human=1";
@@ -549,20 +645,45 @@ impl Store {
         Ok(rows)
     }
 
+    /// People and components active in the range, one row per Rancher user ID (all its
+    /// lifetimes merged) or per name when there is no user ID.
     pub fn actors(&self, from_ms: i64, to_ms: i64) -> anyhow::Result<Vec<ActorRow>> {
         let c = self.conn.lock().unwrap();
         let mut stmt = c.prepare(&format!(
-            "SELECT actor, max(human), sum(CASE WHEN verb IN {WRITE_VERBS} THEN 1 ELSE 0 END),
-                    (SELECT count(*) FROM alerts a JOIN events e2 ON a.event_id=e2.id WHERE e2.actor=e.actor AND e2.ts_ms BETWEEN ?1 AND ?2
-                       AND NOT (e2.source='rancher' AND e2.link_id IS NOT NULL)),
-                    max(ts)
-             FROM events e WHERE ts_ms BETWEEN ?1 AND ?2 AND {SHOWN} GROUP BY actor ORDER BY max(human) DESC, 3 DESC"
+            "SELECT {ACTOR_KEY} AS k, max(user_id), max(human),
+                    sum(CASE WHEN verb IN {WRITE_VERBS} OR source='rancher' THEN 1 ELSE 0 END),
+                    (SELECT count(*) FROM alerts a JOIN events e2 ON a.event_id=e2.id
+                      WHERE (CASE WHEN e2.user_id<>'' THEN e2.user_id ELSE e2.actor END)=(CASE WHEN e.user_id<>'' THEN e.user_id ELSE e.actor END) AND e2.ts_ms BETWEEN ?1 AND ?2
+                        AND NOT (e2.source='rancher' AND e2.link_id IS NOT NULL)),
+                    max(ts),
+                    (SELECT e3.actor FROM events e3 WHERE (CASE WHEN e3.user_id<>'' THEN e3.user_id ELSE e3.actor END)=(CASE WHEN e.user_id<>'' THEN e.user_id ELSE e.actor END) ORDER BY e3.ts_ms DESC LIMIT 1)
+             FROM events e WHERE ts_ms BETWEEN ?1 AND ?2 AND {SHOWN} GROUP BY k ORDER BY max(human) DESC, 4 DESC"
         ))?;
-        let rows = stmt
+        let mut rows: Vec<ActorRow> = stmt
             .query_map(params![from_ms, to_ms], |r| {
-                Ok(ActorRow { actor: r.get(0)?, human: r.get::<_, i64>(1)? == 1, writes: r.get(2)?, alerts: r.get(3)?, last_seen: r.get(4)? })
+                Ok(ActorRow {
+                    key: r.get(0)?, user_id: r.get(1)?, human: r.get::<_, i64>(2)? == 1, writes: r.get(3)?, alerts: r.get(4)?,
+                    last_seen: r.get(5)?, actor: r.get(6)?, deleted: false, lifetimes: vec![],
+                })
             })?
             .collect::<Result<_, _>>()?;
+        drop(stmt);
+        for row in rows.iter_mut().filter(|r| !r.user_id.is_empty()) {
+            let mut lives = Self::lifetimes(&c, &row.user_id)?;
+            for l in lives.iter_mut() {
+                l.writes = c.query_row(
+                    &format!("SELECT count(*) FROM events e WHERE user_id=?1 AND ts_ms BETWEEN max(?2, ?3) AND min(?4, ?5) AND {SHOWN}
+                              AND (verb IN {WRITE_VERBS} OR source='rancher')"),
+                    params![row.user_id, from_ms, l.created_ms, to_ms, l.deleted_ms.unwrap_or(i64::MAX)],
+                    |r| r.get(0),
+                )?;
+            }
+            if let Some(last) = lives.last() {
+                row.actor = last.display_name.clone();
+                row.deleted = last.deleted_ms.is_some();
+            }
+            row.lifetimes = lives;
+        }
         Ok(rows)
     }
 
@@ -679,7 +800,7 @@ mod tests {
         assert_eq!(h[0].actor.as_deref(), Some("alice"));
         assert_eq!(h[0].changes[0].path, "spec.replicas");
 
-        let q = Query { cluster: None, actor: Some("alice".into()), from_ms: 0, to_ms: i64::MAX, humans_only: true, writes_only: true, alerts_only: false, limit: 50 };
+        let q = Query { cluster: None, actor: Some("u-1".into()), from_ms: 0, to_ms: i64::MAX, humans_only: true, writes_only: true, alerts_only: false, limit: 50 };
         let tl = s.timeline(&q).unwrap();
         assert_eq!(tl.len(), 1);
         assert_eq!(tl[0].version_id, Some(vid));
@@ -823,6 +944,38 @@ mod tests {
         // Live changes after that.
         assert_eq!(s.apply_objects("c1", &[ver("modified", "web", 3)]).unwrap(), 1);
         assert_eq!(s.history(&key()).unwrap()[0].change, "modified");
+    }
+
+    fn user_msg(seen: &str, uid: &str, created: &str, at_min: i64) -> ObjMsg {
+        ObjMsg::Version {
+            group: "management.cattle.io".into(), resource: "users".into(), kind: "User".into(),
+            namespace: "".into(), name: "u-1".into(), uid: uid.into(), seen: seen.into(),
+            at: Utc.with_ymd_and_hms(2026, 10, 14, 0, 0, 0).unwrap() + chrono::Duration::minutes(at_min),
+            object: json!({"metadata":{"name":"u-1","creationTimestamp":created},"displayName":"Alice Chen","username":"",
+                           "principalIds":["openldap_user://uid=alice","local://u-1"]}),
+        }
+    }
+
+    #[test]
+    fn deleted_and_readded_user_is_one_person_with_two_lifetimes() {
+        let s = Store::open(":memory:").unwrap();
+        s.apply_objects("local", &[user_msg("list", "A", "2026-10-13T00:00:00Z", 0)]).unwrap();
+        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00Z"), &[]).unwrap();
+        s.apply_objects("local", &[user_msg("deleted", "A", "2026-10-13T00:00:00Z", 180)]).unwrap();
+        // Same principal logs in again: same u-1, new object.
+        s.apply_objects("local", &[user_msg("modified", "B", "2026-10-14T05:00:00Z", 300)]).unwrap();
+        s.insert_event("c1", &patch("k2", "alice.chen", "2026-10-14T06:00:00Z"), &[]).unwrap();
+
+        let actors = s.actors(0, i64::MAX).unwrap();
+        assert_eq!(actors.len(), 1, "merged by user ID");
+        let a = &actors[0];
+        assert_eq!((a.key.as_str(), a.actor.as_str(), a.writes, a.deleted), ("u-1", "Alice Chen", 2, false));
+        assert_eq!(a.lifetimes.iter().map(|l| (l.uid.as_str(), l.writes)).collect::<Vec<_>>(), vec![("A", 1), ("B", 1)]);
+        assert!(a.lifetimes[0].deleted_ms.is_some() && a.lifetimes[1].deleted_ms.is_none());
+        // Filtering by the user ID finds both, whatever name each record carries.
+        let q = Query { cluster: None, actor: Some("u-1".into()), from_ms: 0, to_ms: i64::MAX, humans_only: true, writes_only: true, alerts_only: false, limit: 50 };
+        assert_eq!(s.timeline(&q).unwrap().len(), 2);
+        assert_eq!(s.users().unwrap()[0].1.len(), 2);
     }
 
     #[test]
