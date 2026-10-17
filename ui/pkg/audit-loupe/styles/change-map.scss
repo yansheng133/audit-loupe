@@ -45,6 +45,12 @@
   .btn-al { background: var(--al-surface); border: 1px solid var(--al-border); border-radius: 4px; padding: 3px 9px; cursor: pointer; font-size: 12.5px; white-space: nowrap; line-height: 1.5; min-height: 0; }
   .btn-al:hover { border-color: var(--al-primary); }
   .btn-al.on { background: var(--al-primary-soft); border-color: var(--al-primary); color: var(--al-primary); }
+  .head-stack { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+  .banner-info { border: 1px solid var(--al-primary); background: var(--al-primary-soft); border-radius: 6px; padding: 10px 12px; display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; justify-content: space-between; }
+  .banner-info .banner-text { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1 1 360px; }
+  .banner-info .banner-actions { display: flex; gap: 6px; }
+  .banner-info .banner-msg { color: var(--al-alert); }
+  .banner-info progress { flex: 1 1 200px; }
   .banner-al { border: 1px solid var(--al-alert); background: var(--al-alert-soft); border-radius: 6px; padding: 10px 12px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 
   .work { display: grid; grid-template-columns: 290px minmax(0, 1fr) 390px; gap: 8px; min-height: 0; }

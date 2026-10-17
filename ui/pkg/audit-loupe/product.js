@@ -3,7 +3,7 @@
 // experimental product registration API.
 export const PRODUCT = 'audit-loupe';
 export const BLANK_CLUSTER = '_';
-export const PAGES = ['changes', 'access', 'coverage'];
+export const PAGES = ['changes', 'access', 'coverage', 'rules'];
 export const PAGE = 'changes';
 export const routeName = (page) => `${ PRODUCT }-c-cluster-${ page }`;
 export const ROUTE = routeName(PAGE);

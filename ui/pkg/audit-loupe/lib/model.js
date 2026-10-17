@@ -45,6 +45,39 @@ const ZH = {
     create: '新增', update: '修改', patch: '修改', delete: '刪除', deletecollection: '整批刪除', get: '讀取', list: '列出', login: '登入', generatekubeconfig: '產生 kubeconfig', exec: '進入容器（exec）', attach: '連進容器（attach）', portforward: '轉送連接埠'
   },
   refused: '，被拒絕', failed: (c) => `（失敗 ${ c }）`,
+  rulesPage: {
+    title: '規則', refresh: '重新整理',
+    intro: '哪些操作會被標出來、嚴重度，以及不適用的範圍。設定寫在 Helm values 的 server.rules，重新部署後端才會生效；這裡只能看，不能改。只評估人的操作，ServiceAccount 與系統元件不在範圍內。',
+    rule: '規則', what: '判斷條件', state: '狀態', on: '啟用', off: '停用', severity: '嚴重度', defaultWas: (s) => `預設 ${ s }`,
+    exceptions: '不適用的範圍', none: '—', reason: '理由', until: (t) => `到 ${ t } 為止`, expired: '已到期',
+    scope: { clusters: '叢集', namespaces: 'namespace', namespaceLabels: 'namespace label', users: '使用者', resources: '資源' },
+    windows: (n) => (n ? `已設定 ${ n } 個變更窗口：「非上班時間」不作用，改由「變更窗口外」判斷。` : '沒有設定變更窗口：用上班時間判斷「非上班時間」，「變更窗口外」不作用。'),
+    history: '設定變更紀錄', since: '生效時間', code: '設定代碼', current: '目前', summary: '和預設不同的地方', same: '和預設相同',
+    recomputes: '重新計算紀錄', ran: '執行時間', covered: '涵蓋的紀錄時間', records: '筆數', result: '結果', ok: '完成', inProgress: '進行中',
+    what_: {
+      namespace_deleted: '刪除 namespace',
+      rbac_changed: '新增、修改或刪除 Kubernetes 的 Role、RoleBinding、ClusterRole、ClusterRoleBinding，或 Rancher 的 GlobalRole、RoleTemplate 與各類 binding',
+      pod_exec: '對 pod 做 exec、attach 或 port-forward',
+      bypassed_rancher: '不經 Rancher，直接對下游 apiserver 寫入或進入容器',
+      gitops_bypassed: '人工修改由 Fleet 部署的物件（變更不在 Git 裡）',
+      outside_change_window: '有設定變更窗口時，在涵蓋該物件的窗口都沒開的時候修改',
+      user_deleted: '刪除 Rancher 使用者',
+      secret_read: '讀取或列出 Secret',
+      credential_issued: '產生 kubeconfig，或建立 Rancher token',
+      off_hours: '沒有設定變更窗口時，在上班時間以外修改',
+      forbidden: '請求被拒絕（403）',
+      login_failed: '登入 Rancher 失敗（401）',
+    },
+  },
+  recompute: {
+    pending: (n, since) => `規則設定在 ${ since } 變更過，有 ${ n } 筆過去的紀錄是用舊設定判斷的。`,
+    explain: (total, eta) => `可以用目前的設定重新計算全部 ${ total } 筆紀錄的警示與「需要注意」，預估${ eta }，期間可以照常使用。原始紀錄與雜湊鏈不會改變，只是重新判斷。`,
+    limits: '只能重新計算保留期限內的紀錄；已經轉送到 SIEM 的警示不會重送。',
+    eta: (s) => (s < 60 ? '不到 1 分鐘' : `約 ${ Math.ceil(s / 60) } 分鐘`),
+    start: '重新計算', later: '先不要', running: (d, t) => `重新計算中：${ d } / ${ t } 筆`, done: '重新計算完成，畫面已更新。',
+    failed: (e) => `重新計算失敗：${ e }`, forbidden: '你沒有啟動重新計算的權限（需要後端所在 namespace 的 services/proxy create 權限）。',
+    busy: '已經有一個重新計算在進行，或已經不需要重新計算。',
+  },
   rules: {
     namespace_deleted: '刪除 namespace', rbac_changed: '權限變更', pod_exec: '進入容器', secret_read: '讀取 Secret', bypassed_rancher: '繞過 Rancher',
     off_hours: '非上班時間', forbidden: '被拒絕', user_deleted: '刪除使用者', credential_issued: '發出憑證', login_failed: '登入失敗', unattributed: '無法歸屬',
@@ -111,6 +144,39 @@ const EN = {
     create: 'created', update: 'updated', patch: 'patched', delete: 'deleted', deletecollection: 'deleted (collection)', get: 'read', list: 'listed', login: 'logged in', generatekubeconfig: 'generated a kubeconfig', exec: 'exec into container', attach: 'attached to container', portforward: 'port-forward'
   },
   refused: ', refused', failed: (c) => ` (failed ${ c })`,
+  rulesPage: {
+    title: 'Rules', refresh: 'Refresh',
+    intro: 'Which actions are flagged, how serious they are, and where a rule does not apply. Settings live in the Helm values (server.rules) and take effect when the backend is redeployed; this page only shows them. Only people are checked, not service accounts or system components.',
+    rule: 'Rule', what: 'Fires when', state: 'State', on: 'On', off: 'Off', severity: 'Severity', defaultWas: (s) => `default ${ s }`,
+    exceptions: 'Does not apply to', none: '—', reason: 'Reason', until: (t) => `until ${ t }`, expired: 'expired',
+    scope: { clusters: 'clusters', namespaces: 'namespaces', namespaceLabels: 'namespace labels', users: 'users', resources: 'resources' },
+    windows: (n) => (n ? `${ n } change windows set: "Outside working hours" is off and "Outside change window" decides instead.` : 'No change windows set: working hours decide "Outside working hours", and "Outside change window" is off.'),
+    history: 'Settings history', since: 'In force from', code: 'Settings code', current: 'current', summary: 'Differs from the defaults', same: 'Same as the defaults',
+    recomputes: 'Re-judging runs', ran: 'Ran', covered: 'Records from', records: 'Records', result: 'Result', ok: 'done', inProgress: 'running',
+    what_: {
+      namespace_deleted: 'A namespace is deleted',
+      rbac_changed: 'Kubernetes Roles, RoleBindings, ClusterRoles or ClusterRoleBindings, or Rancher GlobalRoles, RoleTemplates and bindings, are created, changed or deleted',
+      pod_exec: 'exec, attach or port-forward into a pod',
+      bypassed_rancher: 'A write or exec straight to the downstream apiserver, not through Rancher',
+      gitops_bypassed: 'Someone edits an object Fleet deploys (the change is not in Git)',
+      outside_change_window: 'With change windows set, a change when no window covering the object is open',
+      user_deleted: 'A Rancher user is deleted',
+      secret_read: 'A Secret is read or listed',
+      credential_issued: 'A kubeconfig is generated or a Rancher token created',
+      off_hours: 'Without change windows, a change outside working hours',
+      forbidden: 'A request is refused (403)',
+      login_failed: 'A Rancher login fails (401)',
+    },
+  },
+  recompute: {
+    pending: (n, since) => `The rule settings changed on ${ since }; ${ n } earlier records were judged by the old settings.`,
+    explain: (total, eta) => `You can judge all ${ total } records again with the current settings (alerts and "Needs attention"). Estimated time: ${ eta }; everything stays usable meanwhile. The records and their hash chain do not change; only the judgement does.`,
+    limits: 'Only records still within retention can be judged again; alerts already forwarded to the SIEM are not resent.',
+    eta: (s) => (s < 60 ? 'under a minute' : `about ${ Math.ceil(s / 60) } minutes`),
+    start: 'Judge again', later: 'Not now', running: (d, t) => `Judging again: ${ d } / ${ t } records`, done: 'Done; the view is updated.',
+    failed: (e) => `Judging again failed: ${ e }`, forbidden: 'You may not start this (it needs create on services/proxy in the backend namespace).',
+    busy: 'A run is already going, or nothing needs judging again.',
+  },
   rules: {
     namespace_deleted: 'Namespace deleted', rbac_changed: 'Permissions changed', pod_exec: 'Exec into container', secret_read: 'Secret read', bypassed_rancher: 'Bypassed Rancher',
     off_hours: 'Outside working hours', forbidden: 'Refused', user_deleted: 'User deleted', credential_issued: 'Credential issued', login_failed: 'Login failed', unattributed: 'Unattributed',
@@ -147,6 +213,7 @@ export function texts(store) {
 // ---------- constants ----------
 export const SEV_RANK = { high: 0, medium: 1, low: 2 };
 
+// Built-in severities, for records stored before severities were sent along.
 export const RULE_SEV = {
   namespace_deleted: 'high', rbac_changed: 'medium', pod_exec: 'medium', bypassed_rancher: 'medium', user_deleted: 'medium',
   secret_read: 'low', off_hours: 'low', forbidden: 'low', credential_issued: 'low', login_failed: 'low', unattributed: 'low',
@@ -193,7 +260,7 @@ export function fmtDate(ms) {
   return `${ d.getFullYear() }-${ pad(d.getMonth() + 1) }-${ pad(d.getDate()) } ${ pad(d.getHours()) }:${ pad(d.getMinutes()) }`;
 }
 
-export const sevOf = (ev) => ev.alerts.map((r) => RULE_SEV[r] || 'low').sort((x, y) => SEV_RANK[x] - SEV_RANK[y])[0] || null;
+export const sevOf = (ev) => ev.alerts.map((r) => ev.sev?.[r] || RULE_SEV[r] || 'low').sort((x, y) => SEV_RANK[x] - SEV_RANK[y])[0] || null;
 export const worst = (list) => list.filter(Boolean).sort((x, y) => SEV_RANK[x] - SEV_RANK[y])[0] || null;
 export const isRisky = (ev) => ['high', 'medium'].includes(sevOf(ev));
 
@@ -418,6 +485,8 @@ export function buildModel({
       obj,
       change: changeOf(r),
       alerts,
+      // Severity as judged when stored (or at the last re-judging), not as set now.
+      sev:    r.alert_severity || {},
       diff:   diffLines(r),
       note:   notes.join(' '),
       raw:    r,
@@ -447,6 +516,7 @@ export function buildModel({
       obj:    objFor(u.cluster, u.api_group, u.resource, u.namespace, u.name),
       change: changeOf(row),
       alerts: ['unattributed'],
+      sev:    { unattributed: 'low' },
       diff:   diffLines(row),
       note:   '',
       raw:    row,

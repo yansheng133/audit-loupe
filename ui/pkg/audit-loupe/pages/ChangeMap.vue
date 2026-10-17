@@ -3,6 +3,7 @@ import SidePanel from '../components/SidePanel.vue';
 import TopologyMap from '../components/TopologyMap.vue';
 import EvidencePanel from '../components/EvidencePanel.vue';
 import TimeAxis from '../components/TimeAxis.vue';
+import RecomputeBanner from '../components/RecomputeBanner.vue';
 import {
   getJson, backendCluster, setBackendCluster
 } from '../lib/api';
@@ -19,6 +20,7 @@ function isoDay(d) {
 export default {
   name:       'AuditLoupeChangeMap',
   components: {
+    RecomputeBanner,
     SidePanel, TopologyMap, EvidencePanel, TimeAxis
   },
 
@@ -329,97 +331,103 @@ export default {
 
 <template>
   <div class="al">
-    <div
-      class="topbar"
-      role="group"
-      :aria-label="T.title"
-    >
-      <span class="crumb">Audit Loupe ／ {{ T.crumb }}</span>
-      <h1>{{ T.title }}</h1>
-      <input
-        v-model="day"
-        type="date"
-        :aria-label="T.day"
+    <div class="head-stack">
+      <div
+        class="topbar"
+        role="group"
+        :aria-label="T.title"
       >
-      <div class="filters">
-        <select
-          v-model="cluster"
-          :class="{active: cluster}"
-          :aria-label="T.cluster"
+        <span class="crumb">Audit Loupe ／ {{ T.crumb }}</span>
+        <h1>{{ T.title }}</h1>
+        <input
+          v-model="day"
+          type="date"
+          :aria-label="T.day"
         >
-          <option value="">
-            {{ T.allClusters }}
-          </option>
-          <option
-            v-for="[id, label] in clusterOptions"
-            :key="id"
-            :value="id"
+        <div class="filters">
+          <select
+            v-model="cluster"
+            :class="{active: cluster}"
+            :aria-label="T.cluster"
           >
-            {{ label }}
-          </option>
-        </select>
-        <select
-          v-model="project"
-          :class="{active: project}"
-          :aria-label="T.project"
-        >
-          <option value="">
-            {{ T.allProjects }}
-          </option>
-          <option
-            v-for="p in projectOptions"
-            :key="p"
-            :value="p"
+            <option value="">
+              {{ T.allClusters }}
+            </option>
+            <option
+              v-for="[id, label] in clusterOptions"
+              :key="id"
+              :value="id"
+            >
+              {{ label }}
+            </option>
+          </select>
+          <select
+            v-model="project"
+            :class="{active: project}"
+            :aria-label="T.project"
           >
-            {{ p }}
-          </option>
-        </select>
-        <select
-          v-model="ns"
-          :class="{active: ns}"
-          aria-label="Namespace"
-        >
-          <option value="">
-            {{ T.allNs }}
-          </option>
-          <option
-            v-for="n in nsOptions"
-            :key="n"
-            :value="n"
+            <option value="">
+              {{ T.allProjects }}
+            </option>
+            <option
+              v-for="p in projectOptions"
+              :key="p"
+              :value="p"
+            >
+              {{ p }}
+            </option>
+          </select>
+          <select
+            v-model="ns"
+            :class="{active: ns}"
+            aria-label="Namespace"
           >
-            {{ n }}
-          </option>
-        </select>
-        <select
-          v-model="actor"
-          :class="{active: actor}"
-          :aria-label="T.whoDid"
-        >
-          <option value="">
-            {{ T.everyone }}
-          </option>
-          <option
-            v-for="[k, label] in actorOptions"
-            :key="k"
-            :value="k"
+            <option value="">
+              {{ T.allNs }}
+            </option>
+            <option
+              v-for="n in nsOptions"
+              :key="n"
+              :value="n"
+            >
+              {{ n }}
+            </option>
+          </select>
+          <select
+            v-model="actor"
+            :class="{active: actor}"
+            :aria-label="T.whoDid"
           >
-            {{ label }}
-          </option>
-        </select>
-        <label class="check"><input
-          v-model="sys"
-          type="checkbox"
-        > {{ T.withSystem }}</label>
-        <button
-          class="btn-al"
-          type="button"
-          @click="reset"
-        >
-          {{ T.reset }}
-        </button>
+            <option value="">
+              {{ T.everyone }}
+            </option>
+            <option
+              v-for="[k, label] in actorOptions"
+              :key="k"
+              :value="k"
+            >
+              {{ label }}
+            </option>
+          </select>
+          <label class="check"><input
+            v-model="sys"
+            type="checkbox"
+          > {{ T.withSystem }}</label>
+          <button
+            class="btn-al"
+            type="button"
+            @click="reset"
+          >
+            {{ T.reset }}
+          </button>
+        </div>
       </div>
-    </div>
 
+      <RecomputeBanner
+        v-if="!missing"
+        @done="load"
+      />
+    </div>
     <div
       v-if="missing || error"
       class="banner-al"

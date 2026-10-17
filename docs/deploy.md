@@ -179,7 +179,40 @@ rules:
 
 再以 RoleBinding 綁給稽核人員的使用者或 IdP 群組。
 
-## 9. 移除
+只有 `get` 的人可以看所有頁面，但不能啟動「重新計算」（見第 9 節）；要讓他能啟動，再加上 `create`。
+
+## 9. 調整規則
+
+規則的開關、嚴重度、不適用的範圍寫在 values 的 `server.rules`，沒寫到的維持預設。完整的規則清單與欄位說明在 `values.yaml` 的註解，介面「規則」頁也看得到目前生效的設定。
+
+```yaml
+server:
+  rules:
+    pod_exec:
+      severity: high
+      except:
+        - namespaces: ["dev-*"]
+          reason: 開發環境允許除錯
+          until: "2026-12-31"     # 選填，到那天結束為止
+    bypassed_rancher:
+      except:
+        - users: ["break-glass-*"]
+          clusters: ["c-m-xxxxx"]
+          reason: 緊急帳號，事後由資安覆核
+    secret_read:
+      enabled: false
+```
+
+`helm upgrade` 之後 server 重新啟動才會套用。設定有誤時 server 不會啟動，原因寫在 log 第一行，例如 `AL_RULES: pod_exec.except[0]: reason is required`。
+
+套用之後：
+
+- 新進的紀錄用新設定判斷。
+- 之前的紀錄維持原本的判斷。「變更地圖」與「規則」頁會出現提示，說明有幾筆、預估要多久，按「重新計算」才會用新設定重算全部紀錄。期間可照常使用，原始紀錄與雜湊鏈不受影響。
+- 已轉送到 SIEM 的警示不會重送。
+- 「規則」頁保留每次設定變更與重新計算的時間。
+
+## 10. 移除
 
 ```bash
 helm uninstall audit-loupe -n audit-loupe-system

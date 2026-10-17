@@ -22,6 +22,8 @@ pub struct Config {
     pub rancher_cluster: String,
     /// Approved change windows; when set they replace the working-hours rule.
     pub change_windows: Vec<crate::windows::Window>,
+    /// Rule settings (AL_RULES): on or off, severity, exempt scopes.
+    pub rules: crate::rules::RuleSet,
 }
 
 fn var(name: &str, default: &str) -> String {
@@ -111,7 +113,6 @@ impl Config {
             listen: var("AL_LISTEN", "0.0.0.0:8080"),
             ingest_listen: var("AL_INGEST_LISTEN", "0.0.0.0:8081"),
             cluster: var("AL_CLUSTER", "local"),
-            tz,
             work_start_hour: start,
             work_end_hour: end,
             work_days: range(&var("AL_WORK_DAYS", "1-5")),
@@ -119,7 +120,29 @@ impl Config {
             ingest_tokens: load_tokens(&var("AL_INGEST_TOKENS_FILE", "/etc/audit-loupe/tokens/tokens"))?,
             rancher_cluster: var("AL_RANCHER_CLUSTER", "local"),
             change_windows: crate::windows::parse(&env::var("AL_CHANGE_WINDOWS").unwrap_or_default()).map_err(|e| anyhow::anyhow!("AL_CHANGE_WINDOWS: {e}"))?,
+            rules: crate::rules::RuleSet::parse(&env::var("AL_RULES").unwrap_or_default(), &tz).map_err(|e| anyhow::anyhow!("AL_RULES: {e}"))?,
+            tz,
         })
+    }
+
+    /// Built-in settings, for a store opened without any.
+    #[cfg(test)]
+    pub fn defaults() -> Self {
+        Config {
+            db_path: ":memory:".into(),
+            listen: "127.0.0.1:0".into(),
+            ingest_listen: "127.0.0.1:0".into(),
+            cluster: "local".into(),
+            tz: chrono_tz::Asia::Taipei,
+            work_start_hour: 9,
+            work_end_hour: 18,
+            work_days: vec![1, 2, 3, 4, 5],
+            retention_days: 30,
+            ingest_tokens: vec![],
+            rancher_cluster: "local".into(),
+            change_windows: vec![],
+            rules: crate::rules::RuleSet::default(),
+        }
     }
 
     /// Settings for tests.
@@ -141,6 +164,7 @@ impl Config {
             ],
             rancher_cluster: "local".into(),
             change_windows: vec![],
+            rules: crate::rules::RuleSet::default(),
         }
     }
 }

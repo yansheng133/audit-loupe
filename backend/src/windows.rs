@@ -11,17 +11,17 @@
 //! a window with namespace labels does not cover cluster-scoped objects.
 
 use chrono::{DateTime, Datelike, FixedOffset, Timelike, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Range {
     pub from: DateTime<FixedOffset>,
     pub to: DateTime<FixedOffset>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Window {
     pub name: String,

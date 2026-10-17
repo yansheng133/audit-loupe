@@ -4,7 +4,6 @@
 use crate::audit::{to_record, Event};
 use crate::config::Config;
 use crate::diff::mask_values;
-use crate::rules::evaluate;
 use crate::store::{ObjKey, Store};
 use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use serde_json::{json, Value};
@@ -92,7 +91,7 @@ pub fn seed(store: &Store, cfg: &Config) -> anyhow::Result<()> {
             store.insert_version(&key, kind, uid, &obj, change, at + Duration::milliseconds(400))?;
         }
         let r = to_record(&ev).unwrap();
-        store.insert_event(c, &r, &evaluate(&r, cfg))?;
+        store.insert_event(c, &r)?;
         last = last.max(at);
     }
     // A change made while the tool was down: nobody to credit.

@@ -53,3 +53,29 @@ export async function getJson(path, params = {}) {
 
   return res.json();
 }
+
+// Rancher accepts a cookie-authenticated POST only with its CSRF cookie echoed in a header,
+// as its own UI does.
+function csrf() {
+  const m = document.cookie.match(/(?:^|;\s*)CSRF=([^;]+)/);
+
+  return m ? decodeURIComponent(m[1]) : '';
+}
+
+export async function postJson(path) {
+  const res = await fetch(`${ baseUrl() }${ path }`, {
+    method:      'POST',
+    credentials: 'same-origin',
+    headers:     { Accept: 'application/json', 'x-api-csrf': csrf() },
+  });
+  const body = await res.json().catch(() => ({}));
+
+  if (!res.ok) {
+    const err = new Error(body.error || `HTTP ${ res.status }`);
+
+    err.status = res.status;
+    throw err;
+  }
+
+  return body;
+}

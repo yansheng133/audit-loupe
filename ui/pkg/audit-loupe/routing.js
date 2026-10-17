@@ -1,6 +1,7 @@
 import ChangeMap from './pages/ChangeMap.vue';
 import AccessReview from './pages/AccessReview.vue';
 import Coverage from './pages/Coverage.vue';
+import Rules from './pages/Rules.vue';
 import { PRODUCT, BLANK_CLUSTER, routeName } from './product';
 
 const page = (name, component) => ({
@@ -16,4 +17,5 @@ export default [
   page('changes', ChangeMap),
   page('access', AccessReview),
   page('coverage', Coverage),
+  page('rules', Rules),
 ];
