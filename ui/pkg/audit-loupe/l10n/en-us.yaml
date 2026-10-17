@@ -1,6 +1,5 @@
+product:
+  audit-loupe: Audit Loupe
 auditLoupe:
   nav:
-    group: Audit Loupe
-    timeline: Activity Timeline
-    objects: Object History
-    alerts: Alerts
+    changes: Change Map

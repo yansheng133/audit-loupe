@@ -71,3 +71,5 @@ Thumbs.db
 
 # Locally built assets (extensions)
 dist-pkg
+# a symlink to a shared install is not matched by "node_modules/"
+node_modules

@@ -1,6 +1,5 @@
+product:
+  audit-loupe: Audit Loupe
 auditLoupe:
   nav:
-    group: Audit Loupe
-    timeline: 操作時間線
-    objects: 物件變更史
-    alerts: 異常提示
+    changes: 變更地圖

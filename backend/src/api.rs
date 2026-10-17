@@ -200,6 +200,30 @@ async fn hourly(State(s): State<AppState>, Q(p): Q<ClusterRange>) -> Response {
     }
 }
 
+async fn unattributed(State(s): State<AppState>, Q(r): Q<Range>) -> Response {
+    let (f, t) = r.bounds();
+    match s.store.unattributed(f, t) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+async fn clusters(State(s): State<AppState>, Q(r): Q<Range>) -> Response {
+    let (f, t) = r.bounds();
+    match s.store.clusters(f, t) {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+/// Which Rancher project each namespace belongs to, per cluster.
+async fn projects(State(s): State<AppState>, Q(p): Q<ClusterRange>) -> Response {
+    match s.store.namespace_projects(p.cluster.as_deref().filter(|c| !c.is_empty())) {
+        Ok(rows) => Json(rows.into_iter().map(|(c, n, p)| json!({"cluster": c, "namespace": n, "projectId": p})).collect::<Vec<_>>()).into_response(),
+        Err(e) => err(e),
+    }
+}
+
 async fn stories(State(s): State<AppState>, Q(p): Q<ClusterRange>) -> Response {
     let (f, t) = Range { from: p.from, to: p.to, hours: p.hours }.bounds();
     match s.store.stories(p.cluster.as_deref().filter(|c| !c.is_empty()), f, t) {
@@ -263,6 +287,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/history", get(history))
         .route("/api/related", get(related))
         .route("/api/hourly", get(hourly))
+        .route("/api/unattributed", get(unattributed))
+        .route("/api/clusters", get(clusters))
+        .route("/api/projects", get(projects))
         .route("/api/stories", get(stories))
         .route("/api/alerts", get(alerts))
         .with_state(state)

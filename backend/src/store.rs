@@ -158,6 +158,37 @@ pub struct EventRow {
     /// Set when the change was matched to a stored object version.
     pub version_id: Option<i64>,
     pub changes: Option<Vec<Change>>,
+    /// What the matched version did to the object: added, modified, deleting, deleted, ...
+    pub change: Option<String>,
+    /// The object as created or as last seen before deletion, when there is no diff to show.
+    pub body: Option<Value>,
+}
+
+/// A version that no audit record could be matched to: a change made while collection was
+/// down, or on a cluster without an audit source.
+#[derive(Debug, Serialize)]
+pub struct UnattributedRow {
+    pub id: i64,
+    pub cluster: String,
+    pub kind: String,
+    pub api_group: String,
+    pub resource: String,
+    pub namespace: String,
+    pub name: String,
+    pub change: String,
+    pub observed: String,
+    pub changes: Vec<Change>,
+}
+
+/// What each cluster has sent in a range, for the coverage label.
+#[derive(Debug, Serialize)]
+pub struct ClusterRow {
+    pub cluster: String,
+    pub k8s_events: i64,
+    pub rancher_events: i64,
+    pub versions: i64,
+    pub last_event: Option<String>,
+    pub last_version: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -850,6 +881,12 @@ impl Store {
     }
 
     fn version_changes(c: &Connection, vid: i64) -> anyhow::Result<Option<Vec<Change>>> {
+        Ok(Self::version_detail(c, vid)?.map(|(ch, _, _)| ch))
+    }
+
+    /// Diff against the previous version, the change kind, and the body for created or
+    /// deleted objects (which have no diff).
+    fn version_detail(c: &Connection, vid: i64) -> anyhow::Result<Option<(Vec<Change>, String, Option<Value>)>> {
         let row: Option<(String, String, String, String, String, String, String)> = c
             .query_row(
                 "SELECT cluster, api_group, resource, namespace, name, body, change FROM versions WHERE id=?1",
@@ -867,7 +904,69 @@ impl Store {
             .optional()?;
         let new: Value = serde_json::from_str(&body)?;
         let old: Option<Value> = prev.map(|p| serde_json::from_str(&p)).transpose()?;
-        Ok(Some(changes_for(&change, old.as_ref(), &new)))
+        let changes = changes_for(&change, old.as_ref(), &new);
+        let body = matches!(change.as_str(), "added" | "added_unseen" | "deleted").then_some(new);
+        Ok(Some((changes, change, body)))
+    }
+
+    pub fn unattributed(&self, from_ms: i64, to_ms: i64) -> anyhow::Result<Vec<UnattributedRow>> {
+        let c = self.conn.lock().unwrap();
+        let mut st = c.prepare(
+            "SELECT id, cluster, kind, api_group, resource, namespace, name, change, observed FROM versions
+             WHERE event_id IS NULL AND change <> 'baseline' AND observed_ms BETWEEN ?1 AND ?2 ORDER BY observed_ms LIMIT 2000",
+        )?;
+        let mut rows: Vec<UnattributedRow> = st
+            .query_map(params![from_ms, to_ms], |r| {
+                Ok(UnattributedRow {
+                    id: r.get(0)?, cluster: r.get(1)?, kind: r.get(2)?, api_group: r.get(3)?, resource: r.get(4)?,
+                    namespace: r.get(5)?, name: r.get(6)?, change: r.get(7)?, observed: r.get(8)?, changes: vec![],
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        drop(st);
+        for row in rows.iter_mut() {
+            row.changes = Self::version_changes(&c, row.id)?.unwrap_or_default();
+        }
+        Ok(rows)
+    }
+
+    pub fn clusters(&self, from_ms: i64, to_ms: i64) -> anyhow::Result<Vec<ClusterRow>> {
+        let c = self.conn.lock().unwrap();
+        let mut st = c.prepare(
+            "SELECT k.cluster,
+               (SELECT count(*) FROM events WHERE cluster=k.cluster AND source='k8s' AND ts_ms BETWEEN ?1 AND ?2),
+               (SELECT count(*) FROM events WHERE cluster=k.cluster AND source='rancher' AND ts_ms BETWEEN ?1 AND ?2),
+               (SELECT count(*) FROM versions WHERE cluster=k.cluster AND observed_ms BETWEEN ?1 AND ?2),
+               (SELECT max(ts) FROM events WHERE cluster=k.cluster),
+               (SELECT max(observed) FROM versions WHERE cluster=k.cluster)
+             FROM (SELECT DISTINCT cluster FROM events UNION SELECT DISTINCT cluster FROM versions) k ORDER BY k.cluster",
+        )?;
+        let rows = st
+            .query_map(params![from_ms, to_ms], |r| {
+                Ok(ClusterRow { cluster: r.get(0)?, k8s_events: r.get(1)?, rancher_events: r.get(2)?, versions: r.get(3)?, last_event: r.get(4)?, last_version: r.get(5)? })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Namespace -> Rancher project ID, from the `field.cattle.io/projectId` label of each
+    /// namespace's latest version.
+    pub fn namespace_projects(&self, cluster: Option<&str>) -> anyhow::Result<Vec<(String, String, String)>> {
+        let c = self.conn.lock().unwrap();
+        let mut st = c.prepare(
+            "SELECT cluster, name, body FROM versions WHERE id IN (
+               SELECT max(id) FROM versions WHERE api_group='' AND resource='namespaces' AND (?1 IS NULL OR cluster=?1) GROUP BY cluster, name)
+             AND change <> 'deleted'",
+        )?;
+        let rows: Vec<(String, String, String)> = st.query_map(params![cluster], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(cl, ns, body)| {
+                let v: Value = serde_json::from_str(&body).ok()?;
+                let p = v.pointer("/metadata/labels/field.cattle.io~1projectId")?.as_str()?.to_string();
+                Some((cl, ns, p))
+            })
+            .collect())
     }
 
     pub fn timeline(&self, q: &Query) -> anyhow::Result<Vec<EventRow>> {
@@ -924,13 +1023,19 @@ impl Store {
                     alerts: al.map(|s| s.split(',').map(String::from).collect()).unwrap_or_default(),
                     version_id: r.get(20)?,
                     changes: None,
+                    change: None,
+                    body: None,
                 })
             })?
             .collect::<Result<_, _>>()?;
         drop(stmt);
         for row in rows.iter_mut() {
             if let Some(vid) = row.version_id {
-                row.changes = Self::version_changes(&c, vid)?;
+                if let Some((changes, change, body)) = Self::version_detail(&c, vid)? {
+                    row.changes = Some(changes);
+                    row.change = Some(change);
+                    row.body = body;
+                }
             }
         }
         Ok(rows)
@@ -1326,6 +1431,22 @@ mod tests {
         s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00.900Z"), &[]).unwrap();
         let h = s.hourly(None, 0, i64::MAX).unwrap();
         assert_eq!(h.iter().map(|x| x.writes).sum::<i64>(), 1, "{h:?}");
+    }
+
+    #[test]
+    fn unattributed_versions_projects_and_clusters() {
+        let s = Store::open(":memory:").unwrap();
+        let t = Utc.with_ymd_and_hms(2026, 10, 14, 2, 0, 0).unwrap();
+        s.insert_version(&key(), "Deployment", "u1", &obj(1), "baseline", t).unwrap();
+        s.insert_version(&key(), "Deployment", "u1", &obj(2), "resync", t + chrono::Duration::minutes(30)).unwrap();
+        let u = s.unattributed(0, i64::MAX).unwrap();
+        assert_eq!((u.len(), u[0].change.as_str(), u[0].changes[0].path.as_str()), (1, "modified_unseen", "spec.replicas"));
+        let ns = ObjKey { api_group: "".into(), resource: "namespaces".into(), namespace: "".into(), name: "shop".into(), ..key() };
+        s.insert_version(&ns, "Namespace", "n1", &json!({"metadata":{"name":"shop","labels":{"field.cattle.io/projectId":"p-abc"}}}), "baseline", t).unwrap();
+        assert_eq!(s.namespace_projects(None).unwrap(), vec![("c1".into(), "shop".into(), "p-abc".into())]);
+        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00Z"), &[]).unwrap();
+        let c = s.clusters(0, i64::MAX).unwrap();
+        assert_eq!((c[0].cluster.as_str(), c[0].k8s_events, c[0].rancher_events), ("c1", 1, 0));
     }
 
     #[test]
