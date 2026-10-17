@@ -10,7 +10,7 @@ use crate::collect::{batch_and_send, Line, Sender};
 use crate::diff::{mask_values, normalize};
 use chrono::{DateTime, Duration as CDuration, Utc};
 use futures::StreamExt;
-use kube::api::{Api, DynamicObject};
+use kube::api::{Api, DynamicObject, TypeMeta};
 use kube::discovery::{self, ApiResource};
 use kube::runtime::watcher::{self, Event};
 use kube::runtime::WatchStreamExt;
@@ -137,6 +137,12 @@ async fn resolve(client: &Client, spec: &str) -> anyhow::Result<Option<ApiResour
     Ok(g.versioned_resources(&version).into_iter().find(|(ar, _)| ar.plural == plural).map(|(ar, _)| ar))
 }
 
+fn with_types(obj: &mut DynamicObject, ar: &ApiResource) {
+    if obj.types.is_none() {
+        obj.types = Some(TypeMeta { api_version: ar.api_version.clone(), kind: ar.kind.clone() });
+    }
+}
+
 fn line(m: &ObjMsg) -> Line {
     Line { mark: None, text: serde_json::to_string(m).expect("serializable") }
 }
@@ -149,7 +155,7 @@ async fn watch_one(client: Client, ar: ApiResource, tx: tokio::sync::mpsc::Sende
     let mut listed: Vec<(String, String)> = Vec::new();
     let mut stream = watcher::watcher(api, watcher::Config::default()).default_backoff().boxed();
     while let Some(item) = stream.next().await {
-        let (obj, seen) = match item {
+        let (mut obj, seen) = match item {
             Ok(Event::Init) => {
                 listed.clear();
                 tx.send(line(&ObjMsg::ListStart { group: group.clone(), resource: resource.clone() })).await?;
@@ -169,6 +175,9 @@ async fn watch_one(client: Client, ar: ApiResource, tx: tokio::sync::mpsc::Sende
                 continue;
             }
         };
+        // Items of a LIST response carry no apiVersion/kind; watch events do. Without this every
+        // re-list shows a change on those two fields, and restore YAML would lack them.
+        with_types(&mut obj, &ar);
         let namespace = obj.metadata.namespace.clone().unwrap_or_default();
         let name = obj.metadata.name.clone().unwrap_or_default();
         let uid = obj.metadata.uid.clone().unwrap_or_default();

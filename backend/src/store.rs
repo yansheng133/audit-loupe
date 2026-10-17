@@ -1,7 +1,7 @@
 //! SQLite storage for audit records, object versions and alerts.
 
 use crate::audit::{Record, Source, Via};
-use crate::diff::{diff, normalize, Change};
+use crate::diff::{diff, normalize, same_content, Change};
 use crate::rules::Alert;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -1309,7 +1309,7 @@ impl Store {
                 let prev: Value = serde_json::from_str(prev).unwrap_or(Value::Null);
                 if seen == "deleted" {
                     "deleted"
-                } else if prev == body {
+                } else if same_content(&prev, &body) {
                     return Ok(None);
                 } else if !has_deletion(&prev) && has_deletion(&body) {
                     "deleting"
@@ -1380,18 +1380,36 @@ impl Store {
                 _ => ("('delete','deletecollection')", 10 * 60_000, "DESC"),
             };
             // Live changes take the earliest unlinked event in the window so two quick edits
-            // keep their order; gap changes take the latest one before the version was seen.
+            // keep their order. A version found after a gap may fold several people's edits
+            // into one diff: it is linked only when exactly one event could have made it
+            // since the previous version; otherwise it stays unattributed.
+            let unseen = change.ends_with("_unseen");
+            let mut from = obs - before_ms;
+            if unseen {
+                let prev: Option<i64> = c
+                    .query_row(
+                        "SELECT observed_ms FROM versions WHERE cluster=?1 AND api_group=?2 AND resource=?3 AND namespace=?4 AND name=?5 AND id < ?6 ORDER BY id DESC LIMIT 1",
+                        params![cluster, group, resource, ns, name, vid],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(p) = prev {
+                    from = from.max(p + 1);
+                }
+            }
             let sql = format!(
                 "SELECT e.id FROM events e WHERE e.cluster=?1 AND e.api_group=?2 AND e.resource=?3 AND e.namespace=?4
                  AND (e.name=?5 OR (e.name='' AND e.verb IN ('create','deletecollection')))
                  AND e.verb IN {verbs} AND e.subresource IN ('','scale') AND e.code BETWEEN 200 AND 299
                  AND e.ts_ms BETWEEN ?6 AND ?7 AND {SHOWN}
                  AND (e.verb = 'deletecollection' OR NOT EXISTS (SELECT 1 FROM versions v WHERE v.event_id = e.id))
-                 ORDER BY e.ts_ms {order}, e.id {order} LIMIT 1"
+                 ORDER BY e.ts_ms {order}, e.id {order} LIMIT 2"
             );
-            let hit: Option<i64> = c
-                .query_row(&sql, params![cluster, group, resource, ns, name, obs - before_ms, obs + 5_000], |r| r.get(0))
-                .optional()?;
+            let hits: Vec<i64> = c
+                .prepare(&sql)?
+                .query_map(params![cluster, group, resource, ns, name, from, obs + 5_000], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            let hit = if unseen && hits.len() > 1 { None } else { hits.first().copied() };
             if let Some(eid) = hit {
                 c.execute("UPDATE versions SET event_id=?1 WHERE id=?2", params![eid, vid])?;
                 linked += 1;
@@ -1511,6 +1529,19 @@ impl Store {
             .optional()?;
         if let Some(p) = prev.filter(|p| now_ms - p > GAP_MS) {
             c.execute("INSERT INTO gaps (cluster, collector, instance, from_ms, to_ms) VALUES (?1,?2,?3,?4,?5)", params![cluster, collector, instance, p, now_ms])?;
+        }
+        // watch, rancher and neuvector run as one pod per cluster: a new pod name replaces the
+        // old one, so a silent old instance ends its gap here instead of staying "still silent"
+        // forever. collect-file runs one per node, where another node checking in proves nothing.
+        if collector != "file" {
+            let stale: Vec<(String, i64)> = c
+                .prepare("SELECT instance, last_ms FROM heartbeats WHERE cluster=?1 AND collector=?2 AND instance<>?3 AND ?4 - last_ms > ?5")?
+                .query_map(params![cluster, collector, instance, now_ms, GAP_MS], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+            for (old, last) in stale {
+                c.execute("INSERT INTO gaps (cluster, collector, instance, from_ms, to_ms) VALUES (?1,?2,?3,?4,?5)", params![cluster, collector, old, last, now_ms])?;
+                c.execute("DELETE FROM heartbeats WHERE cluster=?1 AND collector=?2 AND instance=?3", params![cluster, collector, old])?;
+            }
         }
         c.execute(
             "INSERT INTO heartbeats (cluster, collector, instance, last_ms, details) VALUES (?1,?2,?3,?4,?5)
@@ -1924,6 +1955,49 @@ mod tests {
         let other = ObjKey { name: "api".into(), ..key() };
         s.insert_version(&other, "Deployment", "u2", &obj(1), "resync", t).unwrap();
         assert_eq!(s.history(&other).unwrap()[0].change, "added_unseen");
+    }
+
+    #[test]
+    fn gap_with_two_editors_stays_unattributed() {
+        // Lab 2026-10-17: one edit by a node admin and one by a Rancher user while the watch
+        // was down came back as one diff and was credited to the last one.
+        let s = Store::open(":memory:").unwrap();
+        let t = Utc.with_ymd_and_hms(2026, 10, 14, 2, 0, 0).unwrap();
+        s.insert_version(&key(), "Deployment", "u1", &obj(1), "baseline", t).unwrap();
+        s.insert_event("c1", &patch("g1", "bob", "2026-10-14T02:03:00Z"), &[]).unwrap();
+        s.insert_event("c1", &patch("g2", "alice", "2026-10-14T02:05:00Z"), &[]).unwrap();
+        s.insert_version(&key(), "Deployment", "u1", &obj(2), "resync", t + chrono::Duration::minutes(10)).unwrap();
+        assert_eq!(s.link_since(0).unwrap(), 0);
+        let h = s.history(&key()).unwrap();
+        assert_eq!((h[0].change.as_str(), h[0].actor.as_deref()), ("modified_unseen", None));
+    }
+
+    #[test]
+    fn list_items_without_types_are_not_a_change() {
+        let s = Store::open(":memory:").unwrap();
+        let t = Utc.with_ymd_and_hms(2026, 10, 14, 2, 0, 0).unwrap();
+        s.insert_version(&key(), "Deployment", "u1", &obj(1), "baseline", t).unwrap();
+        let mut typed = obj(1);
+        typed["apiVersion"] = json!("apps/v1");
+        typed["kind"] = json!("Deployment");
+        assert_eq!(s.insert_version(&key(), "Deployment", "u1", &typed, "modified", t).unwrap(), None);
+    }
+
+    #[test]
+    fn replaced_watch_pod_ends_the_gap() {
+        let s = Store::open(":memory:").unwrap();
+        let t0 = 1_000_000_000_000;
+        s.heartbeat("c1", "watch", "pod-a", &json!({}), t0).unwrap();
+        s.heartbeat("c1", "file", "node-1", &json!({}), t0).unwrap();
+        s.heartbeat("c1", "file", "node-2", &json!({}), t0 + 600_000).unwrap();
+        s.heartbeat("c1", "watch", "pod-b", &json!({}), t0 + 600_000).unwrap();
+        let cov = s.coverage(0, i64::MAX, t0 + 620_000).unwrap();
+        let gaps: Vec<(String, String, Option<i64>)> = cov[0].gaps.iter()
+            .map(|g| (g["collector"].as_str().unwrap().into(), g["instance"].as_str().unwrap().into(), g["toMs"].as_i64())).collect();
+        assert!(gaps.contains(&("watch".into(), "pod-a".into(), Some(t0 + 600_000))), "{gaps:?}");
+        // One file collector per node: node-1 is still silent.
+        assert!(gaps.contains(&("file".into(), "node-1".into(), None)), "{gaps:?}");
+        assert_eq!(cov[0].collectors.iter().filter(|c| c["collector"] == "watch").count(), 1);
     }
 
     fn rancher_put(id: &str, ts: &str) -> Record {

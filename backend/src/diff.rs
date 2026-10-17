@@ -128,8 +128,24 @@ fn walk(path: &str, a: &Value, b: &Value, out: &mut Vec<Change>) {
 
 pub fn diff(old: &Value, new: &Value) -> Vec<Change> {
     let mut out = Vec::new();
-    walk("", &normalize(old), &normalize(new), &mut out);
+    walk("", &without_types(&normalize(old)), &without_types(&normalize(new)), &mut out);
     out
+}
+
+/// Top-level apiVersion and kind are absent from LIST items sent by collectors before 0.2.1
+/// and present in watch events; nobody changes them, so they never count as a change.
+fn without_types(v: &Value) -> Value {
+    let mut v = v.clone();
+    if let Some(m) = v.as_object_mut() {
+        m.remove("apiVersion");
+        m.remove("kind");
+    }
+    v
+}
+
+/// Same content for change detection (normalised bodies; apiVersion/kind ignored).
+pub fn same_content(a: &Value, b: &Value) -> bool {
+    without_types(a) == without_types(b)
 }
 
 #[cfg(test)]
