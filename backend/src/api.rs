@@ -18,7 +18,6 @@ use std::sync::Arc;
 pub struct AppState {
     pub store: Store,
     pub cfg: Arc<Config>,
-    pub watch: crate::watch::Status,
 }
 
 fn err(e: anyhow::Error) -> Response {
@@ -51,6 +50,7 @@ async fn ingest(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> R
         "rancher-audit" => {
             return (StatusCode::FORBIDDEN, "only the Rancher cluster's collector may send Rancher records").into_response();
         }
+        "k8s-object" => return ingest_objects(s, cluster, &body).await,
         _ => return (StatusCode::BAD_REQUEST, format!("unsupported source {source:?}")).into_response(),
     };
     let batch: Vec<_> = records.into_iter().map(|r| {
@@ -60,6 +60,28 @@ async fn ingest(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> R
     let store = s.store.clone();
     match tokio::task::spawn_blocking(move || store.insert_events(&cluster, &batch)).await {
         Ok(Ok(stored)) => Json(json!({"received": received, "skipped": skipped, "stored": stored})).into_response(),
+        Ok(Err(e)) => err(e),
+        Err(e) => err(e.into()),
+    }
+}
+
+async fn ingest_objects(s: AppState, cluster: String, body: &[u8]) -> Response {
+    let mut msgs = Vec::new();
+    for line in body.split(|b| *b == b'\n') {
+        let line = line.trim_ascii();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<crate::watch::ObjMsg>(line) {
+            Ok(m) => msgs.push(m),
+            // A malformed line would be resent forever; refuse the batch so it is visible.
+            Err(e) => return (StatusCode::BAD_REQUEST, format!("bad object message: {e}")).into_response(),
+        }
+    }
+    let received = msgs.len();
+    let store = s.store.clone();
+    match tokio::task::spawn_blocking(move || store.apply_objects(&cluster, &msgs)).await {
+        Ok(Ok(stored)) => Json(json!({"received": received, "stored": stored})).into_response(),
         Ok(Err(e)) => err(e),
         Err(e) => err(e.into()),
     }
@@ -175,9 +197,6 @@ async fn info(State(s): State<AppState>) -> Json<serde_json::Value> {
         "name": "audit-loupe",
         "version": env!("CARGO_PKG_VERSION"),
         "cluster": s.cfg.cluster,
-        "watching": s.cfg.watch_enabled,
-        "watchResources": s.cfg.watch_resources,
-        "watchStatus": s.watch.lock().unwrap().clone(),
         "timezone": s.cfg.tz.name(),
         "workHours": format!("{}-{}", s.cfg.work_start_hour, s.cfg.work_end_hour),
         "retentionDays": s.cfg.retention_days,
@@ -217,7 +236,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn state() -> AppState {
-        AppState { store: Store::open(":memory:").unwrap(), cfg: Arc::new(Config::test()), watch: Default::default() }
+        AppState { store: Store::open(":memory:").unwrap(), cfg: Arc::new(Config::test()) }
     }
     const LINE: &str = r#"{"auditID":"a1","stage":"ResponseComplete","verb":"delete","user":{"username":"system:admin"},"objectRef":{"resource":"namespaces","name":"legacy-batch"},"responseStatus":{"code":200},"stageTimestamp":"2026-10-15T13:40:00Z"}"#;
 

@@ -23,7 +23,8 @@ async fn main() -> anyhow::Result<()> {
         "server" | "seed-demo" => {}
         "collect-file" => return collect::run_file().await,
         "collect-rancher" => return collect::run_rancher().await,
-        other => anyhow::bail!("unknown command {other:?}; use server, collect-file, collect-rancher or seed-demo"),
+        "collect-watch" => return watch::run().await,
+        other => anyhow::bail!("unknown command {other:?}; use server, collect-file, collect-rancher, collect-watch or seed-demo"),
     }
     let cfg = Arc::new(config::Config::from_env()?);
     let store = store::Store::open(&cfg.db_path)?;
@@ -36,17 +37,11 @@ async fn main() -> anyhow::Result<()> {
     if cfg.ingest_tokens.is_empty() {
         warn!("no collector tokens configured; the ingest endpoint will refuse all batches");
     }
-    let status: watch::Status = Default::default();
-
     // Bind first so probes pass and audit batches are accepted while discovery runs.
-    let state = api::AppState { store: store.clone(), cfg: cfg.clone(), watch: status.clone() };
+    let state = api::AppState { store: store.clone(), cfg: cfg.clone() };
     let api_listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
     let ingest_listener = tokio::net::TcpListener::bind(&cfg.ingest_listen).await?;
     info!(api = %cfg.listen, ingest = %cfg.ingest_listen, "serving");
-
-    if cfg.watch_enabled {
-        watch::run(cfg.watch_resources.clone(), cfg.cluster.clone(), store.clone(), status.clone());
-    }
 
     // Audit batches arrive after the watch sees the change, so link them periodically.
     let s = store.clone();

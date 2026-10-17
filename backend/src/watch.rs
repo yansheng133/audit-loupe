@@ -1,8 +1,13 @@
-//! Watch selected resources and store a version every time their spec changes.
-//! Audit logs say who sent a change; the stored versions say what it changed from.
+//! `collect-watch`: watch selected resources in the cluster it runs in and push every spec
+//! change to the server. Audit logs say who sent a change; the stored versions say what it
+//! changed from.
+//!
+//! Everything that must not leave the cluster is removed here, before sending: ConfigMap
+//! values become short hashes, local users' password hashes are dropped, and Secrets are
+//! never watched. Status-only updates are skipped here too, which is most of the traffic.
 
-use crate::diff::mask_values;
-use crate::store::{ObjKey, Store};
+use crate::collect::{batch_and_send, Line, Sender};
+use crate::diff::{mask_values, normalize};
 use chrono::{DateTime, Duration as CDuration, Utc};
 use futures::StreamExt;
 use kube::api::{Api, DynamicObject};
@@ -10,17 +15,50 @@ use kube::discovery::{self, ApiResource};
 use kube::runtime::watcher::{self, Event};
 use kube::runtime::WatchStreamExt;
 use kube::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
-use std::sync::{Arc, Mutex};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{info, warn};
 
-/// Per-resource watch state, reported by /api/info so a silent failure is visible.
-pub type Status = Arc<Mutex<BTreeMap<String, String>>>;
-
 /// Never watched, whatever the configuration says.
-const DENY: &[&str] = &["secrets"];
+const DENY: &[&str] = &["secrets", "tokens"];
+
+pub const DEFAULT_WATCH: &str = "apps/v1/deployments,apps/v1/statefulsets,apps/v1/daemonsets,\
+batch/v1/cronjobs,v1/services,v1/configmaps,v1/namespaces,v1/serviceaccounts,\
+networking.k8s.io/v1/ingresses,networking.k8s.io/v1/networkpolicies,\
+rbac.authorization.k8s.io/v1/roles,rbac.authorization.k8s.io/v1/rolebindings,\
+rbac.authorization.k8s.io/v1/clusterroles,rbac.authorization.k8s.io/v1/clusterrolebindings,\
+autoscaling/v2/horizontalpodautoscalers,gateway.networking.k8s.io/v1/httproutes";
+
+/// Added on the Rancher cluster: who may do what in Rancher (for the access review).
+pub const RANCHER_WATCH: &str = "management.cattle.io/v3/globalroles,management.cattle.io/v3/globalrolebindings,\
+management.cattle.io/v3/roletemplates,management.cattle.io/v3/clusterroletemplatebindings,\
+management.cattle.io/v3/projectroletemplatebindings,management.cattle.io/v3/projects,\
+management.cattle.io/v3/users,management.cattle.io/v3/userattributes";
+
+/// One message from `collect-watch`, a JSON line in a `k8s-object` batch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ObjMsg {
+    /// A full list of this resource type begins (collector start, or the watch was lost).
+    ListStart { group: String, resource: String },
+    /// An object as listed or as changed. `seen` is "list", "modified" or "deleted".
+    Version {
+        group: String,
+        resource: String,
+        kind: String,
+        namespace: String,
+        name: String,
+        uid: String,
+        seen: String,
+        at: DateTime<Utc>,
+        object: Value,
+    },
+    /// The list is complete; anything stored as alive but not listed was deleted meanwhile.
+    ListDone { group: String, resource: String, listed: Vec<(String, String)> },
+}
 
 /// "apps/v1/deployments" -> ("apps", "v1", "deployments"); "v1/configmaps" -> ("", "v1", "configmaps")
 pub fn split_spec(spec: &str) -> Option<(String, String, String)> {
@@ -52,6 +90,34 @@ fn change_time(obj: &Value, now: DateTime<Utc>) -> DateTime<Utc> {
     }
 }
 
+/// Remove what must not leave the cluster and what changes without anyone acting.
+pub fn sanitize(group: &str, resource: &str, obj: &mut Value) {
+    if let Some(meta) = obj.get_mut("metadata").and_then(Value::as_object_mut) {
+        meta.remove("managedFields");
+    }
+    match (group, resource) {
+        ("", "configmaps") => mask_values(obj),
+        ("management.cattle.io", "users") => {
+            if let Some(m) = obj.as_object_mut() {
+                m.remove("password");
+            }
+        }
+        // Refreshed on every login and hourly; only the group lists matter.
+        ("management.cattle.io", "userattributes") => {
+            if let Some(m) = obj.as_object_mut() {
+                for k in ["LastRefresh", "NeedsRefresh", "LastLogin", "lastRefresh", "needsRefresh", "lastLogin"] {
+                    m.remove(k);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn digest(v: &Value) -> [u8; 32] {
+    Sha256::digest(v.to_string().as_bytes()).into()
+}
+
 async fn resolve(client: &Client, spec: &str) -> anyhow::Result<Option<ApiResource>> {
     let Some((group, version, plural)) = split_spec(spec) else {
         anyhow::bail!("expected group/version/resource");
@@ -68,113 +134,118 @@ async fn resolve(client: &Client, spec: &str) -> anyhow::Result<Option<ApiResour
     Ok(g.versioned_resources(&version).into_iter().find(|(ar, _)| ar.plural == plural).map(|(ar, _)| ar))
 }
 
-fn store_obj(store: &Store, cluster: &str, ar: &ApiResource, obj: &DynamicObject, seen: &str) -> Option<(String, String)> {
-    let key = ObjKey {
-        cluster: cluster.to_string(),
-        api_group: ar.group.clone(),
-        resource: ar.plural.clone(),
-        namespace: obj.metadata.namespace.clone().unwrap_or_default(),
-        name: obj.metadata.name.clone().unwrap_or_default(),
-    };
-    let uid = obj.metadata.uid.clone().unwrap_or_default();
-    let mut value = serde_json::to_value(obj).ok()?;
-    if ar.plural == "configmaps" && ar.group.is_empty() {
-        mask_values(&mut value);
-    }
-    let at = if seen == "deleted" { Utc::now() } else { change_time(&value, Utc::now()) };
-    if let Err(e) = store.insert_version(&key, &ar.kind, &uid, &value, seen, at) {
-        warn!(error = %e, "store version failed");
-    }
-    Some((key.namespace, key.name))
+fn line(m: &ObjMsg) -> Line {
+    Line { mark: None, text: serde_json::to_string(m).expect("serializable") }
 }
 
-async fn watch_one(client: Client, ar: ApiResource, cluster: String, store: Store, status: Status, label: String) {
+async fn watch_one(client: Client, ar: ApiResource, tx: tokio::sync::mpsc::Sender<Line>) -> anyhow::Result<()> {
     let api: Api<DynamicObject> = Api::all_with(client, &ar);
-    let first = !store.has_any(&cluster, &ar.group, &ar.plural).unwrap_or(false);
-    let mut listed_once = false;
-    let mut seen_in_list: HashSet<(String, String)> = HashSet::new();
+    let (group, resource) = (ar.group.clone(), ar.plural.clone());
+    // Last digest sent per object, to skip updates that change nothing a person sets.
+    let mut sent: HashMap<(String, String), [u8; 32]> = HashMap::new();
+    let mut listed: Vec<(String, String)> = Vec::new();
     let mut stream = watcher::watcher(api, watcher::Config::default()).default_backoff().boxed();
-    status.lock().unwrap().insert(label.clone(), "listing".into());
     while let Some(item) = stream.next().await {
-        match item {
-            Ok(Event::Init) => seen_in_list.clear(),
-            Ok(Event::InitApply(o)) => {
-                let seen = if first && !listed_once { "baseline" } else { "resync" };
-                if let Some(k) = store_obj(&store, &cluster, &ar, &o, seen) {
-                    seen_in_list.insert(k);
-                }
+        let (obj, seen) = match item {
+            Ok(Event::Init) => {
+                listed.clear();
+                tx.send(line(&ObjMsg::ListStart { group: group.clone(), resource: resource.clone() })).await?;
+                continue;
             }
             Ok(Event::InitDone) => {
-                // Anything we thought was alive but is missing from the fresh list was deleted
-                // while we were not watching.
-                if listed_once || !first {
-                    if let Ok(alive) = store.alive(&cluster, &ar.group, &ar.plural) {
-                        for (ns, name, uid, kind, body) in alive {
-                            if !seen_in_list.contains(&(ns.clone(), name.clone())) {
-                                let key = ObjKey { cluster: cluster.clone(), api_group: ar.group.clone(), resource: ar.plural.clone(), namespace: ns, name };
-                                let _ = store.insert_version(&key, &kind, &uid, &body, "deleted", Utc::now());
-                            }
-                        }
-                    }
-                }
-                listed_once = true;
-                status.lock().unwrap().insert(label.clone(), "watching".into());
+                let done = ObjMsg::ListDone { group: group.clone(), resource: resource.clone(), listed: std::mem::take(&mut listed) };
+                tx.send(line(&done)).await?;
+                continue;
             }
-            Ok(Event::Apply(o)) => {
-                store_obj(&store, &cluster, &ar, &o, "modified");
-            }
-            Ok(Event::Delete(o)) => {
-                store_obj(&store, &cluster, &ar, &o, "deleted");
-            }
+            Ok(Event::InitApply(o)) => (o, "list"),
+            Ok(Event::Apply(o)) => (o, "modified"),
+            Ok(Event::Delete(o)) => (o, "deleted"),
             Err(e) => {
-                // default_backoff() spaces out retries; just record it.
-                warn!(resource = %label, error = %e, "watch error");
-                status.lock().unwrap().insert(label.clone(), format!("error: {e}"));
-            }
-        }
-    }
-}
-
-/// Resolve each configured resource (retrying until the API is reachable) and watch it.
-pub fn run(specs: Vec<String>, cluster: String, store: Store, status: Status) {
-    tokio::spawn(async move {
-        let client = loop {
-            match Client::try_default().await {
-                Ok(c) => break c,
-                Err(e) => {
-                    warn!(error = %e, "kubernetes client unavailable, retrying");
-                    tokio::time::sleep(Duration::from_secs(15)).await;
-                }
+                // default_backoff() spaces out retries; the watcher re-lists by itself.
+                warn!(resource = %resource, error = %e, "watch error");
+                continue;
             }
         };
-        for spec in specs {
-            let (client, cluster, store, status) = (client.clone(), cluster.clone(), store.clone(), status.clone());
-            tokio::spawn(async move {
-                let mut delay = 5;
-                loop {
-                    match resolve(&client, &spec).await {
-                        Ok(Some(ar)) => {
-                            info!(resource = %spec, "watching");
-                            watch_one(client, ar, cluster, store, status, spec).await;
-                            return;
+        let namespace = obj.metadata.namespace.clone().unwrap_or_default();
+        let name = obj.metadata.name.clone().unwrap_or_default();
+        let uid = obj.metadata.uid.clone().unwrap_or_default();
+        let mut value = serde_json::to_value(&obj)?;
+        let now = Utc::now();
+        let at = if seen == "deleted" { now } else { change_time(&value, now) };
+        sanitize(&group, &resource, &mut value);
+        let key = (namespace.clone(), name.clone());
+        if seen == "list" {
+            listed.push(key.clone());
+        }
+        let d = digest(&normalize(&value));
+        if seen == "deleted" {
+            sent.remove(&key);
+        } else if seen == "modified" && sent.get(&key) == Some(&d) {
+            continue;
+        } else {
+            sent.insert(key, d);
+        }
+        let kind = obj.types.as_ref().map(|t| t.kind.clone()).unwrap_or_else(|| ar.kind.clone());
+        let msg = ObjMsg::Version { group: group.clone(), resource: resource.clone(), kind, namespace, name, uid, seen: seen.into(), at, object: value };
+        tx.send(line(&msg)).await?;
+    }
+    Ok(())
+}
+
+pub fn resources_from_env() -> Vec<String> {
+    let base = std::env::var("AL_WATCH_RESOURCES").ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| DEFAULT_WATCH.to_string());
+    let mut specs: Vec<String> = base.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    if std::env::var("AL_WATCH_RANCHER").is_ok_and(|v| v == "true") {
+        specs.extend(RANCHER_WATCH.split(',').map(str::to_string));
+    }
+    specs
+}
+
+/// Resolve each configured resource (retrying until the API serves it) and watch it.
+pub async fn run() -> anyhow::Result<()> {
+    let sender = Sender::from_env("k8s-object")?;
+    let specs = resources_from_env();
+    let client = Client::try_default().await?;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Line>(4096);
+    let sending = tokio::spawn(batch_and_send(rx, sender, None));
+    info!(resources = specs.len(), "watching");
+    let mut tasks = Vec::new();
+    for spec in specs {
+        let (client, tx) = (client.clone(), tx.clone());
+        tasks.push(tokio::spawn(async move {
+            let mut delay = 5;
+            loop {
+                match resolve(&client, &spec).await {
+                    Ok(Some(ar)) => {
+                        info!(resource = %spec, "watching");
+                        if let Err(e) = watch_one(client.clone(), ar, tx.clone()).await {
+                            warn!(resource = %spec, error = %e, "watch stopped");
                         }
-                        Ok(None) => {
-                            status.lock().unwrap().insert(spec.clone(), "not served by this cluster".into());
-                            return;
-                        }
-                        Err(e) => {
-                            status.lock().unwrap().insert(spec.clone(), format!("error: {e}"));
-                            if e.to_string().contains("never watched") || e.to_string().contains("expected group") {
-                                return;
-                            }
-                            tokio::time::sleep(Duration::from_secs(delay)).await;
-                            delay = (delay * 2).min(300);
-                        }
+                        return;
+                    }
+                    Ok(None) => {
+                        info!(resource = %spec, "not served by this cluster; skipped");
+                        return;
+                    }
+                    Err(e) if e.to_string().contains("never watched") || e.to_string().contains("expected group") => {
+                        warn!(resource = %spec, error = %e, "skipped");
+                        return;
+                    }
+                    Err(e) => {
+                        warn!(resource = %spec, error = %e, retry_in = delay, "cannot resolve yet");
+                        tokio::time::sleep(Duration::from_secs(delay)).await;
+                        delay = (delay * 2).min(300);
                     }
                 }
-            });
-        }
-    });
+            }
+        }));
+    }
+    drop(tx);
+    for t in tasks {
+        let _ = t.await;
+    }
+    let _ = sending.await;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -197,5 +268,28 @@ mod tests {
         assert_eq!(change_time(&obj, now).to_rfc3339(), "2026-10-14T02:00:03+00:00");
         let stale = json!({"metadata":{"managedFields":[{"time":"2026-10-01T00:00:00Z"}]}});
         assert_eq!(change_time(&stale, now), now);
+    }
+
+    #[test]
+    fn nothing_sensitive_leaves_the_cluster() {
+        let mut cm = json!({"metadata":{"name":"a","managedFields":[{}]},"data":{"DB_PASSWORD":"hunter2"}});
+        sanitize("", "configmaps", &mut cm);
+        assert!(!cm.to_string().contains("hunter2"));
+        assert!(cm["metadata"].get("managedFields").is_none());
+        let mut user = json!({"metadata":{"name":"u-abc"},"username":"admin","password":"$2a$10$xyz","principalIds":["local://u-abc"]});
+        sanitize("management.cattle.io", "users", &mut user);
+        assert!(user.get("password").is_none());
+        assert_eq!(user["username"], "admin");
+        let mut ua = json!({"metadata":{"name":"u-abc"},"GroupPrincipals":{"openldap":{"items":[]}},"LastRefresh":"2026-10-17T01:00:00Z","NeedsRefresh":false});
+        sanitize("management.cattle.io", "userattributes", &mut ua);
+        assert!(ua.get("LastRefresh").is_none() && ua.get("GroupPrincipals").is_some());
+    }
+
+    #[test]
+    fn messages_round_trip() {
+        let m = ObjMsg::ListDone { group: "apps".into(), resource: "deployments".into(), listed: vec![("shop".into(), "web".into())] };
+        let s = serde_json::to_string(&m).unwrap();
+        assert!(s.starts_with(r#"{"type":"list_done""#), "{s}");
+        assert_eq!(serde_json::from_str::<ObjMsg>(&s).unwrap(), m);
     }
 }

@@ -228,7 +228,7 @@ pub async fn run_file() -> anyhow::Result<()> {
 
 /// How far each Rancher pod's log has been delivered: pod UID -> kubelet time of the last
 /// line the server acknowledged. A new pod has a new UID and is read from its start.
-type Positions = HashMap<String, DateTime<Utc>>;
+pub type Positions = HashMap<String, DateTime<Utc>>;
 
 fn load_positions(path: &Path) -> Positions {
     fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
@@ -247,10 +247,11 @@ pub fn split_timestamp(line: &str) -> Option<(DateTime<Utc>, &str)> {
     Some((DateTime::parse_from_rfc3339(ts).ok()?.with_timezone(&Utc), rest))
 }
 
-struct Line {
-    pod: String,
-    ts: DateTime<Utc>,
-    text: String,
+/// One JSON line for the server. `mark` is (stream, time) for collectors that resume by time:
+/// once the line is acknowledged, that stream's position moves up to `time`.
+pub struct Line {
+    pub mark: Option<(String, DateTime<Utc>)>,
+    pub text: String,
 }
 
 /// Follow one pod's sidecar output until the stream ends (container restart, pod gone).
@@ -275,22 +276,24 @@ async fn follow_pod(pods: Api<Pod>, name: String, uid: String, container: String
         if !text.trim_start().starts_with('{') {
             continue;
         }
-        tx.send(Line { pod: uid.clone(), ts, text: text.to_string() }).await?;
+        tx.send(Line { mark: Some((uid.clone(), ts)), text: text.to_string() }).await?;
     }
     Ok(())
 }
 
 /// Collect lines into batches (up to MAX_BATCH, or 2 s after the first line), send each until
-/// the server accepts it, then record the new positions. While a batch is being retried the
-/// channel fills up and the followers wait, so nothing is dropped.
-async fn send_batches(mut rx: tokio::sync::mpsc::Receiver<Line>, sender: Sender, positions: Arc<Mutex<Positions>>, state: PathBuf) {
+/// the server accepts it, then record the new positions if the collector keeps any. While a
+/// batch is being retried the channel fills up and the producers wait, so nothing is dropped.
+pub async fn batch_and_send(mut rx: tokio::sync::mpsc::Receiver<Line>, sender: Sender, positions: Option<(Arc<Mutex<Positions>>, PathBuf)>) {
     let mut buf: Vec<u8> = Vec::new();
     let mut marks: Positions = HashMap::new();
     let add = |l: Line, buf: &mut Vec<u8>, marks: &mut Positions| {
         buf.extend_from_slice(l.text.as_bytes());
         buf.push(b'\n');
-        let m = marks.entry(l.pod).or_insert(l.ts);
-        *m = (*m).max(l.ts);
+        if let Some((stream, ts)) = l.mark {
+            let m = marks.entry(stream).or_insert(ts);
+            *m = (*m).max(ts);
+        }
     };
     loop {
         let Some(first) = rx.recv().await else { return };
@@ -308,17 +311,20 @@ async fn send_batches(mut rx: tokio::sync::mpsc::Receiver<Line>, sender: Sender,
             tokio::time::sleep(Duration::from_secs(backoff)).await;
             backoff = (backoff * 2).min(60);
         }
-        let snapshot = {
-            let mut p = positions.lock().unwrap();
-            for (pod, ts) in marks.drain() {
-                let e = p.entry(pod).or_insert(ts);
-                *e = (*e).max(ts);
+        if let Some((positions, state)) = &positions {
+            let snapshot = {
+                let mut p = positions.lock().unwrap();
+                for (stream, ts) in marks.drain() {
+                    let e = p.entry(stream).or_insert(ts);
+                    *e = (*e).max(ts);
+                }
+                p.clone()
+            };
+            if let Err(e) = save_positions(state, &snapshot) {
+                warn!(error = %e, "could not save positions; a restart will resend some lines");
             }
-            p.clone()
-        };
-        if let Err(e) = save_positions(&state, &snapshot) {
-            warn!(error = %e, "could not save positions; a restart will resend some lines");
         }
+        marks.clear();
         buf.clear();
     }
 }
@@ -342,7 +348,7 @@ pub async fn run_rancher() -> anyhow::Result<()> {
     let positions = Arc::new(Mutex::new(load_positions(&state)));
     let pods: Api<Pod> = Api::namespaced(kube::Client::try_default().await?, &ns);
     let (tx, rx) = tokio::sync::mpsc::channel::<Line>(4096);
-    tokio::spawn(send_batches(rx, sender, positions.clone(), state));
+    tokio::spawn(batch_and_send(rx, sender, Some((positions.clone(), state))));
     let following: Arc<Mutex<HashSet<String>>> = Default::default();
     info!(namespace = %ns, selector = %selector, container = %container, "following the Rancher audit log");
     let mut warned = false;

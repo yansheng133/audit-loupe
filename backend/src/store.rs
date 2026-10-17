@@ -6,7 +6,9 @@ use crate::rules::Alert;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
+use crate::watch::ObjMsg;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
@@ -47,6 +49,10 @@ CREATE TABLE IF NOT EXISTS versions (
 CREATE INDEX IF NOT EXISTS versions_obj ON versions(cluster, api_group, resource, namespace, name, id);
 CREATE INDEX IF NOT EXISTS versions_unlinked ON versions(event_id, observed_ms);
 CREATE INDEX IF NOT EXISTS versions_event ON versions(event_id);
+CREATE TABLE IF NOT EXISTS listing (
+  cluster TEXT NOT NULL, api_group TEXT NOT NULL, resource TEXT NOT NULL, first INTEGER NOT NULL,
+  PRIMARY KEY (cluster, api_group, resource)
+);
 "#;
 
 /// Version kinds:
@@ -296,6 +302,58 @@ impl Store {
         )
         .optional()?
         .is_some())
+    }
+
+    /// Apply a batch from `collect-watch`. Returns how many versions were stored.
+    pub fn apply_objects(&self, cluster: &str, msgs: &[ObjMsg]) -> anyhow::Result<usize> {
+        let mut stored = 0;
+        for m in msgs {
+            match m {
+                ObjMsg::ListStart { group, resource } => {
+                    // The very first list of a type is the baseline; later lists are re-lists
+                    // after a gap, so anything new or different was changed while unseen.
+                    let first = !self.has_any(cluster, group, resource)?;
+                    self.conn.lock().unwrap().execute(
+                        "INSERT OR REPLACE INTO listing (cluster, api_group, resource, first) VALUES (?1,?2,?3,?4)",
+                        params![cluster, group, resource, first as i64],
+                    )?;
+                }
+                ObjMsg::Version { group, resource, kind, namespace, name, uid, seen, at, object } => {
+                    let seen = match seen.as_str() {
+                        "list" => {
+                            let first: Option<i64> = self.conn.lock().unwrap().query_row(
+                                "SELECT first FROM listing WHERE cluster=?1 AND api_group=?2 AND resource=?3",
+                                params![cluster, group, resource],
+                                |r| r.get(0),
+                            ).optional()?;
+                            if first == Some(1) { "baseline" } else { "resync" }
+                        }
+                        "deleted" => "deleted",
+                        _ => "modified",
+                    };
+                    let key = ObjKey { cluster: cluster.into(), api_group: group.clone(), resource: resource.clone(), namespace: namespace.clone(), name: name.clone() };
+                    if self.insert_version(&key, kind, uid, object, seen, *at)?.is_some() {
+                        stored += 1;
+                    }
+                }
+                ObjMsg::ListDone { group, resource, listed } => {
+                    let listed: HashSet<(String, String)> = listed.iter().cloned().collect();
+                    for (namespace, name, uid, kind, body) in self.alive(cluster, group, resource)? {
+                        if !listed.contains(&(namespace.clone(), name.clone())) {
+                            let key = ObjKey { cluster: cluster.into(), api_group: group.clone(), resource: resource.clone(), namespace, name };
+                            if self.insert_version(&key, &kind, &uid, &body, "deleted", Utc::now())?.is_some() {
+                                stored += 1;
+                            }
+                        }
+                    }
+                    self.conn.lock().unwrap().execute(
+                        "DELETE FROM listing WHERE cluster=?1 AND api_group=?2 AND resource=?3",
+                        params![cluster, group, resource],
+                    )?;
+                }
+            }
+        }
+        Ok(stored)
     }
 
     /// Objects whose latest stored version is not "deleted", as (namespace, name, uid, kind, body).
@@ -740,6 +798,31 @@ mod tests {
         let rows = all(&s);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].source, "k8s", "existing rows default to the Kubernetes source");
+    }
+
+    fn ver(seen: &str, name: &str, replicas: i64) -> ObjMsg {
+        ObjMsg::Version {
+            group: "apps".into(), resource: "deployments".into(), kind: "Deployment".into(),
+            namespace: "shop".into(), name: name.into(), uid: format!("uid-{name}"), seen: seen.into(),
+            at: Utc.with_ymd_and_hms(2026, 10, 14, 2, 0, 0).unwrap(), object: obj(replicas),
+        }
+    }
+
+    #[test]
+    fn pushed_lists_are_baselines_then_resyncs() {
+        let s = Store::open(":memory:").unwrap();
+        let start = ObjMsg::ListStart { group: "apps".into(), resource: "deployments".into() };
+        let done = |names: &[&str]| ObjMsg::ListDone { group: "apps".into(), resource: "deployments".into(), listed: names.iter().map(|n| ("shop".to_string(), n.to_string())).collect() };
+        s.apply_objects("c1", &[start.clone(), ver("list", "web", 1), ver("list", "api", 1), done(&["web", "api"])]).unwrap();
+        assert_eq!(s.history(&key()).unwrap()[0].change, "baseline");
+        // Collector restarts: web changed meanwhile, api was deleted meanwhile.
+        s.apply_objects("c1", &[start, ver("list", "web", 2), done(&["web"])]).unwrap();
+        assert_eq!(s.history(&key()).unwrap()[0].change, "modified_unseen");
+        let api = ObjKey { name: "api".into(), ..key() };
+        assert_eq!(s.history(&api).unwrap()[0].change, "deleted");
+        // Live changes after that.
+        assert_eq!(s.apply_objects("c1", &[ver("modified", "web", 3)]).unwrap(), 1);
+        assert_eq!(s.history(&key()).unwrap()[0].change, "modified");
     }
 
     #[test]

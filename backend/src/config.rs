@@ -8,9 +8,6 @@ pub struct Config {
     pub ingest_listen: String,
     /// Name shown in the UI for the cluster this instance runs in.
     pub cluster: String,
-    pub watch_enabled: bool,
-    /// Entries like "apps/v1/deployments" or "v1/configmaps".
-    pub watch_resources: Vec<String>,
     pub tz: chrono_tz::Tz,
     pub work_start_hour: u32,
     pub work_end_hour: u32,
@@ -24,13 +21,6 @@ pub struct Config {
     /// those can name any downstream cluster as their target.
     pub rancher_cluster: String,
 }
-
-pub const DEFAULT_WATCH: &str = "apps/v1/deployments,apps/v1/statefulsets,apps/v1/daemonsets,\
-batch/v1/cronjobs,v1/services,v1/configmaps,v1/namespaces,\
-networking.k8s.io/v1/ingresses,networking.k8s.io/v1/networkpolicies,\
-rbac.authorization.k8s.io/v1/roles,rbac.authorization.k8s.io/v1/rolebindings,\
-rbac.authorization.k8s.io/v1/clusterroles,rbac.authorization.k8s.io/v1/clusterrolebindings,\
-autoscaling/v2/horizontalpodautoscalers,gateway.networking.k8s.io/v1/httproutes";
 
 fn var(name: &str, default: &str) -> String {
     env::var(name).ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| default.to_string())
@@ -119,12 +109,6 @@ impl Config {
             listen: var("AL_LISTEN", "0.0.0.0:8080"),
             ingest_listen: var("AL_INGEST_LISTEN", "0.0.0.0:8081"),
             cluster: var("AL_CLUSTER", "local"),
-            watch_enabled: var("AL_WATCH", "true") == "true",
-            watch_resources: var("AL_WATCH_RESOURCES", DEFAULT_WATCH)
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
             tz,
             work_start_hour: start,
             work_end_hour: end,
@@ -143,8 +127,6 @@ impl Config {
             listen: "127.0.0.1:0".into(),
             ingest_listen: "127.0.0.1:0".into(),
             cluster: "test".into(),
-            watch_enabled: false,
-            watch_resources: vec![],
             tz: chrono_tz::Asia::Taipei,
             work_start_hour: 9,
             work_end_hour: 18,
