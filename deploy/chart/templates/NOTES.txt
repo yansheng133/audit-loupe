@@ -1,0 +1,12 @@
+audit-loupe is running in {{ .Release.Namespace }}.
+
+Next: point kube-apiserver's audit webhook at http://{{ .Values.service.clusterIP }}:{{ .Values.service.ingestPort }}/ingest/k8s-audit
+using the token in Secret {{ .Release.Namespace }}/audit-loupe-ingest. See deploy/rke2/README.md in the source repository.
+
+The Rancher UI extension reaches this service through the Rancher service proxy. Users need
+"get" on services/proxy in {{ .Release.Namespace }} to see the pages. That grants a read view of
+changes across the whole cluster, so give it only to people who may audit the cluster.
+{{- if not .Values.networkPolicy.allowFromCIDRs }}
+
+WARNING: networkPolicy.allowFromCIDRs is empty, so any pod in the cluster can call the read API.
+{{- end }}

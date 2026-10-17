@@ -1,0 +1,782 @@
+<title>audit-trail 變更地圖</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Lato:wght@400;700;900&family=Roboto+Mono:wght@400;500&family=Noto+Sans+TC:wght@400;500;700&display=swap">
+<style>
+/* Layout: one-screen Rancher workspace. Filter bar on top; three columns that each scroll on their own (what needs attention | grouped topology | evidence for the selection); timeline pinned at the bottom. Nothing you click updates something off-screen. */
+:root {
+  --bg: #f3f4f8;
+  --surface: #ffffff;
+  --sunken: #eceef4;
+  --border: #d9dce6;
+  --fg: #16171d;
+  --muted: #646876;
+  --primary: #2f63d6;
+  --primary-soft: #e3ebfb;
+  --added: #23885a;
+  --modified: #b97a0c;
+  --deleted: #cf3e3e;
+  --alert: #cf3e3e;
+  --alert-soft: #fbe9e9;
+  --none: #8a8e9c;
+  --edge: #b9beca;
+  --font-ui: "Lato", "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", system-ui, sans-serif;
+  --font-mono: "Roboto Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --a1: #2f63d6; --a2: #0f8b8d; --a3: #8a4fd1; --a4: #c2410c; --a5: #4d7c0f; --a6: #3f4553; --a7: #9aa0ad;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #17181d; --surface: #202128; --sunken: #1a1b21; --border: #353844; --fg: #e9eaf0; --muted: #a0a4b2;
+    --primary: #7aa2ff; --primary-soft: #263255; --added: #4cc38a; --modified: #e5a93a; --deleted: #f07171; --alert: #f07171; --alert-soft: #3a2326;
+    --none: #8e93a3; --edge: #4f5463;
+    --a1: #7aa2ff; --a2: #3cc4c6; --a3: #b58cf2; --a4: #f08a52; --a5: #9acd4c; --a6: #c9ccd6; --a7: #7d8291;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #17181d; --surface: #202128; --sunken: #1a1b21; --border: #353844; --fg: #e9eaf0; --muted: #a0a4b2;
+  --primary: #7aa2ff; --primary-soft: #263255; --added: #4cc38a; --modified: #e5a93a; --deleted: #f07171; --alert: #f07171; --alert-soft: #3a2326;
+  --none: #8e93a3; --edge: #4f5463;
+  --a1: #7aa2ff; --a2: #3cc4c6; --a3: #b58cf2; --a4: #f08a52; --a5: #9acd4c; --a6: #c9ccd6; --a7: #7d8291;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  background: var(--bg); color: var(--fg); font-family: var(--font-ui); font-size: 14px; line-height: 1.5;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 10px; display: flex; flex-direction: column; overflow: hidden;
+}
+.page { flex: 1 1 auto; min-height: 0; max-width: 1600px; width: 100%; margin: 0 auto; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; gap: 8px; }
+h1, h2, h3 { margin: 0; text-wrap: balance; }
+h1 { font-size: 17px; font-weight: 700; white-space: nowrap; }
+h2 { font-size: 14px; font-weight: 700; }
+h3 { font-size: 13px; font-weight: 700; }
+.muted { color: var(--muted); }
+.num { font-variant-numeric: tabular-nums; }
+button { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+/* top bar */
+.topbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 7px 10px; }
+.crumb { color: var(--muted); font-size: 12.5px; white-space: nowrap; }
+.mockflag { font-size: 11.5px; color: var(--muted); border: 1px dashed var(--border); border-radius: 4px; padding: 1px 6px; white-space: nowrap; }
+.filters { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-left: auto; }
+.filters label.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+select { font: inherit; font-size: 13px; color: var(--fg); background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 4px 6px; max-width: 100%; }
+select.active { border-color: var(--primary); color: var(--primary); background: var(--primary-soft); }
+.check { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; white-space: nowrap; }
+.btn { background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 3px 9px; cursor: pointer; font-size: 12.5px; white-space: nowrap; }
+.btn:hover { border-color: var(--primary); }
+.btn.on { background: var(--primary-soft); border-color: var(--primary); color: var(--primary); }
+
+/* three columns */
+.work { display: grid; grid-template-columns: 290px minmax(0, 1fr) 390px; gap: 8px; min-height: 0; }
+.col { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.col-head { flex: none; display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 10px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+.col-body { flex: 1 1 auto; min-height: 0; overflow: auto; }
+
+/* left column */
+.side { padding: 10px; display: flex; flex-direction: column; gap: 12px; }
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.stat { background: var(--sunken); border-radius: 4px; padding: 6px 8px; }
+.stat .v { font-size: 19px; font-weight: 900; line-height: 1.2; }
+.stat .k { font-size: 11px; color: var(--muted); }
+.sub { font-size: 11.5px; color: var(--muted); font-weight: 700; letter-spacing: .03em; display: flex; justify-content: space-between; gap: 8px; }
+.att-list { display: flex; flex-direction: column; gap: 6px; }
+.att { display: grid; grid-template-columns: 4px 1fr; background: var(--surface); border: 1px solid var(--border); border-radius: 5px; overflow: hidden; text-align: left; cursor: pointer; padding: 0; width: 100%; }
+.att:hover { border-color: var(--alert); }
+.att.sel { border-color: var(--primary); box-shadow: 0 0 0 1px var(--primary); }
+.att .bar { background: var(--alert); }
+.att.medium .bar { background: var(--modified); }
+.att .body { padding: 6px 9px; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.att .top { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; font-size: 11.5px; color: var(--muted); }
+.att .headline { font-size: 13px; font-weight: 700; line-height: 1.35; }
+.att .why { font-size: 12px; color: var(--muted); }
+.quiet { font-size: 12.5px; color: var(--muted); border: 1px dashed var(--border); border-radius: 5px; padding: 8px 10px; }
+.people { display: flex; flex-direction: column; gap: 2px; }
+.person { display: grid; grid-template-columns: 92px 1fr auto; align-items: center; gap: 8px; font-size: 12.5px; background: none; border: 1px solid transparent; border-radius: 4px; padding: 3px 4px; cursor: pointer; text-align: left; width: 100%; }
+.person:hover { background: var(--sunken); }
+.person.on { border-color: var(--primary); background: var(--primary-soft); }
+.person .bar { height: 7px; border-radius: 4px; background: var(--sunken); overflow: hidden; }
+.person .bar i { display: block; height: 100%; border-radius: 4px; }
+.who { display: inline-flex; align-items: center; gap: 5px; font-weight: 700; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.who i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }
+.hint { font-size: 11.5px; color: var(--muted); margin: 0; }
+
+/* center: grouped topology */
+.legend { display: flex; flex-wrap: wrap; gap: 2px 10px; font-size: 11.5px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 4px; }
+.lg { width: 4px; height: 11px; border-radius: 2px; display: inline-block; }
+.map { position: relative; padding: 10px; display: flex; flex-direction: column; gap: 10px; }
+.links { position: absolute; inset: 0; pointer-events: none; overflow: visible; }
+.links path { fill: none; stroke: var(--primary); stroke-width: 1.6; }
+.links text { font-size: 10.5px; fill: var(--primary); font-family: var(--font-ui); }
+.links .lbl-bg { fill: var(--surface); }
+.cluster { border: 1px solid var(--border); border-radius: 6px; background: var(--sunken); }
+.cluster-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; padding: 6px 10px; }
+.cluster-head .type { font-size: 10.5px; color: var(--muted); border: 1px solid var(--border); border-radius: 3px; padding: 0 5px; background: var(--surface); }
+.cov { font-size: 11.5px; color: var(--muted); display: inline-flex; align-items: center; gap: 5px; }
+.cov i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+.projects { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 8px 8px; align-items: flex-start; }
+.project { flex: 1 1 230px; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.project-name { font-size: 11px; color: var(--muted); letter-spacing: .04em; padding-left: 2px; }
+.nsbox { background: var(--surface); border: 1px solid var(--border); border-radius: 5px; padding: 5px; display: flex; flex-direction: column; gap: 5px; }
+.nsname { font-size: 11.5px; font-family: var(--font-mono); color: var(--muted); padding: 0 2px; }
+.chips { display: flex; flex-direction: column; gap: 5px; }
+.chip { position: relative; display: grid; grid-template-columns: 42px minmax(0, 1fr) auto; align-items: center; gap: 1px 8px; text-align: left; background: var(--surface); border: 1px solid var(--border); border-left: 4px solid var(--none); border-radius: 4px; padding: 4px 7px 4px 5px; cursor: pointer; width: 100%; }
+.chip:hover { border-color: var(--primary); }
+.chip.added { border-left-color: var(--added); }
+.chip.modified { border-left-color: var(--modified); }
+.chip.deleted { border-left-color: var(--deleted); border-left-style: dashed; }
+.chip.deleted .cname { text-decoration: line-through; text-decoration-color: var(--deleted); }
+.chip.sel { border-color: var(--primary); box-shadow: 0 0 0 1px var(--primary); }
+.chip.related { border-color: var(--primary); }
+.map.focus .chip:not(.sel):not(.related) { opacity: .45; }
+.kindtag { font-size: 9.5px; font-weight: 700; letter-spacing: .02em; text-align: center; border-radius: 3px; padding: 1px 0; background: var(--sunken); color: var(--muted); }
+.cname { font-size: 13px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cmeta { grid-column: 2; font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 6px; min-width: 0; white-space: nowrap; overflow: hidden; }
+.who-dots { display: inline-flex; gap: 2px; flex: none; }
+.who-dots i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+.flag { grid-row: 1 / span 2; grid-column: 3; font-size: 10.5px; font-weight: 700; border-radius: 999px; padding: 0 6px; white-space: nowrap; }
+.flag.high { background: var(--alert); color: var(--surface); }
+.flag.medium { border: 1px solid var(--alert); color: var(--alert); }
+.flag.low { border: 1px solid var(--border); color: var(--muted); }
+.empty { padding: 28px 16px; text-align: center; color: var(--muted); display: flex; flex-direction: column; gap: 4px; align-items: center; }
+.empty strong { color: var(--fg); }
+
+/* right: evidence */
+.detail { padding: 10px; display: flex; flex-direction: column; gap: 10px; }
+.objhead { display: flex; flex-direction: column; gap: 1px; }
+.objhead .path { font-family: var(--font-mono); font-size: 11.5px; color: var(--muted); overflow-wrap: anywhere; }
+.steps { display: flex; flex-direction: column; }
+.step { display: grid; grid-template-columns: 42px 14px minmax(0, 1fr); gap: 0 6px; text-align: left; background: none; border: 0; padding: 0; cursor: pointer; width: 100%; }
+.step .t { font-family: var(--font-mono); font-size: 11.5px; color: var(--muted); padding-top: 6px; }
+.step .rail { position: relative; }
+.step .rail::before { content: ""; position: absolute; left: 6px; top: 0; bottom: 0; width: 2px; background: var(--border); }
+.step:first-child .rail::before { top: 12px; }
+.step:last-child .rail::before { bottom: calc(100% - 14px); }
+.step .rail i { position: absolute; left: 1px; top: 7px; width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--surface); }
+.step .card { padding: 4px 8px 6px; border-radius: 4px; margin-bottom: 3px; min-width: 0; }
+.step:hover .card { background: var(--sunken); }
+.step.sel .card { background: var(--primary-soft); }
+.step.out { opacity: .5; }
+.step .line { font-size: 12.5px; }
+.pills { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 2px; }
+.pill { font-size: 10.5px; border: 1px solid var(--border); border-radius: 999px; padding: 0 6px; color: var(--muted); white-space: nowrap; }
+.pill.high { background: var(--alert); border-color: var(--alert); color: var(--surface); }
+.pill.medium { border-color: var(--alert); color: var(--alert); }
+.pill.added { border-color: var(--added); color: var(--added); }
+.pill.modified { border-color: var(--modified); color: var(--modified); }
+.pill.deleted { border-color: var(--deleted); color: var(--deleted); }
+.evidence { border: 1px solid var(--border); border-radius: 5px; overflow: hidden; flex: none; }
+.evidence h3 { padding: 6px 10px; border-bottom: 1px solid var(--border); background: var(--sunken); }
+.chain { display: flex; flex-wrap: wrap; align-items: stretch; gap: 4px; padding: 8px 10px; }
+.hop { display: flex; flex-direction: column; gap: 1px; background: var(--sunken); border-radius: 4px; padding: 3px 7px; min-width: 0; }
+.hop .k { font-size: 10px; color: var(--muted); }
+.hop .v { font-size: 12px; font-weight: 700; overflow-wrap: anywhere; }
+.hop.warn { background: var(--alert-soft); }
+.hop.warn .v { color: var(--alert); }
+.arrow { align-self: center; color: var(--muted); font-size: 12px; }
+.chain-note { font-size: 11.5px; color: var(--muted); padding: 0 10px 8px; margin: 0; }
+.diff { font-family: var(--font-mono); font-size: 11.5px; padding: 6px 0; overflow-x: auto; }
+.diff div { padding: 0 10px; white-space: pre; }
+.diff .add { color: var(--added); background: color-mix(in srgb, var(--added) 9%, transparent); }
+.diff .del { color: var(--deleted); background: color-mix(in srgb, var(--deleted) 9%, transparent); }
+.diff .ctx { color: var(--muted); }
+.impact { font-size: 12px; padding: 6px 10px; border-top: 1px solid var(--border); display: flex; flex-wrap: wrap; gap: 3px 8px; align-items: center; }
+.linkbtn { background: none; border: 0; padding: 0; color: var(--primary); cursor: pointer; font-size: 12px; text-decoration: underline; text-underline-offset: 2px; }
+
+/* bottom: timeline */
+.timeline { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; }
+.tl-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; padding: 5px 10px; border-bottom: 1px solid var(--border); }
+.tl-head .range { font-size: 12.5px; font-weight: 700; }
+.tl-head .keys { font-size: 11.5px; color: var(--muted); }
+.presets { display: flex; flex-wrap: wrap; gap: 5px; margin-left: auto; }
+.tl-wrap { padding: 2px 2px 4px; overflow-x: auto; position: relative; }
+#tl { display: block; touch-action: none; user-select: none; -webkit-user-select: none; }
+#tl text { font-family: var(--font-ui); fill: var(--muted); font-size: 10.5px; }
+#tl .lane-label { fill: var(--fg); font-size: 11.5px; }
+#tl .grid { stroke: var(--border); stroke-width: 1; }
+#tl .offhours { fill: var(--sunken); }
+#tl .hist { fill: var(--edge); }
+#tl .hist.alert { fill: var(--alert); }
+#tl .brush { fill: var(--primary); fill-opacity: .08; stroke: var(--primary); stroke-width: 1; }
+#tl .handle { fill: var(--primary); }
+#tl .hl { fill: var(--surface); font-weight: 700; font-size: 10px; }
+#tl .dot { cursor: pointer; }
+.tip { position: absolute; pointer-events: none; background: var(--fg); color: var(--bg); font-size: 12px; padding: 4px 8px; border-radius: 4px; white-space: nowrap; z-index: 5; }
+
+/* narrow or short screens: fall back to a normal scrolling page */
+@media (max-width: 1180px), (max-height: 640px) {
+  html, body { height: auto; }
+  body { overflow: auto; }
+  .page { display: flex; flex-direction: column; }
+  .work { grid-template-columns: minmax(0, 1fr); }
+  .col-body { overflow: visible; }
+  .filters { margin-left: 0; }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="page">
+  <div class="topbar" role="group" aria-label="篩選">
+    <span class="crumb">Cluster Explorer ／ 稽核</span>
+    <h1>變更地圖</h1>
+    <span class="mockflag">設計模型・示意資料</span>
+    <div class="filters">
+      <label class="sr" for="f-cluster">叢集</label><select id="f-cluster"></select>
+      <label class="sr" for="f-project">專案</label><select id="f-project"></select>
+      <label class="sr" for="f-ns">Namespace</label><select id="f-ns"></select>
+      <label class="sr" for="f-actor">人物視角</label><select id="f-actor"></select>
+      <label class="check" for="f-sys"><input type="checkbox" id="f-sys"> 含系統元件</label>
+      <button class="btn" id="reset" type="button">清除篩選</button>
+    </div>
+  </div>
+
+  <div class="work">
+    <section class="col" aria-labelledby="side-title">
+      <div class="col-head"><h2 id="side-title">這段時間</h2><span class="muted num" id="side-range"></span></div>
+      <div class="col-body"><div class="side" id="side"></div></div>
+    </section>
+
+    <section class="col" aria-labelledby="map-title">
+      <div class="col-head">
+        <h2 id="map-title">被動過的物件</h2>
+        <div class="legend">
+          <span><i class="lg" style="background:var(--added)"></i>新增</span>
+          <span><i class="lg" style="background:var(--modified)"></i>修改</span>
+          <span><i class="lg" style="background:var(--deleted)"></i>刪除</span>
+          <span><i class="lg" style="background:var(--none)"></i>只讀取／進入</span>
+          <span>點物件連出關係</span>
+        </div>
+      </div>
+      <div class="col-body" id="map-scroll"><div class="map" id="map"><svg class="links" id="links" aria-hidden="true"></svg></div></div>
+    </section>
+
+    <section class="col" aria-live="polite" aria-labelledby="detail-head">
+      <div class="col-head"><h2 id="detail-head">證據</h2><span class="muted" id="detail-hint">誰、怎麼做的、改了什麼</span></div>
+      <div class="col-body" id="detail-scroll"><div class="detail" id="detail"></div></div>
+    </section>
+  </div>
+
+  <section class="timeline" aria-label="時間軸">
+    <div class="tl-head">
+      <span class="range num" id="range-label"></span>
+      <span class="keys">拖曳選範圍，A／B 可單獨拖動・●變更 ◆讀取或進入 ○刪除・紅圈為中高風險・灰底為非上班時間・2026-10-15（四）台北時間</span>
+      <div class="presets">
+        <button class="btn" data-preset="0,1440" type="button">全天</button>
+        <button class="btn" data-preset="540,1080" type="button">上班 09–18</button>
+        <button class="btn" data-preset="1080,1440" type="button">下班後 18–24</button>
+      </div>
+    </div>
+    <div class="tl-wrap" id="tl-wrap"><svg id="tl" aria-label="操作時間軸，拖曳可選取範圍"></svg><div class="tip" id="tip" hidden></div></div>
+  </section>
+</div>
+
+<script>
+// ---------- demo data (fictional) ----------
+const ACTORS = {
+  alice: { label: "alice", role: "平台工程", color: "var(--a1)", idp: "uid=alice", uid: "u-7x2lq" },
+  bob:   { label: "bob", role: "電商開發", color: "var(--a2)", idp: "uid=bob", uid: "u-k9m3p" },
+  carol: { label: "carol", role: "資安", color: "var(--a3)", idp: "uid=carol", uid: "u-c4r0l" },
+  ops:   { label: "ops-hsu", role: "維運", color: "var(--a4)", idp: "uid=ops-hsu", uid: "u-0ps01" },
+  david: { label: "david", role: "電商開發", color: "var(--a5)", idp: "uid=david", uid: "u-d4v1d" },
+  admin: { label: "system:admin", role: "節點上的管理者憑證", color: "var(--a6)" },
+  ctrl:  { label: "系統元件", role: "controller、operator", color: "var(--a7)", system: true },
+  unknown: { label: "無法歸屬", role: "收集中斷期間的變更", color: "var(--a7)" },
+};
+const VIA = { ui: "Rancher 介面", kubectl: "Rancher kubectl", direct: "繞過 Rancher", controller: "系統元件", unknown: "收集中斷" };
+const RULES = {
+  namespace_deleted: { label: "刪除 namespace", sev: "high" },
+  rbac_changed: { label: "權限變更", sev: "medium" },
+  pod_exec: { label: "進入容器", sev: "medium" },
+  bypassed_rancher: { label: "繞過 Rancher", sev: "medium" },
+  forbidden: { label: "被拒絕", sev: "low" },
+  off_hours: { label: "非上班時間", sev: "low" },
+  unattributed: { label: "無法歸屬", sev: "low" },
+};
+const SEV_LABEL = { high: "高", medium: "中", low: "低" };
+const SEV_RANK = { high: 0, medium: 1, low: 2 };
+const CLUSTERS = {
+  local: { type: "Rancher", coverage: "經 Rancher 的操作", dot: "var(--modified)" },
+  "prod-rke2": { type: "RKE2", coverage: "完整：apiserver audit ＋ 物件版本", dot: "var(--added)" },
+};
+const KIND_TAG = { Deployment: "DEPLOY", ConfigMap: "CM", Secret: "SECRET", Pod: "POD", NetworkPolicy: "NETPOL", RoleBinding: "RB", Ingress: "ING", ReplicaSet: "RS", CronJob: "CRON", PrometheusRule: "RULE", Namespace: "NS", ClusterRoleBinding: "CRB", "專案成員": "成員", "全域角色": "角色" };
+const OBJ = {
+  "prtb-shop-bob":   { cluster: "local", project: "Rancher 設定", ns: "Rancher 全域", kind: "專案成員", name: "電商 ← bob" },
+  "grb-david":       { cluster: "local", project: "Rancher 設定", ns: "Rancher 全域", kind: "全域角色", name: "david" },
+  "dep-web":         { cluster: "prod-rke2", project: "電商", ns: "shop", kind: "Deployment", name: "web" },
+  "dep-web-canary":  { cluster: "prod-rke2", project: "電商", ns: "shop", kind: "Deployment", name: "web-canary" },
+  "cm-web-config":   { cluster: "prod-rke2", project: "電商", ns: "shop", kind: "ConfigMap", name: "web-config" },
+  "cm-web-flags":    { cluster: "prod-rke2", project: "電商", ns: "shop", kind: "ConfigMap", name: "web-flags" },
+  "np-deny-egress":  { cluster: "prod-rke2", project: "電商", ns: "shop", kind: "NetworkPolicy", name: "deny-egress" },
+  "sec-payment":     { cluster: "prod-rke2", project: "電商", ns: "shop", kind: "Secret", name: "payment-key" },
+  "pod-web":         { cluster: "prod-rke2", project: "電商", ns: "shop", kind: "Pod", name: "web-6c9f7d-2kq8v" },
+  "rb-dev-edit":     { cluster: "prod-rke2", project: "電商", ns: "shop", kind: "RoleBinding", name: "dev-edit" },
+  "ing-web":         { cluster: "prod-rke2", project: "電商", ns: "shop", kind: "Ingress", name: "web" },
+  "rs-web":          { cluster: "prod-rke2", project: "電商", ns: "shop", kind: "ReplicaSet", name: "web-6c9f7d" },
+  "cj-report":       { cluster: "prod-rke2", project: "電商", ns: "shop-batch", kind: "CronJob", name: "nightly-report" },
+  "pr-node":         { cluster: "prod-rke2", project: "共用平台", ns: "cattle-monitoring-system", kind: "PrometheusRule", name: "node-alerts" },
+  "ns-legacy":       { cluster: "prod-rke2", project: "叢集層級", ns: "不屬於 namespace", kind: "Namespace", name: "legacy-batch" },
+  "crb-tmp":         { cluster: "prod-rke2", project: "叢集層級", ns: "不屬於 namespace", kind: "ClusterRoleBinding", name: "tmp-admin" },
+};
+// relations between objects: [from, to, label]
+const REL = [
+  ["cm-web-config", "dep-web", "掛載於"],
+  ["cm-web-flags", "dep-web", "掛載於"],
+  ["sec-payment", "dep-web", "掛載於"],
+  ["np-deny-egress", "dep-web", "套用到它的 Pod"],
+  ["ing-web", "dep-web", "導流（經 Service web）"],
+  ["dep-web", "rs-web", "擁有"],
+  ["rs-web", "pod-web", "擁有"],
+  ["dep-web", "pod-web", "擁有（經 ReplicaSet）", "skipIfVisible:rs-web"],
+];
+const hm = s => { const [h, m] = s.split(":").map(Number); return h * 60 + m; };
+const E = (id, t, actor, via, verb, obj, change, alerts, diff, note) => ({ id, t: hm(t), hhmm: t, actor, via, verb, obj, change, alerts: alerts || [], diff: diff || [], note: note || "" });
+const EVENTS = [
+  E("e01", "09:12", "alice", "ui", "把 bob 加入專案「電商」", "prtb-shop-bob", "added", ["rbac_changed"],
+    [["+", "kind: ProjectRoleTemplateBinding"], ["+", "projectName: c-m-7h2kx:p-shop"], ["+", "roleTemplateName: project-member"], ["+", "userPrincipalName: openldap_user://uid=bob,ou=people"]]),
+  E("e02", "09:40", "bob", "kubectl", "更新映像檔", "dep-web", "modified", [],
+    [[" ", "spec.template.spec.containers[web]:"], ["-", "  image: registry.example.com/shop/web:1.4.2"], ["+", "  image: registry.example.com/shop/web:1.5.0"]]),
+  E("e03", "09:40", "ctrl", "controller", "建立新版 ReplicaSet", "rs-web", "modified", [], [["-", "replicas: 0"], ["+", "replicas: 3"]], "deployment-controller 隨 web 的新版本自動調整。"),
+  E("e04", "09:41", "ctrl", "controller", "更新就緒數", "rs-web", "modified", [], [["-", "readyReplicas: 1"], ["+", "readyReplicas: 3"]]),
+  E("e05", "10:05", "bob", "ui", "副本數 3 → 5", "dep-web", "modified", [], [["-", "spec.replicas: 3"], ["+", "spec.replicas: 5"]]),
+  E("e06", "10:30", "bob", "ui", "新增", "cm-web-flags", "added", [], [["+", "data:"], ["+", "  NEW_CHECKOUT: (值已遮蔽 sha256 1c7e…)"], ["+", "  SEARCH_V2: (值已遮蔽 sha256 a90b…)"]]),
+  E("e07", "11:15", "carol", "ui", "新增", "np-deny-egress", "added", [],
+    [["+", "spec.podSelector: {app: web}"], ["+", "spec.policyTypes: [Egress]"], ["+", "spec.egress[0].to: namespaceSelector shop"]]),
+  E("e08", "11:20", "bob", "ui", "讀取，被拒絕", "sec-payment", null, ["forbidden"], [], "回應 403。Secret 不保存版本，只記錄誰在何時存取。"),
+  E("e09", "13:02", "ops", "ui", "進入容器（exec）", "pod-web", null, ["pod_exec"], [], "從 Rancher 介面開啟 shell。在容器裡下了哪些指令，audit log 不會記錄。"),
+  E("e10", "13:30", "bob", "kubectl", "修改 LOG_LEVEL", "cm-web-config", "modified", [],
+    [[" ", "data:"], ["-", "  LOG_LEVEL: (值已遮蔽 sha256 3f2a…)"], ["+", "  LOG_LEVEL: (值已遮蔽 sha256 9c1e…)"], [" ", "  PAYMENT_TIMEOUT: 未變"]], "ConfigMap 的值預設遮蔽，只顯示哪個鍵變了。"),
+  E("e11", "14:10", "alice", "ui", "排程 02:00 → 01:30", "cj-report", "modified", [], [["-", "spec.schedule: \"0 2 * * *\""], ["+", "spec.schedule: \"30 1 * * *\""]]),
+  E("e12", "15:00", "carol", "ui", "給 shop-dev 群組 edit 權限", "rb-dev-edit", "added", ["rbac_changed"],
+    [["+", "roleRef: {kind: ClusterRole, name: edit}"], ["+", "subjects: [{kind: Group, name: shop-dev}]"]]),
+  E("e13", "15:45", "david", "kubectl", "更換對外網址", "ing-web", "modified", [], [[" ", "spec.rules[0]:"], ["-", "  host: shop.example.com"], ["+", "  host: shop-new.example.com"]]),
+  E("e14", "16:20", "bob", "ui", "刪除", "dep-web-canary", "deleted", [], [["-", "kind: Deployment"], ["-", "metadata.name: web-canary"], ["-", "spec.replicas: 1"], ["-", "image: registry.example.com/shop/web:1.5.0-rc2"]]),
+  E("e15", "16:52", "alice", "ui", "全域角色 user → user-base", "grb-david", "modified", ["rbac_changed"], [["-", "globalRoleName: user"], ["+", "globalRoleName: user-base"]]),
+  E("e16", "17:05", "alice", "ui", "告警等待 5 → 10 分鐘", "pr-node", "modified", [], [[" ", "rules[NodeDiskPressure]:"], ["-", "  for: 5m"], ["+", "  for: 10m"]]),
+  E("e17", "21:40", "admin", "direct", "刪除", "ns-legacy", "deleted", ["namespace_deleted", "bypassed_rancher", "off_hours"],
+    [["-", "kind: Namespace"], ["-", "metadata.name: legacy-batch"], ["-", "（底下 4 個工作負載一併刪除）"]], "用的是節點上的管理者憑證，沒有經過 Rancher，所以查不到是哪一位使用者。"),
+  E("e18", "21:42", "admin", "direct", "授予 tmp-ops cluster-admin", "crb-tmp", "added", ["rbac_changed", "bypassed_rancher", "off_hours"],
+    [["+", "roleRef: {kind: ClusterRole, name: cluster-admin}"], ["+", "subjects: [{kind: User, name: tmp-ops}]"]], "與 21:40 刪除 namespace 是同一張憑證、相隔 2 分鐘。"),
+  E("e19", "22:10", "unknown", "unknown", "修改 PAYMENT_TIMEOUT", "cm-web-config", "modified", ["unattributed"],
+    [[" ", "data:"], ["-", "  PAYMENT_TIMEOUT: (值已遮蔽 sha256 51d0…)"], ["+", "  PAYMENT_TIMEOUT: (值已遮蔽 sha256 e83f…)"]], "收集元件 21:55–22:20 中斷，重新連上後比對版本才發現這筆變更。"),
+];
+const PROJECT_ORDER = ["Rancher 設定", "電商", "共用平台", "叢集層級"];
+
+// ---------- state ----------
+const S = { a: 0, b: 1440, cluster: "", project: "", ns: "", actor: "", sys: false, sel: null, selEvent: null };
+
+// ---------- helpers ----------
+const $ = id => document.getElementById(id);
+const NS = "http://www.w3.org/2000/svg";
+const svgEl = (tag, attrs, parent) => { const e = document.createElementNS(NS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); if (parent) parent.appendChild(e); return e; };
+const h = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+const fmt = m => m >= 1440 ? "24:00" : `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+const sevOf = ev => ev.alerts.map(r => RULES[r].sev).sort((x, y) => SEV_RANK[x] - SEV_RANK[y])[0] || null;
+const worst = list => list.filter(Boolean).sort((x, y) => SEV_RANK[x] - SEV_RANK[y])[0] || null;
+const CHG = { added: "新增", modified: "修改", deleted: "刪除" };
+const who = key => { const s = h("span", "who"); const i = h("i"); i.style.background = ACTORS[key].color; s.append(i, document.createTextNode(ACTORS[key].label)); return s; };
+
+function matchesScope(ev) {
+  const o = OBJ[ev.obj];
+  if (!S.sys && ACTORS[ev.actor].system) return false;
+  if (S.cluster && o.cluster !== S.cluster) return false;
+  if (S.project && o.project !== S.project) return false;
+  if (S.ns && o.ns !== S.ns) return false;
+  return true;
+}
+const inRange = ev => ev.t >= S.a && ev.t <= S.b;
+const visibleEvents = () => EVENTS.filter(ev => matchesScope(ev) && inRange(ev) && (!S.actor || ev.actor === S.actor));
+function netState(evs) {
+  const ch = evs.filter(e => e.change).sort((x, y) => x.t - y.t);
+  if (!ch.length) return "none";
+  const last = ch[ch.length - 1].change, first = ch[0].change;
+  if (last === "deleted") return first === "added" ? "none" : "deleted";
+  return first === "added" ? "added" : "modified";
+}
+
+// ---------- filters ----------
+function fillSelect(sel, values, first) {
+  const cur = sel.value; sel.textContent = "";
+  sel.append(new Option(first, ""));
+  values.forEach(v => sel.append(Array.isArray(v) ? new Option(v[1], v[0]) : new Option(v, v)));
+  sel.value = values.some(v => (Array.isArray(v) ? v[0] : v) === cur) ? cur : "";
+}
+function refreshFilters() {
+  fillSelect($("f-cluster"), Object.keys(CLUSTERS), "全部叢集"); S.cluster = $("f-cluster").value;
+  const objs = Object.values(OBJ).filter(o => !S.cluster || o.cluster === S.cluster);
+  fillSelect($("f-project"), PROJECT_ORDER.filter(p => objs.some(o => o.project === p)), "全部專案"); S.project = $("f-project").value;
+  fillSelect($("f-ns"), [...new Set(objs.filter(o => !S.project || o.project === S.project).map(o => o.ns))], "全部 namespace"); S.ns = $("f-ns").value;
+  fillSelect($("f-actor"), Object.keys(ACTORS).filter(k => !ACTORS[k].system || S.sys).map(k => [k, `${ACTORS[k].label}（${ACTORS[k].role}）`]), "所有人"); S.actor = $("f-actor").value;
+}
+
+
+// ---------- left column: summary, what needs attention, who ----------
+const isRisky = e => ["high", "medium"].includes(sevOf(e));
+function headline(ev) {
+  const o = OBJ[ev.obj];
+  const plain = /^(刪除|新增|修改)$/.test(ev.verb);
+  return `${ACTORS[ev.actor].label} ${ev.verb}${plain ? ` ${o.kind} ${o.name}` : ""}`;
+}
+function stories(evs) {
+  // the same credential acting outside Rancher within 10 minutes reads as one story
+  const out = [];
+  evs.filter(isRisky).sort((x, y) => SEV_RANK[sevOf(x)] - SEV_RANK[sevOf(y)] || x.t - y.t).forEach(ev => {
+    const s = out.find(st => st.actor === ev.actor && st.via === "direct" && ev.via === "direct" && Math.abs(st.t - ev.t) <= 10);
+    if (s) s.events.push(ev); else out.push({ actor: ev.actor, via: ev.via, t: ev.t, events: [ev] });
+  });
+  out.forEach(s => s.events.sort((x, y) => x.t - y.t));
+  return out;
+}
+function renderSide() {
+  $("side-range").textContent = `${fmt(S.a)}–${fmt(S.b)}`;
+  const box = $("side"); box.textContent = "";
+  const evs = visibleEvents();
+  const stats = h("div", "stats");
+  [["筆操作", evs.length], ["個物件變更", new Set(evs.filter(e => e.change).map(e => e.obj)).size], ["筆需注意", evs.filter(isRisky).length]]
+    .forEach(([k, v]) => { const s = h("div", "stat"); s.append(h("div", "v num", v), h("div", "k", k)); stats.append(s); });
+  box.append(stats);
+
+  const st = stories(evs);
+  const sub1 = h("div", "sub"); sub1.append(h("span", null, "需要注意"), h("span", null, st.length ? `${st.length} 件` : "")); box.append(sub1);
+  if (!st.length) box.append(h("div", "quiet", "這段時間沒有中、高風險的操作。"));
+  else {
+    const list = h("div", "att-list");
+    st.forEach(story => {
+      const first = story.events[0], sev = worst(story.events.map(sevOf));
+      const c = h("button", `att ${sev}` + (story.events.some(e => e.id === S.selEvent) ? " sel" : "")); c.type = "button";
+      c.append(h("span", "bar"));
+      const b = h("div", "body");
+      const top = h("div", "top");
+      top.append(h("span", "pill " + sev, `${SEV_LABEL[sev]}風險`), h("span", "num", story.events.map(e => e.hhmm).join("、")), h("span", null, VIA[first.via]));
+      const span = Math.max(1, story.events[story.events.length - 1].t - first.t);
+      const hl = story.events.length > 1 ? `${ACTORS[story.actor].label} 在 ${span} 分鐘內連續 ${story.events.length} 筆高權限操作` : headline(first);
+      const why = story.events.length > 1
+        ? story.events.map(e => `${e.verb} ${OBJ[e.obj].kind} ${OBJ[e.obj].name}`).join("；")
+        : [...new Set(first.alerts.map(r => RULES[r].label))].join("、");
+      b.append(top, h("span", "headline", hl), h("span", "why", why));
+      c.append(b);
+      c.addEventListener("click", () => select(first.obj, first.id));
+      list.append(c);
+    });
+    box.append(list);
+  }
+
+  // per person, using the time range but not the person lens, so you can switch lenses here
+  const base = EVENTS.filter(ev => matchesScope(ev) && inRange(ev));
+  const per = {};
+  base.forEach(e => { per[e.actor] = per[e.actor] || { n: 0, risky: 0 }; per[e.actor].n++; if (isRisky(e)) per[e.actor].risky++; });
+  const entries = Object.entries(per).sort((a, b) => b[1].n - a[1].n);
+  if (entries.length) {
+    const sub2 = h("div", "sub"); sub2.append(h("span", null, "誰做了什麼"), h("span", null, S.actor ? "再點一次取消" : "點名字只看這個人")); box.append(sub2);
+    const max = Math.max(...entries.map(e => e[1].n));
+    const pl = h("div", "people");
+    entries.forEach(([k, v]) => {
+      const row = h("button", "person" + (S.actor === k ? " on" : "")); row.type = "button"; row.title = ACTORS[k].role;
+      row.append(who(k));
+      const bar = h("span", "bar"); const i = h("i"); i.style.width = `${(v.n / max) * 100}%`; i.style.background = ACTORS[k].color; bar.append(i);
+      row.append(bar, h("span", "num muted", v.risky ? `${v.n}・${v.risky} 需注意` : `${v.n}`));
+      row.addEventListener("click", () => { S.actor = S.actor === k ? "" : k; $("f-actor").value = S.actor; syncFilterLook(); render(); });
+      pl.append(row);
+    });
+    box.append(pl);
+  }
+  box.append(h("p", "hint", "叢集收集範圍標在中間每座叢集的標題列；local 只有經 Rancher 的操作。"));
+}
+
+
+// ---------- grouped topology ----------
+function renderMap() {
+  const map = $("map"), links = $("links");
+  [...map.children].forEach(c => { if (c !== links) c.remove(); });
+  links.textContent = "";
+  const evs = visibleEvents();
+  const byObj = new Map();
+  evs.forEach(e => { if (!byObj.has(e.obj)) byObj.set(e.obj, []); byObj.get(e.obj).push(e); });
+  map.classList.toggle("focus", !!S.sel && byObj.has(S.sel));
+  if (!byObj.size) { map.append(h("div", "empty", "這段時間、這個範圍內沒有任何操作。放寬時間範圍或篩選條件試試。")); return; }
+  const related = new Set();
+  if (S.sel) REL.forEach(([a, b]) => { if (a === S.sel) related.add(b); if (b === S.sel) related.add(a); });
+  const tree = {};
+  [...byObj.keys()].forEach(k => {
+    const o = OBJ[k];
+    ((tree[o.cluster] ??= {})[o.project] ??= {})[o.ns] ??= [];
+    tree[o.cluster][o.project][o.ns].push(k);
+  });
+  Object.keys(CLUSTERS).filter(c => tree[c]).forEach(c => {
+    const cl = h("div", "cluster");
+    const head = h("div", "cluster-head");
+    const cov = h("span", "cov"); const ci = h("i"); ci.style.background = CLUSTERS[c].dot; cov.append(ci, document.createTextNode(`收集範圍：${CLUSTERS[c].coverage}`));
+    head.append(h("h3", null, c), h("span", "type", CLUSTERS[c].type), cov);
+    const projects = h("div", "projects");
+    PROJECT_ORDER.filter(p => tree[c][p]).forEach(p => {
+      const pr = h("div", "project"); pr.append(h("div", "project-name", p === "叢集層級" || p === "Rancher 設定" ? p : `專案 ${p}`));
+      Object.keys(tree[c][p]).sort().forEach(n => {
+        const box = h("div", "nsbox"); box.append(h("div", "nsname", n));
+        const chips = h("div", "chips");
+        tree[c][p][n].sort((x, y) => OBJ[x].kind.localeCompare(OBJ[y].kind) || OBJ[x].name.localeCompare(OBJ[y].name)).forEach(k => chips.append(chip(k, byObj.get(k), related)));
+        box.append(chips); pr.append(box);
+      });
+      projects.append(pr);
+    });
+    cl.append(head, projects); map.append(cl);
+  });
+  requestAnimationFrame(drawLinks);
+}
+function chip(k, list, related) {
+  const o = OBJ[k], st = netState(list), sev = worst(list.map(sevOf));
+  const b = h("button", `chip ${st}` + (S.sel === k ? " sel" : "") + (related.has(k) ? " related" : ""));
+  b.type = "button"; b.dataset.k = k;
+  b.setAttribute("aria-label", `${o.kind} ${o.name}，${st === "none" ? "沒有內容變更" : CHG[st]}，${list.length} 筆操作`);
+  b.append(h("span", "kindtag", KIND_TAG[o.kind] || o.kind), h("span", "cname", o.name));
+  if (sev) b.append(h("span", "flag " + sev, sev === "low" ? RULES[list.find(e => sevOf(e) === "low").alerts[0]].label : `${SEV_LABEL[sev]}風險`));
+  const meta = h("span", "cmeta");
+  const dots = h("span", "who-dots");
+  [...new Set(list.map(e => e.actor))].forEach(a => { const i = h("i"); i.style.background = ACTORS[a].color; i.title = ACTORS[a].label; dots.append(i); });
+  const last = [...list].sort((x, y) => y.t - x.t)[0];
+  meta.append(dots, h("span", "num", `${list.length} 筆・最後 ${ACTORS[last.actor].label} ${last.hhmm}`));
+  b.append(meta);
+  b.addEventListener("click", () => S.sel === k ? clearSel() : select(k));
+  return b;
+}
+function drawLinks() {
+  const map = $("map"), svg = $("links");
+  svg.textContent = "";
+  const mr = map.getBoundingClientRect();
+  svg.setAttribute("width", mr.width); svg.setAttribute("height", mr.height);
+  const chipOf = k => map.querySelector(`.chip[data-k="${k}"]`);
+  REL.forEach(([a, b, label, cond]) => {
+    if (cond && cond.startsWith("skipIfVisible:") && chipOf(cond.split(":")[1])) return;
+    const ea = chipOf(a), eb = chipOf(b);
+    if (!ea || !eb) return;
+    const ra = ea.getBoundingClientRect(), rb = eb.getBoundingClientRect();
+    const hot = S.sel === a || S.sel === b;
+    if (!hot) return;
+    let d, lx, ly;
+    if (Math.abs(ra.left - rb.left) < 4) {
+      // same column: route around the right edge
+      const x = ra.right - mr.left, y1 = ra.top + ra.height / 2 - mr.top, y2 = rb.top + rb.height / 2 - mr.top;
+      const bulge = 14 + Math.min(40, Math.abs(y2 - y1) / 6);
+      d = `M${x},${y1} C${x + bulge},${y1} ${x + bulge},${y2} ${x},${y2}`; lx = x + bulge - 2; ly = (y1 + y2) / 2;
+    } else {
+      const leftFirst = ra.left < rb.left;
+      const x1 = (leftFirst ? ra.right : ra.left) - mr.left, x2 = (leftFirst ? rb.left : rb.right) - mr.left;
+      const y1 = ra.top + ra.height / 2 - mr.top, y2 = rb.top + rb.height / 2 - mr.top, mx = (x1 + x2) / 2;
+      d = `M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`; lx = mx; ly = (y1 + y2) / 2;
+    }
+    svgEl("path", { d, class: hot ? "hot" : "" }, svg);
+    if (hot) {
+      const t = svgEl("text", { x: lx + 4, y: ly + 4 }, svg); t.textContent = label;
+      const bb = t.getBBox(); const bg = svgEl("rect", { class: "lbl-bg", x: bb.x - 3, y: bb.y - 1, width: bb.width + 6, height: bb.height + 2, rx: 3 }); svg.insertBefore(bg, t);
+    }
+  });
+}
+
+
+// ---------- evidence panel ----------
+function select(k, evId) {
+  S.sel = k;
+  const evs = EVENTS.filter(e => e.obj === k && matchesScope(e)).sort((a, b) => a.t - b.t);
+  S.selEvent = evId || ([...evs].reverse().find(e => inRange(e) && (!S.actor || e.actor === S.actor)) || evs[evs.length - 1] || {}).id || null;
+  render();
+  requestAnimationFrame(() => {
+    $("map").querySelector(`.chip[data-k="${k}"]`)?.scrollIntoView({ block: "nearest", behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+    $("detail-scroll").scrollTop = 0;
+  });
+}
+function clearSel() { S.sel = null; S.selEvent = null; render(); }
+
+function identityChain(ev) {
+  const a = ACTORS[ev.actor], o = OBJ[ev.obj], hops = [];
+  if (ev.via === "ui" || ev.via === "kubectl") {
+    hops.push(["LDAP 帳號", a.idp]);
+    hops.push(["經由", ev.via === "ui" ? "Rancher 介面" : "Rancher 的 kubeconfig"]);
+    if (o.cluster === "local") hops.push(["寫入", "Rancher API"]);
+    else { hops.push(["代為執行", `cattle-impersonation-${a.uid}`]); hops.push(["寫入", `${o.cluster} apiserver`]); }
+    return { hops, note: o.cluster === "local" ? "來源：Rancher API audit log。" : "來源：Rancher audit log 與下游 apiserver audit log 對到同一筆，合併成一列。" };
+  }
+  if (ev.via === "direct") return { hops: [["憑證", "system:admin（節點上的管理者憑證）", true], ["寫入", `${o.cluster} apiserver`]], note: "只有下游 apiserver audit log，Rancher 那邊沒有紀錄，無法對應到個人。要追是誰，得查誰能登入 control plane 節點。" };
+  if (ev.via === "controller") return { hops: [["系統元件", "kube-system:deployment-controller"], ["寫入", `${o.cluster} apiserver`]], note: "Kubernetes 自動產生的變更，起因是上游物件被修改。" };
+  return { hops: [["是誰", "不明", true], ["發現方式", "重新連線後比對物件版本"]], note: "只知道內容變了、大約在什麼時候，沒有 audit 紀錄可以對應。" };
+}
+function renderDetail() {
+  const box = $("detail"); box.textContent = "";
+  if (!S.sel) {
+    const e = h("div", "empty");
+    e.append(h("strong", null, "還沒選物件"), h("span", null, "從左邊的「需要注意」、中間的物件，或下方時間軸上的點，挑一個開始看。"));
+    box.append(e); return;
+  }
+  const o = OBJ[S.sel];
+  const head = h("div", "objhead");
+  head.append(h("h2", null, `${o.kind} ${o.name}`), h("span", "path", `${o.cluster} ／ ${o.project} ／ ${o.ns}`));
+  box.append(head);
+  const evs = EVENTS.filter(e => e.obj === S.sel && matchesScope(e)).sort((a, b) => a.t - b.t);
+  box.append(h("div", "sub", `當天 ${evs.length} 筆操作${evs.some(e => !inRange(e)) ? "（範圍外的變淡）" : ""}`));
+  const steps = h("div", "steps");
+  evs.forEach(ev => {
+    const s = h("button", "step" + (S.selEvent === ev.id ? " sel" : "") + (inRange(ev) ? "" : " out")); s.type = "button";
+    s.append(h("span", "t num", ev.hhmm));
+    const rail = h("span", "rail"); const dot = h("i"); dot.style.background = ACTORS[ev.actor].color; rail.append(dot); s.append(rail);
+    const card = h("span", "card");
+    const line = h("span", "line"); line.append(who(ev.actor), document.createTextNode(` ${ev.verb}`)); card.append(line);
+    const pills = h("span", "pills");
+    pills.append(h("span", "pill", VIA[ev.via]));
+    if (ev.change) pills.append(h("span", "pill " + ev.change, CHG[ev.change]));
+    ev.alerts.forEach(r => pills.append(h("span", "pill " + RULES[r].sev, RULES[r].label)));
+    card.append(pills); s.append(card);
+    s.addEventListener("click", () => { S.selEvent = ev.id; renderDetail(); renderTimeline(); });
+    steps.append(s);
+  });
+  box.append(steps);
+  const ev = EVENTS.find(e => e.id === S.selEvent);
+  if (!ev) return;
+  const chain = identityChain(ev);
+  const evd = h("div", "evidence");
+  evd.append(h("h3", null, `${ev.hhmm} 是誰做的`));
+  const ch = h("div", "chain");
+  chain.hops.forEach(([k, v, warn], i) => {
+    if (i) ch.append(h("span", "arrow", "→"));
+    const hop = h("div", "hop" + (warn ? " warn" : "")); hop.append(h("span", "k", k), h("span", "v", v)); ch.append(hop);
+  });
+  evd.append(ch, h("p", "chain-note", chain.note));
+  box.append(evd);
+  if (ev.diff.length || ev.note) {
+    const df = h("div", "evidence");
+    df.append(h("h3", null, ev.diff.length ? `${ev.hhmm} 改了什麼` : `${ev.hhmm} 補充`));
+    if (ev.diff.length) {
+      const d = h("div", "diff");
+      ev.diff.forEach(([op, text]) => d.append(h("div", op === "+" ? "add" : op === "-" ? "del" : "ctx", `${op} ${text}`)));
+      df.append(d);
+    }
+    if (ev.note) { const n = h("p", "chain-note", ev.note); n.style.paddingTop = ev.diff.length ? "0" : "10px"; df.append(n); }
+    const rel = REL.filter(([a, b, , c]) => (a === S.sel || b === S.sel) && !c).map(([a, b, label]) => a === S.sel ? [b, label, "out"] : [a, label, "in"]);
+    if (rel.length) {
+      const im = h("div", "impact"); im.append(h("span", "muted", "相關物件："));
+      rel.forEach(([k, label, dir]) => {
+        const btn = h("button", "linkbtn", dir === "out" ? `${label} ${OBJ[k].kind} ${OBJ[k].name}` : `${OBJ[k].kind} ${OBJ[k].name}（${label}這裡）`);
+        btn.type = "button"; btn.addEventListener("click", () => select(k)); im.append(btn);
+      });
+      df.append(im);
+    }
+    box.append(df);
+  }
+}
+
+
+// ---------- timeline ----------
+const TL = { L: 104, R: 20, axis: 16, hist: 22, gap: 4, lane: 16 };
+let drag = null;
+function renderTimeline() {
+  const svg = $("tl"); svg.textContent = "";
+  const W = Math.max($("tl-wrap").clientWidth - 4, 640);
+  const evs = EVENTS.filter(e => matchesScope(e) && (!S.actor || e.actor === S.actor));
+  const lanes = Object.keys(ACTORS).filter(k => evs.some(e => e.actor === k));
+  const histTop = TL.axis + 22, lanesTop = histTop + TL.hist + TL.gap;
+  const H = lanesTop + Math.max(lanes.length, 1) * TL.lane + 6;
+  svg.setAttribute("width", W); svg.setAttribute("height", H); svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const x = m => TL.L + (m / 1440) * (W - TL.L - TL.R);
+  TL.W = W;
+  [[0, 540], [1080, 1440]].forEach(([s, e]) => svgEl("rect", { class: "offhours", x: x(s), y: histTop - 4, width: x(e) - x(s), height: H - histTop }, svg));
+  for (let m = 0; m <= 1440; m += 180) {
+    svgEl("line", { class: "grid", x1: x(m), x2: x(m), y1: histTop - 4, y2: H - 4 }, svg);
+    svgEl("text", { x: x(m), y: 12, "text-anchor": m === 0 ? "start" : m === 1440 ? "end" : "middle" }, svg).textContent = fmt(m);
+  }
+  // hourly volume
+  const buckets = Array.from({ length: 24 }, () => ({ n: 0, risky: 0 }));
+  evs.forEach(e => { const b = buckets[Math.min(23, Math.floor(e.t / 60))]; b.n++; if (["high", "medium"].includes(sevOf(e))) b.risky++; });
+  const maxN = Math.max(1, ...buckets.map(b => b.n));
+  svgEl("text", { x: 4, y: histTop + TL.hist / 2 + 4 }, svg).textContent = "每小時量";
+  buckets.forEach((b, i) => {
+    if (!b.n) return;
+    const bw = (x(60) - x(0)) - 3, hh = (b.n / maxN) * TL.hist, hr = (b.risky / maxN) * TL.hist;
+    svgEl("rect", { class: "hist", x: x(i * 60) + 1.5, y: histTop + TL.hist - hh, width: bw, height: hh - hr, rx: 1.5 }, svg);
+    if (hr) svgEl("rect", { class: "hist alert", x: x(i * 60) + 1.5, y: histTop + TL.hist - hr, width: bw, height: hr, rx: 1.5 }, svg);
+  });
+  lanes.forEach((k, i) => { svgEl("text", { x: 4, y: lanesTop + i * TL.lane + TL.lane / 2 + 4, class: "lane-label" }, svg).textContent = ACTORS[k].label; });
+  // brush
+  svgEl("rect", { class: "brush", x: x(S.a), y: histTop - 4, width: Math.max(x(S.b) - x(S.a), 1), height: H - histTop }, svg);
+  [["A", S.a], ["B", S.b]].forEach(([lab, m]) => {
+    const g = svgEl("g", { class: "handle-g", "data-h": lab }, svg); g.style.cursor = "ew-resize";
+    svgEl("rect", { class: "handle", x: x(m) - 7, y: histTop - 18, width: 14, height: 15, rx: 3 }, g);
+    svgEl("text", { class: "hl", x: x(m), y: histTop - 7, "text-anchor": "middle" }, g).textContent = lab;
+    svgEl("rect", { x: x(m) - 5, y: histTop - 4, width: 10, height: H - histTop, fill: "transparent" }, g);
+  });
+  // events
+  evs.forEach(ev => {
+    const y = lanesTop + lanes.indexOf(ev.actor) * TL.lane + TL.lane / 2, sev = sevOf(ev), dim = !inRange(ev), cx = x(ev.t);
+    const g = svgEl("g", { class: "dot", tabindex: 0, role: "button", "aria-label": `${ev.hhmm} ${ACTORS[ev.actor].label} ${ev.verb} ${OBJ[ev.obj].kind} ${OBJ[ev.obj].name}`, opacity: dim ? .3 : 1 }, svg);
+    if (sev === "high" || sev === "medium") svgEl("circle", { cx, cy: y, r: 8.5, fill: "none", stroke: "var(--alert)", "stroke-width": 2 }, g);
+    const sel = S.selEvent === ev.id;
+    if (ev.change === "deleted") svgEl("circle", { cx, cy: y, r: sel ? 6 : 5, fill: "var(--surface)", stroke: ACTORS[ev.actor].color, "stroke-width": 2.5 }, g);
+    else if (!ev.change) svgEl("rect", { x: cx - 4.5, y: y - 4.5, width: 9, height: 9, transform: `rotate(45 ${cx} ${y})`, fill: ACTORS[ev.actor].color, stroke: "var(--surface)", "stroke-width": 1.5 }, g);
+    else svgEl("circle", { cx, cy: y, r: sel ? 6.5 : 5, fill: ACTORS[ev.actor].color, stroke: sel ? "var(--fg)" : "var(--surface)", "stroke-width": 1.5 }, g);
+    if (sel) svgEl("circle", { cx, cy: y, r: 11, fill: "none", stroke: "var(--fg)", "stroke-width": 1.2, "stroke-dasharray": "2 2" }, g);
+    const tipText = `${ev.hhmm}　${ACTORS[ev.actor].label} ${ev.verb}・${OBJ[ev.obj].kind} ${OBJ[ev.obj].name}・${VIA[ev.via]}`;
+    g.addEventListener("pointerenter", () => showTip(tipText, cx, y));
+    g.addEventListener("pointerleave", hideTip);
+    g.addEventListener("focus", () => showTip(tipText, cx, y));
+    g.addEventListener("blur", hideTip);
+    g.addEventListener("pointerdown", e => e.stopPropagation());
+    g.addEventListener("click", e => { e.stopPropagation(); select(ev.obj, ev.id); });
+    g.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); select(ev.obj, ev.id); } });
+  });
+  // legend for shapes
+  $("range-label").textContent = `範圍 A ${fmt(S.a)} → B ${fmt(S.b)}`;
+  document.querySelectorAll("[data-preset]").forEach(b => b.classList.toggle("on", b.dataset.preset === `${S.a},${S.b}`));
+}
+function showTip(text, cx, cy) {
+  const tip = $("tip"); tip.textContent = text; tip.hidden = false;
+  const wrap = $("tl-wrap"), w = tip.offsetWidth;
+  tip.style.left = `${Math.min(Math.max(cx - w / 2, 4), wrap.scrollWidth - w - 4)}px`;
+  tip.style.top = `${cy - 34}px`;
+}
+function hideTip() { $("tip").hidden = true; }
+function toMinutes(clientX) {
+  const r = $("tl").getBoundingClientRect();
+  const m = ((clientX - r.left) - TL.L) / (TL.W - TL.L - TL.R) * 1440;
+  return Math.max(0, Math.min(1440, Math.round(m / 5) * 5));
+}
+$("tl").addEventListener("pointerdown", e => {
+  const hnd = e.target.closest(".handle-g"), m = toMinutes(e.clientX);
+  if (hnd) drag = { mode: hnd.dataset.h }; else { drag = { mode: "new", start: m }; S.a = m; S.b = Math.min(1440, m + 5); }
+  $("tl").setPointerCapture(e.pointerId); hideTip(); renderTimeline();
+});
+$("tl").addEventListener("pointermove", e => {
+  if (!drag) return;
+  const m = toMinutes(e.clientX);
+  if (drag.mode === "A") S.a = Math.min(m, S.b - 10);
+  else if (drag.mode === "B") S.b = Math.max(m, S.a + 10);
+  else { S.a = Math.min(drag.start, m); S.b = Math.max(drag.start, m); }
+  renderTimeline(); renderMap(); renderSide(); renderDetail();
+});
+const endDrag = () => { if (!drag) return; drag = null; if (S.b - S.a < 10) S.b = Math.min(1440, S.a + 10); render(); };
+$("tl").addEventListener("pointerup", endDrag);
+$("tl").addEventListener("pointercancel", endDrag);
+document.querySelectorAll("[data-preset]").forEach(b => b.addEventListener("click", () => { [S.a, S.b] = b.dataset.preset.split(",").map(Number); render(); }));
+
+
+// ---------- wiring ----------
+function syncFilterLook() { ["f-cluster", "f-project", "f-ns", "f-actor"].forEach(id => $(id).classList.toggle("active", !!$(id).value)); }
+function render() { syncFilterLook(); renderSide(); renderMap(); renderDetail(); renderTimeline(); }
+$("f-cluster").addEventListener("change", e => { S.cluster = e.target.value; S.sel = null; refreshFilters(); render(); });
+$("f-project").addEventListener("change", e => { S.project = e.target.value; S.sel = null; refreshFilters(); render(); });
+$("f-ns").addEventListener("change", e => { S.ns = e.target.value; S.sel = null; render(); });
+$("f-actor").addEventListener("change", e => { S.actor = e.target.value; render(); });
+$("f-sys").addEventListener("change", e => { S.sys = e.target.checked; refreshFilters(); render(); });
+$("reset").addEventListener("click", () => {
+  Object.assign(S, { a: 0, b: 1440, cluster: "", project: "", ns: "", actor: "" });
+  ["f-cluster", "f-project", "f-ns", "f-actor"].forEach(id => $(id).value = "");
+  refreshFilters(); render();
+});
+let rt; window.addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(() => { renderTimeline(); drawLinks(); }, 100); });
+if (document.fonts && document.fonts.ready) document.fonts.ready.then(drawLinks);
+refreshFilters();
+// open on the most serious item so every column has something to show
+const firstStory = stories(visibleEvents())[0];
+if (firstStory) select(firstStory.events[0].obj, firstStory.events[0].id); else render();
+
+</script>

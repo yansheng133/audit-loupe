@@ -1,0 +1,6 @@
+apiVersion: v2
+name: audit-loupe
+description: Who changed what in this cluster - audit webhook receiver, object version tracker and API for the audit-loupe Rancher UI extension
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

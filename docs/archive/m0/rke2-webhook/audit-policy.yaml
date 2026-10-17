@@ -1,0 +1,35 @@
+# Audit policy for audit-trail. First matching rule wins.
+# - Writes are recorded with the request body (Request level), so the UI can show what was sent.
+# - Secret and ConfigMap requests are recorded at Metadata only, so their content never reaches
+#   the audit log. (audit-trail separately watches ConfigMaps and stores value hashes only.)
+# - HelmChart/HelmChartConfig values can carry credentials, so they are Metadata too.
+# - Kubelet, scheduler, controller-manager and kube-system controllers are dropped to keep volume down.
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages: ["RequestReceived"]
+rules:
+  - level: None
+    userGroups: ["system:nodes", "system:serviceaccounts:kube-system"]
+  - level: None
+    users: ["system:kube-scheduler", "system:kube-controller-manager", "system:apiserver", "system:kube-proxy"]
+  - level: None
+    verbs: ["watch"]
+  - level: None
+    resources:
+      - { group: "", resources: ["events"] }
+      - { group: "events.k8s.io", resources: ["events"] }
+      - { group: "coordination.k8s.io", resources: ["leases"] }
+      - { group: "authentication.k8s.io", resources: ["tokenreviews"] }
+      - { group: "authorization.k8s.io", resources: ["subjectaccessreviews", "selfsubjectaccessreviews", "selfsubjectrulesreviews"] }
+  - level: None
+    nonResourceURLs: ["/healthz*", "/livez*", "/readyz*", "/version", "/metrics", "/openapi*", "/api*", "/apis*"]
+  - level: Metadata
+    resources:
+      - { group: "", resources: ["secrets", "configmaps", "serviceaccounts/token"] }
+      - { group: "helm.cattle.io", resources: ["helmcharts", "helmchartconfigs"] }
+  - level: Metadata
+    resources:
+      - { group: "", resources: ["pods/exec", "pods/attach", "pods/portforward"] }
+  - level: Request
+    verbs: ["create", "update", "patch", "delete", "deletecollection"]
+  - level: None

@@ -1,0 +1,46 @@
+# Name shown in the UI for this cluster.
+clusterName: downstream
+
+image:
+  repository: docker.io/CHANGE-ME/audit-loupe
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+# Fixed ClusterIP so kube-apiserver (host network) can reach the audit webhook
+# without cluster DNS. Use the low "static" band of the service CIDR to avoid
+# colliding with dynamic allocation (RKE2 default 10.43.0.0/16: 10.43.0.2-10.43.0.255,
+# but not .1 or .10). Check that it is free first.
+service:
+  clusterIP: 10.43.0.200
+  port: 8080        # read API for the UI (via Rancher service proxy)
+  ingestPort: 8081  # audit webhook receiver
+
+# Shared secret the audit webhook sends as a bearer token. Leave empty to generate one.
+ingestToken: ""
+
+# Resources whose versions are stored ("group/version/resource", core group as "v1/...").
+# Secrets are never watched. ConfigMap values are stored as hashes only.
+watchResources: ""
+
+timezone: Asia/Taipei
+workHours: "9-18"
+workDays: "1-5"
+retentionDays: 90
+
+persistence:
+  enabled: true
+  # Empty uses the cluster's default StorageClass. RKE2 does not ship one;
+  # with enabled: false the data lives in an emptyDir and is lost on restart.
+  storageClass: ""
+  size: 2Gi
+
+# Optional: restrict who can reach the pod. Requests from kube-apiserver (webhook and
+# Rancher service proxy) come from the control-plane nodes' host network, so list those
+# node addresses (or their subnet) here. Leave empty to not create a NetworkPolicy.
+# Without it, any pod in the cluster can call the read API directly.
+networkPolicy:
+  allowFromCIDRs: []
+
+resources:
+  requests: { cpu: 50m, memory: 64Mi }
+  limits: { memory: 256Mi }

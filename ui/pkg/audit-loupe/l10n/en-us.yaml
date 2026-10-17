@@ -1,0 +1,6 @@
+auditLoupe:
+  nav:
+    group: Audit Loupe
+    timeline: Activity Timeline
+    objects: Object History
+    alerts: Alerts
