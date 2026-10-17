@@ -185,6 +185,85 @@ async fn history(State(s): State<AppState>, Q(p): Q<HistoryParams>) -> Response 
 }
 
 #[derive(Deserialize)]
+struct AtParams {
+    at: Option<DateTime<Utc>>,
+    user: Option<String>,
+}
+
+fn access_snapshot(s: &AppState, at_ms: i64) -> anyhow::Result<crate::access::Snapshot> {
+    let cl = &s.cfg.rancher_cluster;
+    let objs = s.store.access_objects(cl, at_ms)?;
+    let users = s.store.access_users(cl, at_ms)?;
+    Ok(crate::access::snapshot(at_ms, &objs, users))
+}
+
+/// Who held which Rancher permission at a time (default now).
+async fn access(State(s): State<AppState>, Q(p): Q<AtParams>) -> Response {
+    let at = p.at.unwrap_or_else(Utc::now).timestamp_millis();
+    match access_snapshot(&s, at) {
+        Ok(mut snap) => {
+            if let Some(u) = p.user.filter(|u| !u.is_empty()) {
+                snap.users.retain(|x| x.user_id == u);
+            }
+            Json(snap).into_response()
+        }
+        Err(e) => err(e),
+    }
+}
+
+async fn access_csv(State(s): State<AppState>, Q(p): Q<AtParams>) -> Response {
+    let at = p.at.unwrap_or_else(Utc::now);
+    match access_snapshot(&s, at.timestamp_millis()) {
+        Ok(snap) => (
+            [
+                (axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
+                (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=\"access-{}.csv\"", at.format("%Y%m%d-%H%M"))),
+            ],
+            // A byte-order mark so spreadsheet programs read the UTF-8 names correctly.
+            format!("\u{feff}{}", crate::access::to_csv(&snap)),
+        )
+            .into_response(),
+        Err(e) => err(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct DiffParams {
+    from: DateTime<Utc>,
+    to: Option<DateTime<Utc>>,
+}
+
+/// Permissions added and removed between two times, who did it, and role definition changes.
+async fn access_diff(State(s): State<AppState>, Q(p): Q<DiffParams>) -> Response {
+    let (from, to) = (p.from.timestamp_millis(), p.to.unwrap_or_else(Utc::now).timestamp_millis());
+    let run = || -> anyhow::Result<serde_json::Value> {
+        let cl = &s.cfg.rancher_cluster;
+        let before = crate::access::grants(&s.store.access_objects(cl, from)?);
+        let after = crate::access::grants(&s.store.access_objects(cl, to)?);
+        let (added, removed) = crate::access::diff(&before, &after);
+        let mut changes = Vec::new();
+        for g in added {
+            let (at, by) = (Some(g.granted_ms), g.granted_by.clone());
+            changes.push(crate::access::Change { change: "added", grant: g, at_ms: at, by, reason: None });
+        }
+        for g in removed {
+            let resource = match g.binding_kind.as_str() {
+                "GlobalRoleBinding" => "globalrolebindings",
+                "ClusterRoleTemplateBinding" => "clusterroletemplatebindings",
+                _ => "projectroletemplatebindings",
+            };
+            let (at, by, reason) = s.store.access_removal(cl, resource, &g.binding_namespace, &g.binding_name, &g.subject, from, to)?;
+            changes.push(crate::access::Change { change: "removed", grant: g, at_ms: at, by, reason });
+        }
+        Ok(json!({"from": from, "to": to, "changes": changes, "roleChanges": s.store.role_changes(cl, from, to)?}))
+    };
+    match run() {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+#[derive(Deserialize)]
 struct ClusterRange {
     cluster: Option<String>,
     from: Option<DateTime<Utc>>,
@@ -287,6 +366,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/history", get(history))
         .route("/api/related", get(related))
         .route("/api/hourly", get(hourly))
+        .route("/api/access", get(access))
+        .route("/api/access/diff", get(access_diff))
+        .route("/api/access/csv", get(access_csv))
         .route("/api/unattributed", get(unattributed))
         .route("/api/clusters", get(clusters))
         .route("/api/projects", get(projects))

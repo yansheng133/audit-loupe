@@ -9,7 +9,7 @@ use serde::Serialize;
 use crate::relations::{extract, pod_template, selector_matches};
 use crate::watch::ObjMsg;
 use serde_json::{Map, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
@@ -229,6 +229,22 @@ pub struct UserLife {
     pub deleted_ms: Option<i64>,
     /// Changes made in this lifetime within the requested range (filled by `actors`).
     pub writes: i64,
+}
+
+pub type AccessObj = crate::access::Obj;
+
+/// Rancher's permission objects, all in management.cattle.io on the Rancher cluster.
+const ACCESS_TYPES: [&str; 5] = ["globalroles", "globalrolebindings", "roletemplates", "clusterroletemplatebindings", "projectroletemplatebindings"];
+
+#[derive(Debug, Serialize)]
+pub struct RoleChange {
+    pub kind: String,
+    pub name: String,
+    pub change: String,
+    pub at_ms: i64,
+    pub by: Option<String>,
+    /// "rancher_sync": a built-in role Rancher changed itself (typically on upgrade).
+    pub reason: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -641,6 +657,146 @@ impl Store {
             r.last_change = st.query_row(params![cluster, r.kind, r.namespace, r.name], |row| row.get(0)).optional()?;
         }
         Ok(out)
+    }
+
+    /// Rancher permission objects as they were at `at_ms`, with who created each one.
+    pub fn access_objects(&self, cluster: &str, at_ms: i64) -> anyhow::Result<Vec<AccessObj>> {
+        let c = self.conn.lock().unwrap();
+        let mut out = Vec::new();
+        for resource in ACCESS_TYPES {
+            let mut st = c.prepare_cached(
+                "SELECT namespace, name, uid, body FROM versions WHERE id IN (
+                   SELECT max(id) FROM versions WHERE cluster=?1 AND api_group='management.cattle.io' AND resource=?2 AND observed_ms <= ?3
+                   GROUP BY namespace, name)
+                 AND change <> 'deleted'",
+            )?;
+            let rows: Vec<(String, String, String, String)> =
+                st.query_map(params![cluster, resource, at_ms], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<Result<_, _>>()?;
+            drop(st);
+            for (namespace, name, uid, body) in rows {
+                let (first_seen_ms, before_tracking, created_by, inferred) = Self::creation(&c, cluster, resource, &namespace, &name, &uid)?;
+                out.push(AccessObj {
+                    resource: resource.to_string(), namespace, name, body: serde_json::from_str(&body).unwrap_or(Value::Null),
+                    first_seen_ms, before_tracking, created_by, created_by_inferred: inferred,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// When an object (this UID) was first seen and who created it. Exact when the first
+    /// version was matched to an audit record; otherwise the nearest create of that type by
+    /// a person shortly before (Norman creates carry no namespace or name to match on).
+    fn creation(c: &Connection, cluster: &str, resource: &str, ns: &str, name: &str, uid: &str) -> anyhow::Result<(i64, bool, Option<String>, bool)> {
+        let (vid, obs, change, eid): (i64, i64, String, Option<i64>) = c.query_row(
+            "SELECT id, observed_ms, change, event_id FROM versions WHERE cluster=?1 AND api_group='management.cattle.io' AND resource=?2
+               AND namespace=?3 AND name=?4 AND uid=?5 ORDER BY id LIMIT 1",
+            params![cluster, resource, ns, name, uid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+        let _ = vid;
+        if change == "baseline" {
+            return Ok((obs, true, None, false));
+        }
+        if let Some(eid) = eid {
+            let who: Option<String> = c.query_row("SELECT actor FROM events WHERE id=?1", params![eid], |r| r.get(0)).optional()?;
+            return Ok((obs, false, who, false));
+        }
+        let who: Option<String> = c
+            .query_row(
+                "SELECT actor FROM events WHERE cluster=?1 AND resource=?2 AND verb='create' AND human=1 AND code BETWEEN 200 AND 299
+                   AND (name=?3 OR name='') AND ts_ms BETWEEN ?4 AND ?5 ORDER BY abs(ts_ms - ?6) LIMIT 1",
+                params![cluster, resource, name, obs - 20_000, obs + 5_000, obs],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let inferred = who.is_some();
+        Ok((obs, false, who, inferred))
+    }
+
+    /// Users as they were at `at_ms`: (user ID, name, principal IDs, groups, when the group
+    /// list was last seen to change).
+    pub fn access_users(&self, cluster: &str, at_ms: i64) -> anyhow::Result<Vec<(String, String, Vec<String>, Vec<String>, Option<i64>)>> {
+        let c = self.conn.lock().unwrap();
+        let latest = |resource: &str| -> anyhow::Result<Vec<(String, String, i64)>> {
+            let mut st = c.prepare_cached(
+                "SELECT name, body, observed_ms FROM versions WHERE id IN (
+                   SELECT max(id) FROM versions WHERE cluster=?1 AND api_group='management.cattle.io' AND resource=?2 AND observed_ms <= ?3 GROUP BY name)
+                 AND change <> 'deleted'",
+            )?;
+            let rows = st.query_map(params![cluster, resource, at_ms], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+            Ok(rows)
+        };
+        let attrs: HashMap<String, (Value, i64)> = latest("userattributes")?
+            .into_iter()
+            .map(|(n, b, t)| (n, (serde_json::from_str(&b).unwrap_or(Value::Null), t)))
+            .collect();
+        let mut out = Vec::new();
+        for (name, body, _) in latest("users")? {
+            let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let display = [v.get("displayName"), v.get("username")]
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .find(|s| !s.is_empty())
+                .unwrap_or(&name)
+                .to_string();
+            let principals: Vec<String> = v.get("principalIds").and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+            let (groups, seen) = attrs.get(&name).map(|(ua, t)| (crate::access::groups_of(ua), Some(*t))).unwrap_or_default();
+            out.push((name, display, principals, groups, seen));
+        }
+        Ok(out)
+    }
+
+    /// Who deleted a binding between two times, and whether Rancher did it on its own right
+    /// after deleting the user it named.
+    pub fn access_removal(&self, cluster: &str, resource: &str, ns: &str, name: &str, subject: &str, from_ms: i64, to_ms: i64) -> anyhow::Result<(Option<i64>, Option<String>, Option<&'static str>)> {
+        let c = self.conn.lock().unwrap();
+        let row: Option<(i64, Option<i64>)> = c
+            .query_row(
+                "SELECT observed_ms, event_id FROM versions WHERE cluster=?1 AND api_group='management.cattle.io' AND resource=?2 AND namespace=?3 AND name=?4
+                   AND change IN ('deleting','deleted') AND observed_ms > ?5 AND observed_ms <= ?6 ORDER BY id LIMIT 1",
+                params![cluster, resource, ns, name, from_ms, to_ms],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((at, eid)) = row else { return Ok((None, None, None)) };
+        let who: Option<(String, i64)> = match eid {
+            Some(e) => c.query_row("SELECT actor, human FROM events WHERE id=?1", params![e], |r| Ok((r.get(0)?, r.get(1)?))).optional()?,
+            None => None,
+        };
+        if let Some((actor, 1)) = &who {
+            return Ok((Some(at), Some(actor.clone()), None));
+        }
+        let user_gone: Option<i64> = c
+            .query_row("SELECT max(deleted_ms) FROM users WHERE user_id=?1 AND deleted_ms BETWEEN ?2 AND ?3", params![subject, at - 600_000, at + 5_000], |r| r.get(0))
+            .optional()?
+            .flatten();
+        Ok((Some(at), who.map(|w| w.0), user_gone.map(|_| "rancher_cleanup")))
+    }
+
+    /// Role definitions (RoleTemplate, GlobalRole) changed between two times, with who changed them.
+    pub fn role_changes(&self, cluster: &str, from_ms: i64, to_ms: i64) -> anyhow::Result<Vec<RoleChange>> {
+        let c = self.conn.lock().unwrap();
+        let mut st = c.prepare(
+            "SELECT v.resource, v.name, v.change, v.observed_ms, v.body, e.actor, e.human FROM versions v LEFT JOIN events e ON v.event_id=e.id
+             WHERE v.cluster=?1 AND v.api_group='management.cattle.io' AND v.resource IN ('roletemplates','globalroles')
+               AND v.change NOT IN ('baseline') AND v.observed_ms > ?2 AND v.observed_ms <= ?3 ORDER BY v.observed_ms",
+        )?;
+        let rows = st
+            .query_map(params![cluster, from_ms, to_ms], |r| {
+                let body: String = r.get(4)?;
+                let builtin = serde_json::from_str::<Value>(&body).ok().and_then(|b| b.get("builtin").and_then(Value::as_bool)).unwrap_or(false);
+                let actor: Option<String> = r.get(5)?;
+                let human: Option<i64> = r.get(6)?;
+                Ok(RoleChange {
+                    kind: r.get(0)?, name: r.get(1)?, change: r.get(2)?, at_ms: r.get(3)?,
+                    by: actor.filter(|_| human == Some(1)),
+                    reason: if builtin && human != Some(1) { Some("rancher_sync") } else { None },
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
     }
 
     /// Keep the user directory current. One row per lifetime of a user ID: an external
@@ -1447,6 +1603,40 @@ mod tests {
         s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00Z"), &[]).unwrap();
         let c = s.clusters(0, i64::MAX).unwrap();
         assert_eq!((c[0].cluster.as_str(), c[0].k8s_events, c[0].rancher_events), ("c1", 1, 0));
+    }
+
+    #[test]
+    fn access_review_from_stored_versions() {
+        let s = Store::open(":memory:").unwrap();
+        let t0 = Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap();
+        let mk = |res: &str, ns: &str, name: &str, uid: &str, body: Value, seen: &str, at: DateTime<Utc>| {
+            let key = ObjKey { cluster: "local".into(), api_group: "management.cattle.io".into(), resource: res.into(), namespace: ns.into(), name: name.into() };
+            let kind = match res { "users" => "User", "roletemplates" => "RoleTemplate", _ => "ClusterRoleTemplateBinding" };
+            s.insert_version(&key, kind, uid, &body, seen, at).unwrap()
+        };
+        mk("roletemplates", "", "cluster-owner", "rt1", json!({"rules":[{"apiGroups":["*"],"resources":["*"],"verbs":["*"]}]}), "baseline", t0);
+        mk("users", "", "u-dave", "ud", json!({"displayName":"Dave","principalIds":["local://u-dave"]}), "baseline", t0);
+        // carol grants dave cluster-owner through the Rancher API (Norman: no namespace/name to match).
+        let t1 = t0 + chrono::Duration::days(3);
+        let line = format!(r#"{{"auditID":"g1","requestURI":"/v3/clusterroletemplatebindings","method":"POST","user":{{"name":"u-carol","extra":{{"username":["carol"]}}}},"responseCode":201,"responseTimestamp":"{}"}}"#, t1.to_rfc3339());
+        let r = crate::rancher::to_record(&crate::rancher::parse_fixture(&line)[0]).unwrap();
+        s.insert_event("local", &r, &[]).unwrap();
+        mk("clusterroletemplatebindings", "c-m-1", "crtb-x", "b1", json!({"clusterName":"c-m-1","roleTemplateName":"cluster-owner","userName":"u-dave"}), "modified", t1 + chrono::Duration::seconds(1));
+        // Later Rancher deletes the user, then cleans up the binding itself.
+        let t2 = t0 + chrono::Duration::days(10);
+        mk("users", "", "u-dave", "ud", json!({"displayName":"Dave"}), "deleted", t2);
+        mk("clusterroletemplatebindings", "c-m-1", "crtb-x", "b1", json!({"clusterName":"c-m-1","roleTemplateName":"cluster-owner","userName":"u-dave"}), "deleted", t2 + chrono::Duration::seconds(3));
+
+        let mid = (t0 + chrono::Duration::days(5)).timestamp_millis();
+        let snap = crate::access::snapshot(mid, &s.access_objects("local", mid).unwrap(), s.access_users("local", mid).unwrap());
+        let g = &snap.users[0].grants[0];
+        assert_eq!((snap.users[0].display_name.as_str(), g.role.as_str(), g.admin_like), ("Dave", "cluster-owner", true));
+        assert_eq!((g.granted_by.as_deref(), g.granted_by_inferred), (Some("carol"), true));
+        let later = (t0 + chrono::Duration::days(20)).timestamp_millis();
+        assert!(s.access_objects("local", later).unwrap().iter().all(|o| o.resource != "clusterroletemplatebindings"));
+        let (at, by, reason) = s.access_removal("local", "clusterroletemplatebindings", "c-m-1", "crtb-x", "u-dave", mid, later).unwrap();
+        assert!(at.is_some() && by.is_none());
+        assert_eq!(reason, Some("rancher_cleanup"));
     }
 
     #[test]
