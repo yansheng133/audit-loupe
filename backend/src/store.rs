@@ -159,6 +159,7 @@ pub struct RancherSide {
 pub struct EventRow {
     pub id: i64,
     pub cluster: String,
+    pub audit_id: String,
     /// "k8s" or "rancher".
     pub source: String,
     pub user_id: String,
@@ -1628,7 +1629,7 @@ impl Store {
                     e.namespace,e.name,e.code,e.source_ip,e.user_agent,e.request_uri,e.request_object,
                     (SELECT group_concat(rule) FROM alerts a WHERE a.event_id=e.id),
                     (SELECT v.id FROM versions v WHERE v.event_id=e.id ORDER BY v.id DESC LIMIT 1),
-                    e.source,e.user_id,r.ts,r.user_agent,r.source_ip,r.request_uri
+                    e.source,e.user_id,r.ts,r.user_agent,r.source_ip,r.request_uri,e.audit_id
              FROM events e LEFT JOIN events r ON r.id=e.link_id AND e.source='k8s'
              WHERE e.ts_ms BETWEEN ?1 AND ?2",
         );
@@ -1666,7 +1667,7 @@ impl Store {
                     None => None,
                 };
                 Ok(EventRow {
-                    id: r.get(0)?, cluster: r.get(1)?, source: r.get(21)?, user_id: r.get(22)?, rancher,
+                    id: r.get(0)?, cluster: r.get(1)?, audit_id: r.get(27)?, source: r.get(21)?, user_id: r.get(22)?, rancher,
                     ts: r.get(2)?, actor: r.get(3)?, principal: r.get(4)?,
                     human: r.get::<_, i64>(5)? == 1, via: r.get(6)?, caller: r.get(7)?, verb: r.get(8)?,
                     api_group: r.get(9)?, resource: r.get(10)?, subresource: r.get(11)?, namespace: r.get(12)?,
