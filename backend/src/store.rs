@@ -6,6 +6,7 @@ use crate::rules::Alert;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
+use crate::integrity::{link, Fields};
 use crate::relations::{extract, pod_template, selector_matches};
 use crate::watch::ObjMsg;
 use serde_json::{Map, Value};
@@ -29,7 +30,7 @@ CREATE TABLE IF NOT EXISTS events (
   verb TEXT NOT NULL, api_group TEXT NOT NULL, resource TEXT NOT NULL, subresource TEXT NOT NULL,
   namespace TEXT NOT NULL, name TEXT NOT NULL, code INTEGER NOT NULL,
   source_ip TEXT NOT NULL, user_agent TEXT NOT NULL, request_uri TEXT NOT NULL, request_object TEXT,
-  source TEXT NOT NULL DEFAULT 'k8s', user_id TEXT NOT NULL DEFAULT '', link_id INTEGER, story_id INTEGER,
+  source TEXT NOT NULL DEFAULT 'k8s', user_id TEXT NOT NULL DEFAULT '', link_id INTEGER, story_id INTEGER, hash TEXT, received_ms INTEGER,
   UNIQUE(cluster, audit_id)
 );
 CREATE INDEX IF NOT EXISTS events_ts ON events(ts_ms);
@@ -75,6 +76,15 @@ CREATE TABLE IF NOT EXISTS users (
   local INTEGER NOT NULL, created_ms INTEGER NOT NULL, deleted_ms INTEGER,
   PRIMARY KEY (user_id, uid)
 );
+CREATE TABLE IF NOT EXISTS chain (cluster TEXT PRIMARY KEY, head_id INTEGER NOT NULL, head_hash TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS chain_base (cluster TEXT PRIMARY KEY, base_id INTEGER NOT NULL, base_hash TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS anchors (
+  id INTEGER PRIMARY KEY, cluster TEXT NOT NULL, event_id INTEGER NOT NULL, hash TEXT NOT NULL, at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS forward_cursor (
+  target TEXT PRIMARY KEY, event_id INTEGER NOT NULL DEFAULT 0, anchor_id INTEGER NOT NULL DEFAULT 0,
+  last_ok_ms INTEGER, last_error TEXT
+);
 CREATE TABLE IF NOT EXISTS listing (
   cluster TEXT NOT NULL, api_group TEXT NOT NULL, resource TEXT NOT NULL, first INTEGER NOT NULL,
   PRIMARY KEY (cluster, api_group, resource)
@@ -91,6 +101,8 @@ const ADDED_COLUMNS: &[(&str, &str)] = &[
     ("user_id", "TEXT NOT NULL DEFAULT ''"),
     ("link_id", "INTEGER"),
     ("story_id", "INTEGER"),
+    ("hash", "TEXT"),
+    ("received_ms", "INTEGER"),
 ];
 
 /// A Rancher record that was matched to the downstream record of the same action is shown
@@ -245,6 +257,60 @@ pub struct RoleChange {
     pub by: Option<String>,
     /// "rancher_sync": a built-in role Rancher changed itself (typically on upgrade).
     pub reason: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChainReport {
+    pub cluster: String,
+    /// Records before this were removed by retention; the chain is checked from here.
+    pub base_id: i64,
+    pub verified: i64,
+    /// The first record whose link does not match: something was changed, inserted or removed.
+    pub first_bad_id: Option<i64>,
+    pub head_id: i64,
+    pub head_hash: String,
+}
+
+/// A record as sent to a SIEM.
+#[derive(Debug, Serialize, Clone)]
+pub struct ForwardRecord {
+    pub id: i64,
+    pub cluster: String,
+    pub ts: String,
+    pub source: String,
+    pub audit_id: String,
+    pub actor: String,
+    pub user_id: String,
+    pub principal: String,
+    pub human: bool,
+    pub via: String,
+    pub caller: String,
+    pub verb: String,
+    pub api_group: String,
+    pub resource: String,
+    pub subresource: String,
+    pub namespace: String,
+    pub name: String,
+    pub code: i64,
+    pub source_ip: String,
+    pub user_agent: String,
+    pub rules: Vec<String>,
+    pub risky: bool,
+    pub story_id: Option<i64>,
+    /// This record's link in its cluster's chain.
+    pub hash: Option<String>,
+    /// From the matched Rancher record, when there is one.
+    pub rancher_user_agent: Option<String>,
+    pub rancher_source_ip: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct Anchor {
+    pub id: i64,
+    pub cluster: String,
+    pub event_id: i64,
+    pub hash: String,
+    pub at_ms: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -551,6 +617,20 @@ impl Store {
                 }
                 stored += 1;
                 let id = tx.last_insert_rowid();
+                let (via, ts, source) = (r.via.as_str(), r.ts.to_rfc3339(), r.source.as_str());
+                let fields = Fields {
+                    cluster: cl, audit_id: &r.audit_id, source, ts: &ts, actor: &r.actor, principal: &r.principal, user_id: &r.user_id,
+                    human: r.human, via, caller: &r.caller, verb: &r.verb, api_group: &r.api_group, resource: &r.resource,
+                    subresource: &r.subresource, namespace: &r.namespace, name: &r.name, code: r.code, source_ip: &r.source_ip,
+                    user_agent: &r.user_agent, request_uri: &r.request_uri, request_object: body.as_deref(),
+                };
+                let prev: String = tx.query_row("SELECT head_hash FROM chain WHERE cluster=?1", params![cl], |x| x.get(0)).optional()?.unwrap_or_default();
+                let h = link(&prev, &fields);
+                tx.execute("UPDATE events SET hash=?1, received_ms=?3 WHERE id=?2", params![h, id, Utc::now().timestamp_millis()])?;
+                tx.execute(
+                    "INSERT INTO chain (cluster, head_id, head_hash) VALUES (?1,?2,?3) ON CONFLICT(cluster) DO UPDATE SET head_id=excluded.head_id, head_hash=excluded.head_hash",
+                    params![cl, id, h],
+                )?;
                 for a in alerts {
                     al.execute(params![id, a.rule, a.severity])?;
                 }
@@ -797,6 +877,163 @@ impl Store {
             })?
             .collect::<Result<_, _>>()?;
         Ok(rows)
+    }
+
+    /// Walk each cluster's chain from its base and report the first record that does not fit.
+    pub fn verify_chain(&self, cluster: Option<&str>) -> anyhow::Result<Vec<ChainReport>> {
+        let c = self.conn.lock().unwrap();
+        let clusters: Vec<String> = c
+            .prepare("SELECT cluster FROM chain WHERE (?1 IS NULL OR cluster=?1) ORDER BY cluster")?
+            .query_map(params![cluster], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        let mut out = Vec::new();
+        for cl in clusters {
+            let (base_id, mut prev): (i64, String) =
+                c.query_row("SELECT base_id, base_hash FROM chain_base WHERE cluster=?1", params![cl], |r| Ok((r.get(0)?, r.get(1)?))).optional()?.unwrap_or((0, String::new()));
+            let mut st = c.prepare_cached(
+                "SELECT id, audit_id, source, ts, actor, principal, user_id, human, via, caller, verb, api_group, resource, subresource,
+                        namespace, name, code, source_ip, user_agent, request_uri, request_object, hash
+                 FROM events WHERE cluster=?1 AND id > ?2 AND hash IS NOT NULL ORDER BY id",
+            )?;
+            let mut rows = st.query(params![cl, base_id])?;
+            let (mut verified, mut first_bad, mut head) = (0i64, None, (base_id, prev.clone()));
+            while let Some(r) = rows.next()? {
+                let g = |i: usize| -> rusqlite::Result<String> { r.get(i) };
+                let (id, ro, stored): (i64, Option<String>, String) = (r.get(0)?, r.get(20)?, r.get(21)?);
+                let (aid, src, ts, actor, pr, uid, via, caller, verb, grp, res, sub, ns, name, sip, ua, uri) =
+                    (g(1)?, g(2)?, g(3)?, g(4)?, g(5)?, g(6)?, g(8)?, g(9)?, g(10)?, g(11)?, g(12)?, g(13)?, g(14)?, g(15)?, g(17)?, g(18)?, g(19)?);
+                let fields = Fields {
+                    cluster: &cl, audit_id: &aid, source: &src, ts: &ts, actor: &actor, principal: &pr, user_id: &uid,
+                    human: r.get::<_, i64>(7)? == 1, via: &via, caller: &caller, verb: &verb, api_group: &grp, resource: &res,
+                    subresource: &sub, namespace: &ns, name: &name, code: r.get(16)?, source_ip: &sip, user_agent: &ua,
+                    request_uri: &uri, request_object: ro.as_deref(),
+                };
+                if link(&prev, &fields) != stored {
+                    first_bad = Some(id);
+                    break;
+                }
+                prev = stored;
+                head = (id, prev.clone());
+                verified += 1;
+            }
+            out.push(ChainReport { cluster: cl, base_id, verified, first_bad_id: first_bad, head_id: head.0, head_hash: head.1 });
+        }
+        Ok(out)
+    }
+
+    pub fn forward_cursor(&self, target: &str) -> anyhow::Result<(i64, i64)> {
+        let c = self.conn.lock().unwrap();
+        c.execute("INSERT OR IGNORE INTO forward_cursor (target) VALUES (?1)", params![target])?;
+        Ok(c.query_row("SELECT event_id, anchor_id FROM forward_cursor WHERE target=?1", params![target], |r| Ok((r.get(0)?, r.get(1)?)))?)
+    }
+
+    /// Move a target's cursor after a successful send, or record why it failed.
+    pub fn forward_done(&self, target: &str, event_id: Option<i64>, anchor_id: Option<i64>, error: Option<String>) -> anyhow::Result<()> {
+        let c = self.conn.lock().unwrap();
+        match error {
+            Some(e) => c.execute("UPDATE forward_cursor SET last_error=?2 WHERE target=?1", params![target, e])?,
+            None => c.execute(
+                "UPDATE forward_cursor SET event_id=coalesce(?2, event_id), anchor_id=coalesce(?3, anchor_id), last_ok_ms=?4, last_error=NULL WHERE target=?1",
+                params![target, event_id, anchor_id, Utc::now().timestamp_millis()],
+            )?,
+        };
+        Ok(())
+    }
+
+    /// Per target: last success, last error, records still to send.
+    pub fn forward_status(&self) -> anyhow::Result<Vec<(String, Option<i64>, Option<String>, i64)>> {
+        let c = self.conn.lock().unwrap();
+        let rows = c
+            .prepare(&format!(
+                "SELECT target, last_ok_ms, last_error, (SELECT count(*) FROM events e WHERE e.id > f.event_id AND {SHOWN}) FROM forward_cursor f ORDER BY target"
+            ))?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Records to forward: after the cursor, received at least the hold-back ago, and not the
+    /// hidden Rancher half of a paired action.
+    pub fn forward_records(&self, after_id: i64, received_before_ms: i64, limit: i64) -> anyhow::Result<Vec<ForwardRecord>> {
+        let c = self.conn.lock().unwrap();
+        // Stop at the first record still inside the hold-back so the cursor never skips one.
+        let upto: i64 = c.query_row(
+            "SELECT coalesce((SELECT min(id) - 1 FROM events WHERE id > ?1 AND received_ms > ?2), (SELECT coalesce(max(id), 0) FROM events))",
+            params![after_id, received_before_ms],
+            |r| r.get(0),
+        )?;
+        let mut st = c.prepare(&format!(
+            "SELECT e.id, e.cluster, e.ts, e.source, e.audit_id, e.actor, e.user_id, e.principal, e.human, e.via, e.caller, e.verb,
+                    e.api_group, e.resource, e.subresource, e.namespace, e.name, e.code, e.source_ip, e.user_agent, e.hash, e.story_id,
+                    (SELECT group_concat(rule) FROM alerts a WHERE a.event_id=e.id),
+                    (SELECT count(*) FROM alerts a WHERE a.event_id=e.id AND a.severity IN ('high','medium')),
+                    r.user_agent, r.source_ip
+             FROM events e LEFT JOIN events r ON r.id=e.link_id AND e.source='k8s'
+             WHERE e.id > ?1 AND e.id <= ?2 AND {SHOWN} ORDER BY e.id LIMIT ?3"
+        ))?;
+        let rows = st
+            .query_map(params![after_id, upto, limit], |r| {
+                let rules: Option<String> = r.get(22)?;
+                let rua: Option<String> = r.get(24)?;
+                Ok(ForwardRecord {
+                    id: r.get(0)?, cluster: r.get(1)?, ts: r.get(2)?, source: r.get(3)?, audit_id: r.get(4)?, actor: r.get(5)?,
+                    user_id: r.get(6)?, principal: r.get(7)?, human: r.get::<_, i64>(8)? == 1, via: r.get(9)?, caller: r.get(10)?,
+                    verb: r.get(11)?, api_group: r.get(12)?, resource: r.get(13)?, subresource: r.get(14)?, namespace: r.get(15)?,
+                    name: r.get(16)?, code: r.get(17)?, source_ip: r.get(18)?, user_agent: r.get(19)?, hash: r.get(20)?, story_id: r.get(21)?,
+                    rules: rules.map(|s| s.split(',').map(String::from).collect()).unwrap_or_default(),
+                    risky: r.get::<_, i64>(23)? > 0,
+                    rancher_user_agent: rua,
+                    rancher_source_ip: r.get(25)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Record the current head of every chain that moved since its last anchor.
+    pub fn take_anchors(&self, now: DateTime<Utc>) -> anyhow::Result<Vec<Anchor>> {
+        let c = self.conn.lock().unwrap();
+        let heads: Vec<(String, i64, String)> = c
+            .prepare(
+                "SELECT ch.cluster, ch.head_id, ch.head_hash FROM chain ch
+                 WHERE ch.head_id > coalesce((SELECT max(event_id) FROM anchors a WHERE a.cluster = ch.cluster), 0)",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        let mut out = Vec::new();
+        for (cluster, event_id, hash) in heads {
+            c.execute("INSERT INTO anchors (cluster, event_id, hash, at_ms) VALUES (?1,?2,?3,?4)", params![cluster, event_id, hash, ms(&now)])?;
+            out.push(Anchor { id: c.last_insert_rowid(), cluster, event_id, hash, at_ms: ms(&now) });
+        }
+        Ok(out)
+    }
+
+    pub fn anchors(&self, after_id: i64, limit: i64) -> anyhow::Result<Vec<Anchor>> {
+        let c = self.conn.lock().unwrap();
+        let rows = c
+            .prepare("SELECT id, cluster, event_id, hash, at_ms FROM anchors WHERE id > ?1 ORDER BY id LIMIT ?2")?
+            .query_map(params![after_id, limit], |r| Ok(Anchor { id: r.get(0)?, cluster: r.get(1)?, event_id: r.get(2)?, hash: r.get(3)?, at_ms: r.get(4)? }))?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Check an anchor kept elsewhere: the chain must be intact up to that record and the
+    /// record must still carry that hash.
+    pub fn check_anchor(&self, cluster: &str, event_id: i64, hash: &str) -> anyhow::Result<&'static str> {
+        let report = self.verify_chain(Some(cluster))?;
+        let Some(r) = report.first() else { return Ok("unknown_cluster") };
+        if r.first_bad_id.is_some_and(|b| b <= event_id) {
+            return Ok("chain_broken");
+        }
+        if event_id <= r.base_id {
+            return Ok("pruned");
+        }
+        let stored: Option<String> = self.conn.lock().unwrap().query_row("SELECT hash FROM events WHERE id=?1 AND cluster=?2", params![event_id, cluster], |x| x.get(0)).optional()?.flatten();
+        Ok(match stored {
+            Some(h) if h == hash => "match",
+            Some(_) => "mismatch",
+            None => "missing",
+        })
     }
 
     /// Keep the user directory current. One row per lifetime of a user ID: an external
@@ -1296,11 +1533,30 @@ impl Store {
             "DELETE FROM versions WHERE observed_ms < ?1 AND id NOT IN (SELECT max(id) FROM versions GROUP BY cluster, api_group, resource, namespace, name)",
             params![cutoff],
         )?;
-        // Keep events that kept versions still point at, so their author is not lost.
-        let n = c.execute(
-            "DELETE FROM events WHERE ts_ms < ?1 AND id NOT IN (SELECT event_id FROM versions WHERE event_id IS NOT NULL)",
+        // Events go oldest-first by ID, up to the first one still inside the retention, so each
+        // cluster's chain stays one unbroken run; the last removed link becomes its new base.
+        // Records that arrived late (old time, new ID) wait until everything before them goes.
+        let last: Option<i64> = c.query_row(
+            "SELECT CASE WHEN EXISTS (SELECT 1 FROM events WHERE ts_ms >= ?1) THEN (SELECT min(id) - 1 FROM events WHERE ts_ms >= ?1) ELSE (SELECT max(id) FROM events) END",
             params![cutoff],
+            |r| r.get(0),
         )?;
+        let mut n = 0;
+        if let Some(last) = last.filter(|l| *l > 0) {
+            c.execute(
+                "INSERT INTO chain_base (cluster, base_id, base_hash)
+                   SELECT e.cluster, e.id, e.hash FROM events e
+                   WHERE e.hash IS NOT NULL AND e.id = (SELECT max(id) FROM events x WHERE x.cluster = e.cluster AND x.id <= ?1 AND x.hash IS NOT NULL)
+                 ON CONFLICT(cluster) DO UPDATE SET base_id=excluded.base_id, base_hash=excluded.base_hash",
+                params![last],
+            )?;
+            // Keep events that kept versions still point at, so their author is not lost.
+            n = c.execute(
+                "DELETE FROM events WHERE id <= ?1 AND id NOT IN (SELECT event_id FROM versions WHERE event_id IS NOT NULL)",
+                params![last],
+            )?;
+        }
+        c.execute("DELETE FROM anchors WHERE at_ms < ?1", params![cutoff])?;
         c.execute("DELETE FROM hourly WHERE hour_ms < ?1", params![cutoff])?;
         c.execute("DELETE FROM stories WHERE last_ms < ?1", params![cutoff])?;
         Ok(n + m)
@@ -1637,6 +1893,31 @@ mod tests {
         let (at, by, reason) = s.access_removal("local", "clusterroletemplatebindings", "c-m-1", "crtb-x", "u-dave", mid, later).unwrap();
         assert!(at.is_some() && by.is_none());
         assert_eq!(reason, Some("rancher_cleanup"));
+    }
+
+    #[test]
+    fn chain_detects_tampering_and_survives_retention() {
+        let s = Store::open(":memory:").unwrap();
+        for (i, ts) in ["2026-09-01T00:00:00Z", "2026-09-02T00:00:00Z", "2026-10-14T00:00:00Z", "2026-10-14T01:00:00Z"].iter().enumerate() {
+            s.insert_event("c1", &patch(&format!("p{i}"), "alice", ts), &[]).unwrap();
+        }
+        let r = &s.verify_chain(None).unwrap()[0];
+        assert_eq!((r.verified, r.first_bad_id), (4, None));
+        let anchor = s.take_anchors(Utc::now()).unwrap().remove(0);
+        assert!(s.take_anchors(Utc::now()).unwrap().is_empty(), "nothing new to anchor");
+        assert_eq!(s.check_anchor("c1", anchor.event_id, &anchor.hash).unwrap(), "match");
+
+        // Retention removes the two September records; what is left still verifies.
+        let now = Utc.with_ymd_and_hms(2026, 10, 15, 0, 0, 0).unwrap();
+        s.prune(30, now).unwrap();
+        let r = &s.verify_chain(None).unwrap()[0];
+        assert_eq!((r.base_id, r.verified, r.first_bad_id), (2, 2, None));
+
+        // Someone edits a stored record directly.
+        s.conn.lock().unwrap().execute("UPDATE events SET actor='mallory' WHERE audit_id='p2'", []).unwrap();
+        let r = &s.verify_chain(None).unwrap()[0];
+        assert_eq!(r.first_bad_id, Some(3));
+        assert_eq!(s.check_anchor("c1", anchor.event_id, &anchor.hash).unwrap(), "chain_broken");
     }
 
     #[test]

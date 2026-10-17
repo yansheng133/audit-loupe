@@ -5,6 +5,8 @@ mod collect;
 mod config;
 mod demo;
 mod diff;
+mod forward;
+mod integrity;
 mod rancher;
 mod relations;
 mod rules;
@@ -58,6 +60,21 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
+    // Chain anchors every hour; forwarding sends them out with the records.
+    let s = store.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            let s = s.clone();
+            if let Ok(Err(e)) = tokio::task::spawn_blocking(move || s.take_anchors(chrono::Utc::now())).await {
+                warn!(error = %e, "anchor failed");
+            }
+        }
+    });
+    let targets = forward::targets_from_env()?;
+    if !targets.is_empty() {
+        forward::Forwarder::new(store.clone(), targets)?.spawn();
+    }
     let (s, days) = (store.clone(), cfg.retention_days);
     tokio::spawn(async move {
         loop {

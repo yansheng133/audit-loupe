@@ -120,7 +120,23 @@ helm install audit-loupe deploy/chart -n audit-loupe-system -f values-downstream
 - collect-file 以 root 身分唯讀讀取 audit log（檔案權限 0600），但不帶任何 capability、根檔案系統唯讀。
 - 每座叢集的收集元件要能連到 server 的 ingest 位址（HTTPS 443），防火牆請放行。
 
-## 5. UI extension
+## 5. 轉送 SIEM 與防竄改
+
+server 在寫入時把每座叢集的紀錄串成雜湊鏈，每小時記一次鏈的最新位置（錨點）。在 `server.forward` 設定轉送目標後，整理過的紀錄與錨點會一起送出：
+
+```yaml
+server:
+  forward:
+    syslog: tls://siem.example.com:6514   # 或 splunkHec、webhook，可同時設定
+    caSecret: siem-ca                     # 私有 CA 時
+```
+
+- 送出的是整理過的紀錄（身分鏈、叢集、物件、風險規則、雜湊），不是原始 log。syslog 為 RFC 5424，內容為 JSON；中、高風險為 warning，其餘為 notice。
+- 每個目標各自記錄送到哪裡，目標暫時無法連線時會累積、恢復後補送。`/api/forwarding` 看得到積壓量與最後一次錯誤。
+- **雜湊鏈要搭配外部的錨點才有意義**：鏈存在同一個資料庫裡，能改資料庫的人也能重算整條鏈。錨點送到 SIEM（或其他不能事後修改的地方）之後，可以用 `/api/integrity/anchor?cluster=&event_id=&hash=` 比對現在的資料是否與當時一致。沒有設定轉送時，雜湊鏈只能偵測意外損毀。
+- `/api/integrity` 逐座叢集驗證整條鏈，回報第一筆對不上的紀錄。
+
+## 6. UI extension
 
 Rancher 的 Extensions 頁面加入 Audit Loupe 的 extension repository 後安裝（repository 由 `ui/` 的 GitHub Actions 產生）。安裝後：
 
@@ -128,7 +144,7 @@ Rancher 的 Extensions 頁面加入 Audit Loupe 的 extension repository 後安�
 - 每座叢集的 Dashboard 多一張卡片，點了直接以該叢集篩選開啟。
 - server 不在 local 時，第一次開啟會詢問 server 所在的叢集 ID，記在這台瀏覽器。
 
-## 6. 誰看得到稽核資料
+## 7. 誰看得到稽核資料
 
 UI 透過 Rancher 的 service proxy 讀 server，所以由 Rancher 的權限決定：要有 server 所在叢集 `audit-loupe-system` namespace 的 `services/proxy` get 權限。給稽核人員的 Role 範例：
 
@@ -147,7 +163,7 @@ rules:
 
 再以 RoleBinding 綁給稽核人員的使用者或 IdP 群組。
 
-## 7. 移除
+## 8. 移除
 
 ```bash
 helm uninstall audit-loupe -n audit-loupe-system

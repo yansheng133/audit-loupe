@@ -141,16 +141,20 @@ dependencies = [
  "kube",
  "reqwest",
  "rusqlite",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "sha2",
  "subtle",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tower",
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
+ "webpki-roots",
 ]
 
 [[package]]

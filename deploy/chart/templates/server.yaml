@@ -71,6 +71,25 @@ spec:
             - { name: AL_WORK_HOURS, value: {{ .Values.server.workHours | quote }} }
             - { name: AL_WORK_DAYS, value: {{ .Values.server.workDays | quote }} }
             - { name: AL_RETENTION_DAYS, value: {{ .Values.server.retentionDays | quote }} }
+            {{- with .Values.server.forward }}
+            {{- if .syslog }}
+            - { name: AL_FORWARD_SYSLOG, value: {{ .syslog | quote }} }
+            {{- end }}
+            {{- if .splunkHec }}
+            - { name: AL_FORWARD_SPLUNK_HEC, value: {{ .splunkHec | quote }} }
+            - { name: AL_FORWARD_SPLUNK_TOKEN_FILE, value: /etc/audit-loupe/forward/splunk-token }
+            {{- end }}
+            {{- if .webhook }}
+            - { name: AL_FORWARD_WEBHOOK, value: {{ .webhook | quote }} }
+            {{- if .secret }}
+            - { name: AL_FORWARD_WEBHOOK_TOKEN_FILE, value: /etc/audit-loupe/forward/webhook-token }
+            {{- end }}
+            {{- end }}
+            {{- if .caSecret }}
+            - { name: AL_FORWARD_CA_FILE, value: /etc/audit-loupe/forward-ca/ca.crt }
+            {{- end }}
+            - { name: AL_FORWARD_DELAY_SECONDS, value: {{ .delaySeconds | quote }} }
+            {{- end }}
           ports:
             - { name: api, containerPort: 8080 }
             - { name: ingest, containerPort: 8081 }
@@ -85,7 +104,21 @@ spec:
           volumeMounts:
             - { name: data, mountPath: /data }
             - { name: tokens, mountPath: /etc/audit-loupe/tokens, readOnly: true }
+            {{- if .Values.server.forward.secret }}
+            - { name: forward, mountPath: /etc/audit-loupe/forward, readOnly: true }
+            {{- end }}
+            {{- if .Values.server.forward.caSecret }}
+            - { name: forward-ca, mountPath: /etc/audit-loupe/forward-ca, readOnly: true }
+            {{- end }}
       volumes:
+        {{- if .Values.server.forward.secret }}
+        - name: forward
+          secret: { secretName: {{ .Values.server.forward.secret }} }
+        {{- end }}
+        {{- if .Values.server.forward.caSecret }}
+        - name: forward-ca
+          secret: { secretName: {{ .Values.server.forward.caSecret }}, items: [{ key: ca.crt, path: ca.crt }] }
+        {{- end }}
         - name: data
           persistentVolumeClaim:
             claimName: audit-loupe-data

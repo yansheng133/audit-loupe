@@ -39,6 +39,17 @@ server:
   resources:
     requests: { cpu: 100m, memory: 128Mi }
     limits: { memory: 512Mi }
+  # Send processed records and hourly chain anchors to the SIEM. Anchors kept outside this
+  # database are what make the tamper-evidence chain meaningful.
+  forward:
+    syslog: ""        # tls://siem.example.com:6514 | tcp://host:514 | udp://host:514
+    splunkHec: ""     # https://splunk.example.com:8088/services/collector/event
+    webhook: ""       # https://...
+    # Secret with keys "splunk-token" and/or "webhook-token" as needed.
+    secret: ""
+    # Secret with key ca.crt for a private CA.
+    caSecret: ""
+    delaySeconds: 30
 
 # ---------------------------------------------------------------------------
 # Collectors: what this cluster sends, and where.

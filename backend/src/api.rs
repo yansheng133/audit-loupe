@@ -185,6 +185,46 @@ async fn history(State(s): State<AppState>, Q(p): Q<HistoryParams>) -> Response 
 }
 
 #[derive(Deserialize)]
+struct ChainParams {
+    cluster: Option<String>,
+}
+
+/// Verify every cluster's chain of records.
+async fn integrity(State(s): State<AppState>, Q(p): Q<ChainParams>) -> Response {
+    let store = s.store.clone();
+    match tokio::task::spawn_blocking(move || store.verify_chain(p.cluster.as_deref().filter(|c| !c.is_empty()))).await {
+        Ok(Ok(rows)) => Json(rows).into_response(),
+        Ok(Err(e)) => err(e),
+        Err(e) => err(e.into()),
+    }
+}
+
+/// Forwarding targets: last success, last error, records still to send.
+async fn forwarding(State(s): State<AppState>) -> Response {
+    match s.store.forward_status() {
+        Ok(rows) => Json(rows.into_iter().map(|(t, ok, e, pending)| json!({"target": t, "lastOkMs": ok, "lastError": e, "pending": pending})).collect::<Vec<_>>()).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct AnchorParams {
+    cluster: String,
+    event_id: i64,
+    hash: String,
+}
+
+/// Check an anchor kept outside (e.g. in the SIEM) against what is stored now.
+async fn integrity_anchor(State(s): State<AppState>, Q(p): Q<AnchorParams>) -> Response {
+    let store = s.store.clone();
+    match tokio::task::spawn_blocking(move || store.check_anchor(&p.cluster, p.event_id, &p.hash)).await {
+        Ok(Ok(result)) => Json(json!({"result": result})).into_response(),
+        Ok(Err(e)) => err(e),
+        Err(e) => err(e.into()),
+    }
+}
+
+#[derive(Deserialize)]
 struct AtParams {
     at: Option<DateTime<Utc>>,
     user: Option<String>,
@@ -366,6 +406,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/history", get(history))
         .route("/api/related", get(related))
         .route("/api/hourly", get(hourly))
+        .route("/api/integrity", get(integrity))
+        .route("/api/forwarding", get(forwarding))
+        .route("/api/integrity/anchor", get(integrity_anchor))
         .route("/api/access", get(access))
         .route("/api/access/diff", get(access_diff))
         .route("/api/access/csv", get(access_csv))
