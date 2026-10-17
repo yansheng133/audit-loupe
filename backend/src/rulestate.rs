@@ -37,6 +37,7 @@ DROP TABLE IF EXISTS rc_alerts;
 DROP TABLE IF EXISTS rc_stories;
 DROP TABLE IF EXISTS rc_hourly;
 DROP TABLE IF EXISTS rc_story_of;
+DROP TABLE IF EXISTS rc_counted;
 "#;
 
 const SHADOW_CREATE: &str = r#"
@@ -52,6 +53,7 @@ CREATE TABLE rc_hourly (
   PRIMARY KEY (cluster, hour_ms, actor_key)
 );
 CREATE TABLE rc_story_of (event_id INTEGER PRIMARY KEY, story_id INTEGER NOT NULL);
+CREATE TABLE rc_counted (event_id INTEGER PRIMARY KEY);
 "#;
 
 /// Records judged per second when no run has been timed here yet. The `judging_speed` test
@@ -296,8 +298,9 @@ impl Store {
     }
 
     /// Start judging every stored record again with the current settings, in the background.
-    /// Returns false when one is already running or nothing needs it.
-    pub fn start_recompute(&self) -> anyhow::Result<bool> {
+    /// Returns false when one is already running, or nothing needs it and `force` is off
+    /// (force covers records whose settings history is not known, e.g. from before upgrading).
+    pub fn start_recompute(&self, force: bool) -> anyhow::Result<bool> {
         {
             let mut job = self.job.lock().unwrap();
             if job.as_ref().is_some_and(|j| j.state == "running") {
@@ -308,7 +311,7 @@ impl Store {
                 let c = self.conn.lock().unwrap();
                 (Self::pending(&c, &fp)?, c.query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))?)
             };
-            if pending.is_none() {
+            if pending.is_none() && (!force || total == 0) {
                 return Ok(false);
             }
             *job = Some(Job { state: "running", done: 0, total, started_ms: Utc::now().timestamp_millis(), finished_ms: None, error: None });
@@ -342,14 +345,18 @@ impl Store {
     /// Judge loaded records into the shadow tables, the way records are judged on arrival.
     fn judge_rows(&self, c: &Connection, rows: &[Loaded]) -> anyhow::Result<()> {
         let mut al = c.prepare_cached("INSERT INTO rc_alerts (event_id, rule, severity) VALUES (?1, ?2, ?3)")?;
+        // Hourly counts and stories older than retention were pruned; records kept past it
+        // (still referenced by a version) must not bring them back.
+        let cutoff = Utc::now().timestamp_millis() - self.cfg.retention_days * 86_400_000;
         for (id, cluster, ts_ms, hidden, r) in rows {
             let alerts = judge(r, cluster, &self.cfg, c)?;
             for a in &alerts {
                 al.execute(params![id, a.rule, a.severity])?;
             }
-            if *hidden {
+            if *hidden || *ts_ms < cutoff {
                 continue;
             }
+            c.prepare_cached("INSERT OR IGNORE INTO rc_counted (event_id) VALUES (?1)")?.execute(params![id])?;
             let key = if r.user_id.is_empty() { r.actor.as_str() } else { r.user_id.as_str() };
             if crate::store::counts(r, &alerts) {
                 Store::bump_in(c, Tables::SHADOW, cluster, *ts_ms, key, r.human, 1, !alerts.is_empty() as i64)?;
@@ -371,18 +378,30 @@ impl Store {
     fn recompute(&self) -> anyhow::Result<()> {
         let started = Instant::now();
         let started_ms = Utc::now().timestamp_millis();
-        let (run_id, max_id, total) = {
-            let c = self.conn.lock().unwrap();
-            c.execute_batch(SHADOW)?;
-            c.execute_batch(SHADOW_CREATE)?;
+        let setup = || -> anyhow::Result<(i64, i64, i64)> {
+            let mut c = self.conn.lock().unwrap();
+            let tx = c.transaction()?;
+            tx.execute_batch(SHADOW)?;
+            tx.execute_batch(SHADOW_CREATE)?;
+            // New story IDs continue after the current ones, so an ID already sent to the SIEM
+            // never names a different story. The placeholder row is left out at the swap.
+            tx.execute(
+                "INSERT INTO rc_stories (id, cluster, actor_key, via, severity, first_ms, last_ms, count)
+                 VALUES ((SELECT coalesce(max(id), 0) FROM stories), '', '', '', '', 0, 0, 0)",
+                [],
+            )?;
             let (fp, _) = crate::rules::fingerprint(&self.cfg);
-            let sid: i64 = c.query_row("SELECT id FROM rule_settings WHERE fingerprint=?1 ORDER BY id DESC LIMIT 1", params![fp], |r| r.get(0))?;
-            c.execute("INSERT INTO recomputes (settings_id, started_ms) VALUES (?1, ?2)", params![sid, started_ms])?;
-            let run_id = c.last_insert_rowid();
-            let max_id: i64 = c.query_row("SELECT coalesce(max(id), 0) FROM events", [], |r| r.get(0))?;
-            let total: i64 = c.query_row("SELECT count(*) FROM events", [], |r| r.get(0))?;
-            (run_id, max_id, total)
+            let sid: i64 = tx.query_row("SELECT id FROM rule_settings WHERE fingerprint=?1 ORDER BY id DESC LIMIT 1", params![fp], |r| r.get(0))?;
+            let max_id: i64 = tx.query_row("SELECT coalesce(max(id), 0) FROM events", [], |r| r.get(0))?;
+            let total: i64 = tx.query_row("SELECT count(*) FROM events", [], |r| r.get(0))?;
+            tx.execute("INSERT INTO recomputes (settings_id, started_ms) VALUES (?1, ?2)", params![sid, started_ms])?;
+            let run_id = tx.last_insert_rowid();
+            tx.commit()?;
+            Ok((run_id, max_id, total))
         };
+        let (run_id, max_id, total) = setup().inspect_err(|_| {
+            let _ = self.conn.lock().unwrap().execute_batch(SHADOW);
+        })?;
         let fail = |e: anyhow::Error| -> anyhow::Error {
             let c = self.conn.lock().unwrap();
             let _ = c.execute_batch(SHADOW);
@@ -411,6 +430,12 @@ impl Store {
                 break;
             }
         }
+        #[cfg(test)]
+        tests::MID_RUN.with(|h| {
+            if let Some(f) = h.borrow_mut().take() {
+                f(self);
+            }
+        });
         // Then, holding the lock: whatever arrived meanwhile, and the swap.
         let swap = || -> anyhow::Result<i64> {
             let mut c = self.conn.lock().unwrap();
@@ -420,18 +445,37 @@ impl Store {
                 .query_map(params![max_id], record_of)?
                 .collect::<Result<_, _>>()?;
             self.judge_rows(&tx, &late)?;
+            // A Rancher half judged early on its own may have been matched to its downstream
+            // record during the run: take it back out, as ingest does.
+            let paired: Vec<(i64, String, i64, String, Option<i64>, i64, bool)> = tx
+                .prepare(&format!(
+                    "SELECT e.id, e.cluster, e.ts_ms, {key}, s.story_id, (SELECT count(*) FROM rc_alerts a WHERE a.event_id=e.id), e.human
+                     FROM rc_counted c JOIN events e ON e.id=c.event_id LEFT JOIN rc_story_of s ON s.event_id=e.id
+                     WHERE e.source='rancher' AND e.link_id IS NOT NULL",
+                    key = "CASE WHEN e.user_id<>'' THEN e.user_id ELSE e.actor END"
+                ))?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get::<_, i64>(6)? == 1)))?
+                .collect::<Result<_, _>>()?;
+            for (id, cluster, ts_ms, key, story, alerts, human) in paired {
+                Store::bump_in(&tx, Tables::SHADOW, &cluster, ts_ms, &key, human, -1, -((alerts > 0) as i64))?;
+                if let Some(sid) = story {
+                    tx.execute("DELETE FROM rc_story_of WHERE event_id=?1", params![id])?;
+                    tx.execute("UPDATE rc_stories SET count=count-1 WHERE id=?1", params![sid])?;
+                    tx.execute("DELETE FROM rc_stories WHERE id=?1 AND count<=0", params![sid])?;
+                }
+            }
             let upto: i64 = tx.query_row("SELECT coalesce(max(id), 0) FROM events", [], |r| r.get(0))?;
             tx.execute_batch(
                 "DELETE FROM alerts;
                  INSERT INTO alerts (event_id, rule, severity) SELECT a.event_id, a.rule, a.severity FROM rc_alerts a JOIN events e ON e.id=a.event_id;
                  DELETE FROM stories;
                  INSERT INTO stories (id, cluster, actor_key, via, severity, first_ms, last_ms, count)
-                   SELECT id, cluster, actor_key, via, severity, first_ms, last_ms, count FROM rc_stories;
+                   SELECT id, cluster, actor_key, via, severity, first_ms, last_ms, count FROM rc_stories WHERE count > 0;
                  UPDATE events SET story_id=NULL WHERE story_id IS NOT NULL;
                  UPDATE events SET story_id=(SELECT story_id FROM rc_story_of WHERE event_id=events.id) WHERE id IN (SELECT event_id FROM rc_story_of);
                  DELETE FROM hourly;
                  INSERT INTO hourly (cluster, hour_ms, actor_key, human, writes, alerts)
-                   SELECT cluster, hour_ms, actor_key, human, writes, alerts FROM rc_hourly;",
+                   SELECT cluster, hour_ms, actor_key, human, writes, alerts FROM rc_hourly WHERE writes <> 0 OR alerts <> 0;",
             )?;
             tx.execute_batch(SHADOW)?;
             let (from_ms, to_ms): (Option<i64>, Option<i64>) = tx.query_row("SELECT min(ts_ms), max(ts_ms) FROM events", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -455,7 +499,13 @@ mod tests {
     use super::*;
     use crate::audit::{parse_body, to_record};
     use crate::config::Config;
+    use std::cell::RefCell;
     use std::sync::Arc;
+
+    thread_local! {
+        /// Runs between the chunked pass and the swap, to act out records arriving mid-run.
+        pub static MID_RUN: RefCell<Option<Box<dyn FnOnce(&Store)>>> = RefCell::new(None);
+    }
 
     fn exec(id: &str, user: &str, ns: &str, ts: &str) -> Record {
         let ev = format!(r#"{{"auditID":"{id}","stage":"ResponseStarted","verb":"create",
@@ -502,7 +552,7 @@ mod tests {
                 (cl, k, sev, f, l, n, evs)
             })
             .collect();
-        let hourly = c.prepare("SELECT cluster, hour_ms, actor_key, human, writes, alerts FROM hourly ORDER BY 1,2,3").unwrap()
+        let hourly = c.prepare("SELECT cluster, hour_ms, actor_key, human, writes, alerts FROM hourly WHERE writes <> 0 OR alerts <> 0 ORDER BY 1,2,3").unwrap()
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         (alerts, stories, hourly)
     }
@@ -564,7 +614,7 @@ mod tests {
         s.insert_event("c1", &exec("e4", "carol", "shop", "2026-10-15T02:00:00Z")).unwrap();
         assert_eq!(s.rule_status().unwrap().pending.unwrap().events, 8);
 
-        assert!(s.start_recompute().unwrap());
+        assert!(s.start_recompute(false).unwrap());
         let j = wait(&s);
         assert_eq!((j.state, j.done, j.total), ("done", 9, 9));
         assert_eq!(medium(&s), vec!["high"; 3], "e1, e3 and e4; e2 is exempt now");
@@ -578,7 +628,7 @@ mod tests {
         let after = s.verify_chain(None).unwrap();
         assert!(after.iter().all(|c| c.first_bad_id.is_none()));
         assert_eq!(after.iter().map(|c| c.verified).sum::<i64>(), chain.iter().map(|c| c.verified).sum::<i64>() + 1);
-        assert!(!s.start_recompute().unwrap(), "nothing left to judge again");
+        assert!(!s.start_recompute(false).unwrap(), "nothing left to judge again");
     }
 
     #[test]
@@ -621,6 +671,57 @@ mod tests {
         assert_eq!(st.recomputes[0].error.as_deref(), Some("stopped by a restart"));
         let left: i64 = s.conn.lock().unwrap().query_row("SELECT count(*) FROM sqlite_master WHERE name LIKE 'rc\\_%' ESCAPE '\\'", [], |r| r.get(0)).unwrap();
         assert_eq!(left, 0, "shadow tables are dropped");
+    }
+
+    #[test]
+    fn a_pair_completed_during_the_run_is_counted_once() {
+        let live = Store::open(":memory:").unwrap();
+        live.insert_event("local", &rancher_put("r1", "2026-10-14T02:00:01Z")).unwrap();
+        live.insert_event("c1", &exec("e1", "u-1", "shop", "2026-10-14T02:00:30Z")).unwrap();
+        live.insert_event("c1", &patch("k1", "2026-10-14T02:00:00.900Z")).unwrap();
+        let expected = snapshot(&live);
+
+        let s = Store::open(":memory:").unwrap();
+        s.insert_event("local", &rancher_put("r1", "2026-10-14T02:00:01Z")).unwrap();
+        s.insert_event("c1", &exec("e1", "u-1", "shop", "2026-10-14T02:00:30Z")).unwrap();
+        // The downstream half arrives while the run is between its passes.
+        MID_RUN.with(|h| *h.borrow_mut() = Some(Box::new(|s: &Store| {
+            s.insert_event("c1", &patch("k1", "2026-10-14T02:00:00.900Z")).unwrap();
+        })));
+        s.recompute().unwrap();
+        let got = snapshot(&s);
+        assert_eq!(got.0, expected.0);
+        assert_eq!(got.2, expected.2, "hourly");
+        assert_eq!(got.1.iter().map(|x| (&x.2, x.5, x.6.len())).collect::<Vec<_>>(), expected.1.iter().map(|x| (&x.2, x.5, x.6.len())).collect::<Vec<_>>(), "stories");
+    }
+
+    #[test]
+    fn records_kept_past_retention_do_not_bring_back_counts_and_story_ids_move_on() {
+        let s = Store::open(":memory:").unwrap();
+        let old = (chrono::Utc::now() - chrono::Duration::days(60)).to_rfc3339();
+        let new = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        s.insert_event("c1", &exec("e0", "alice", "shop", &old)).unwrap();
+        s.insert_event("c1", &exec("e1", "alice", "shop", &new)).unwrap();
+        s.conn.lock().unwrap().execute_batch("DELETE FROM hourly WHERE hour_ms < strftime('%s','now','-30 days')*1000; DELETE FROM stories WHERE last_ms < strftime('%s','now','-30 days')*1000;").unwrap();
+        let before = snapshot(&s);
+        let max_story: i64 = s.conn.lock().unwrap().query_row("SELECT max(id) FROM stories", [], |r| r.get(0)).unwrap();
+        s.recompute().unwrap();
+        let after = snapshot(&s);
+        assert_eq!(after.0.len(), 2, "both records keep their alerts");
+        assert_eq!(after.2, before.2, "no hourly row for the old record");
+        assert_eq!(after.1.len(), 1);
+        let ids: Vec<i64> = s.conn.lock().unwrap().prepare("SELECT id FROM stories").unwrap().query_map([], |r| r.get(0)).unwrap().map(|x| x.unwrap()).collect();
+        assert!(ids.iter().all(|i| *i > max_story), "{ids:?} after {max_story}");
+    }
+
+    #[test]
+    fn force_runs_without_a_recorded_change() {
+        let s = Store::open(":memory:").unwrap();
+        assert!(!s.start_recompute(true).unwrap(), "nothing stored");
+        s.insert_event("c1", &patch("k1", "2026-10-14T02:00:00Z")).unwrap();
+        assert!(!s.start_recompute(false).unwrap());
+        assert!(s.start_recompute(true).unwrap());
+        assert_eq!(wait(&s).state, "done");
     }
 
     /// Timing for the estimate shown before re-judging: `cargo test --release -- --ignored judging_speed --nocapture`.

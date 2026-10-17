@@ -68,10 +68,12 @@ export default {
         }
       }
     },
-    async start() {
+    // force: judge everything again even when no settings change is recorded (records from
+    // before this version, or to check).
+    async start(force = false) {
       this.msg = '';
       try {
-        await postJson('/api/rules/recompute');
+        await postJson(`/api/rules/recompute${ force ? '?force=1' : '' }`);
         this.watching = true;
       } catch (e) {
         this.msg = e.status === 403 ? this.R.forbidden : (e.status === 409 ? this.R.busy : this.R.failed(e.message));
@@ -121,7 +123,7 @@ export default {
       <button
         class="btn-al on"
         type="button"
-        @click="start"
+        @click="start()"
       >
         {{ R.start }}
       </button>

@@ -140,7 +140,9 @@ fn parse_until(s: &str, tz: &chrono_tz::Tz) -> Option<i64> {
         return Some(t.timestamp_millis());
     }
     let d = NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?.succ_opt()?;
-    let t = tz.from_local_datetime(&d.and_hms_opt(0, 0, 0)?).earliest()?;
+    let midnight = d.and_hms_opt(0, 0, 0)?;
+    // Where the clocks skip midnight (a DST change at 00:00), the day starts an hour later.
+    let t = tz.from_local_datetime(&midnight).earliest().or_else(|| tz.from_local_datetime(&(midnight + chrono::Duration::hours(1))).earliest())?;
     Some(t.timestamp_millis())
 }
 
@@ -497,6 +499,13 @@ mod tests {
         assert!(err(r#"{"pod_exec": {"except": [{"namespaces": ["a"], "reason": "x", "until": "next week"}]}}"#).contains("until"));
         assert!(err(r#"{"pod_exec": {"enable": false}}"#).contains("unknown field"));
         assert_eq!(RuleSet::parse("", &tz).unwrap(), RuleSet::default());
+    }
+
+    #[test]
+    fn until_on_a_day_whose_midnight_is_skipped() {
+        // Chile moves the clocks from 00:00 to 01:00 on 6 September 2026.
+        let t = parse_until("2026-09-05", &chrono_tz::America::Santiago).unwrap();
+        assert_eq!(t, chrono::DateTime::parse_from_rfc3339("2026-09-06T01:00:00-03:00").unwrap().timestamp_millis());
     }
 
     #[test]

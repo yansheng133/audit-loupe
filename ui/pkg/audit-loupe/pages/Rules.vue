@@ -71,14 +71,14 @@ export default {
           }
         }
         if (parts.length) {
-          out.push(`${ this.T.rules[r.id] || r.id }：${ parts.join('、') }`);
+          out.push(`${ this.T.rules[r.id] || r.id }${ this.P.sep[0] }${ parts.join(this.P.sep[1]) }`);
         }
       }
       if (settings?.changeWindows?.length) {
         out.push(this.P.windows(settings.changeWindows.length));
       }
 
-      return out.length ? out.join('；') : this.P.same;
+      return out.length ? out.join(this.P.sep[2]) : this.P.same;
     },
   },
 };
@@ -99,7 +99,10 @@ export default {
         </button>
       </div>
     </div>
-    <RecomputeBanner @done="load" />
+    <RecomputeBanner
+      ref="banner"
+      @done="load"
+    />
     <div
       v-if="error"
       class="banner-al"
@@ -125,6 +128,19 @@ export default {
           </p>
           <p class="muted">
             {{ P.windows(status.changeWindows) }}
+          </p>
+          <p
+            v-if="!status.pending && status.job?.state !== 'running'"
+            class="muted"
+          >
+            {{ P.forceHint }}
+            <button
+              class="btn-al"
+              type="button"
+              @click="$refs.banner.start(true)"
+            >
+              {{ P.force }}
+            </button>
           </p>
           <table class="tbl">
             <thead>
@@ -177,13 +193,13 @@ export default {
                       <span
                         v-for="[k, v] in scopes(x)"
                         :key="k"
-                      >{{ k }}：<code>{{ v }}</code>　</span>
-                      <div>{{ P.reason }}：{{ x.reason }}</div>
+                      >{{ k }}{{ P.sep[0] }}<code>{{ v }}</code>　</span>
+                      <div>{{ P.reason }}{{ P.sep[0] }}{{ x.reason }}</div>
                       <div
                         v-if="x.until"
                         class="muted"
                       >
-                        {{ P.until(x.until) }}<span v-if="expired(x)">（{{ P.expired }}）</span>
+                        {{ P.until(x.until) }}<span v-if="expired(x)"> ({{ P.expired }})</span>
                       </div>
                     </li>
                   </ul>

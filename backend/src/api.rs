@@ -122,8 +122,15 @@ async fn rules(State(s): State<AppState>) -> Response {
 
 /// Judge every stored record again with the settings in force. Through the Rancher service
 /// proxy a POST needs "create" on services/proxy, which plain viewers do not have.
-async fn recompute(State(s): State<AppState>) -> Response {
-    match tokio::task::spawn_blocking(move || s.store.start_recompute()).await {
+#[derive(Deserialize)]
+struct RecomputeParams {
+    /// force=1: judge everything again even when no settings change is recorded.
+    force: Option<u8>,
+}
+
+async fn recompute(State(s): State<AppState>, Q(p): Q<RecomputeParams>) -> Response {
+    let force = p.force == Some(1);
+    match tokio::task::spawn_blocking(move || s.store.start_recompute(force)).await {
         Ok(Ok(true)) => (StatusCode::ACCEPTED, Json(json!({"started": true}))).into_response(),
         Ok(Ok(false)) => (StatusCode::CONFLICT, Json(json!({"started": false, "error": "already running, or nothing to judge again"}))).into_response(),
         Ok(Err(e)) => err(e),

@@ -53,6 +53,8 @@ const ZH = {
     scope: { clusters: '叢集', namespaces: 'namespace', namespaceLabels: 'namespace label', users: '使用者', resources: '資源' },
     windows: (n) => (n ? `已設定 ${ n } 個變更窗口：「非上班時間」不作用，改由「變更窗口外」判斷。` : '沒有設定變更窗口：用上班時間判斷「非上班時間」，「變更窗口外」不作用。'),
     history: '設定變更紀錄', since: '生效時間', code: '設定代碼', current: '目前', summary: '和預設不同的地方', same: '和預設相同',
+    sep: ['：', '、', '；'],
+    force: '重新計算全部紀錄', forceHint: '所有紀錄都已用目前的設定判斷過。升級前就存在的紀錄無從得知當時的設定，如有疑慮可以全部重新計算一次。',
     recomputes: '重新計算紀錄', ran: '執行時間', covered: '涵蓋的紀錄時間', records: '筆數', result: '結果', ok: '完成', inProgress: '進行中',
     what_: {
       namespace_deleted: '刪除 namespace',
@@ -152,6 +154,8 @@ const EN = {
     scope: { clusters: 'clusters', namespaces: 'namespaces', namespaceLabels: 'namespace labels', users: 'users', resources: 'resources' },
     windows: (n) => (n ? `${ n } change windows set: "Outside working hours" is off and "Outside change window" decides instead.` : 'No change windows set: working hours decide "Outside working hours", and "Outside change window" is off.'),
     history: 'Settings history', since: 'In force from', code: 'Settings code', current: 'current', summary: 'Differs from the defaults', same: 'Same as the defaults',
+    sep: [': ', ', ', '; '],
+    force: 'Judge all records again', forceHint: 'Every record was judged by the current settings. For records stored before this version the settings then are unknown; judge them all again if in doubt.',
     recomputes: 'Re-judging runs', ran: 'Ran', covered: 'Records from', records: 'Records', result: 'Result', ok: 'done', inProgress: 'running',
     what_: {
       namespace_deleted: 'A namespace is deleted',
