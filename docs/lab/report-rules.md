@@ -135,9 +135,9 @@ lab 沒有設定 syslog、Splunk 或 webhook 轉送，沒有做。
 
 | 項目 | 狀態 |
 |---|---|
-| server 規則設定 | 測試設定（pod_exec 高＋例外、secret_read 關）**仍在**，待 Sam 決定是否改回預設 |
-| namespace `al-rules-a`、`al-rules-b` 與其中的 Pod | **仍在**（待清） |
-| m1-m2 留下的測試帳號 `al-lab-member`、`al-lab-noproxy`，Role／RoleBinding `audit-loupe-viewer` | **仍在**（m1-m2 的收尾沒有執行；第 5 步沿用了 `al-lab-noproxy`） |
+| server 規則設定 | 已改回預設（`server.rules` 拿掉），並重新計算一次：50,868 筆、89 毫秒 |
+| namespace `al-rules-a`、`al-rules-b` 與其中的 Pod | 已刪 |
+| m1-m2 留下的測試帳號 `al-lab-member`、`al-lab-noproxy`，Role／RoleBinding `audit-loupe-viewer` | 已刪（含 Mac 上存放對應 token 的鑰匙圈項目） |
 | 第 5 步登入產生的 session token | 已登出 |
 | port-forward | 都綁 127.0.0.1，用完即關 |
 | 本機暫存（截圖、API 快照、log） | 在 Mac 的 lab 資料夾，不進 repo |
