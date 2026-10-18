@@ -1,0 +1,145 @@
+{
+  "kind": "Event",
+  "apiVersion": "audit.k8s.io/v1",
+  "level": "Request",
+  "auditID": "3705f966-a50a-4596-8fee-817201a9f23f",
+  "stage": "ResponseComplete",
+  "requestURI": "/apis/apps/v1/namespaces/al-lab-test/deployments/al-demo?timeout=15m0s",
+  "verb": "update",
+  "user": {
+    "username": "system:serviceaccount:cattle-system:cattle",
+    "uid": "786fd9cd-d0a9-45c3-9956-39879c889a91",
+    "groups": [
+      "system:serviceaccounts",
+      "system:serviceaccounts:cattle-system",
+      "system:authenticated"
+    ],
+    "extra": {
+      "authentication.kubernetes.io/credential-id": [
+        "JTI=<masked>"
+      ],
+      "authentication.kubernetes.io/node-name": [
+        "node-1.example.com"
+      ],
+      "authentication.kubernetes.io/node-uid": [
+        "857a4f65-c4ad-4212-ad24-a147c6336a7e"
+      ],
+      "authentication.kubernetes.io/pod-name": [
+        "cattle-cluster-agent-5858787fb9-dkxwk"
+      ],
+      "authentication.kubernetes.io/pod-uid": [
+        "60a53f52-0f6f-4389-a5e1-d24e443e8210"
+      ]
+    }
+  },
+  "impersonatedUser": {
+    "username": "user-kgw7z",
+    "groups": [
+      "system:authenticated",
+      "system:cattle:authenticated"
+    ],
+    "extra": {
+      "principalid": [
+        "local://user-kgw7z"
+      ],
+      "requesthost": [
+        "localhost:8443"
+      ],
+      "requesttokenid": [
+        "<masked>"
+      ],
+      "username": [
+        "admin"
+      ]
+    }
+  },
+  "sourceIPs": [
+    "198.51.100.78"
+  ],
+  "userAgent": "agent/v0.0.0 (linux/arm64) kubernetes/$Format",
+  "objectRef": {
+    "resource": "deployments",
+    "namespace": "al-lab-test",
+    "name": "al-demo",
+    "apiGroup": "apps",
+    "apiVersion": "v1",
+    "resourceVersion": "11407429"
+  },
+  "responseStatus": {
+    "metadata": {},
+    "code": 200
+  },
+  "requestObject": {
+    "kind": "Deployment",
+    "apiVersion": "apps/v1",
+    "metadata": {
+      "name": "al-demo",
+      "namespace": "al-lab-test",
+      "resourceVersion": "11407429",
+      "labels": {
+        "al-gap-test": "during-gap"
+      },
+      "annotations": {
+        "deployment.kubernetes.io/revision": "1",
+        "kubectl.kubernetes.io/last-applied-configuration": "{\"apiVersion\":\"apps/v1\",\"kind\":\"Deployment\",\"metadata\":{\"annotations\":{},\"name\":\"al-demo\",\"namespace\":\"al-lab-test\"},\"spec\":{\"replicas\":1,\"selector\":{\"matchLabels\":{\"app\":\"al-demo\"}},\"template\":{\"metadata\":{\"labels\":{\"app\":\"al-demo\"}},\"spec\":{\"containers\":[{\"command\":[\"sleep\",\"infinity\"],\"image\":\"registry.suse.com/bci/bci-micro:16.0\",\"name\":\"app\",\"resources\":{\"requests\":{\"cpu\":\"5m\",\"memory\":\"8Mi\"}}}]}}}}\n"
+      }
+    },
+    "spec": {
+      "replicas": 2,
+      "selector": {
+        "matchLabels": {
+          "app": "al-demo"
+        }
+      },
+      "template": {
+        "metadata": {
+          "labels": {
+            "app": "al-demo"
+          }
+        },
+        "spec": {
+          "containers": [
+            {
+              "name": "app",
+              "image": "registry.suse.com/bci/bci-micro:16.0",
+              "command": [
+                "sleep",
+                "infinity"
+              ],
+              "resources": {
+                "requests": {
+                  "cpu": "5m",
+                  "memory": "8Mi"
+                }
+              },
+              "terminationMessagePath": "/dev/termination-log",
+              "terminationMessagePolicy": "File",
+              "imagePullPolicy": "IfNotPresent"
+            }
+          ],
+          "restartPolicy": "Always",
+          "terminationGracePeriodSeconds": 30,
+          "dnsPolicy": "ClusterFirst",
+          "securityContext": {},
+          "schedulerName": "default-scheduler"
+        }
+      },
+      "strategy": {
+        "type": "RollingUpdate",
+        "rollingUpdate": {
+          "maxUnavailable": "25%",
+          "maxSurge": "25%"
+        }
+      },
+      "revisionHistoryLimit": 10,
+      "progressDeadlineSeconds": 600
+    },
+    "status": {}
+  },
+  "requestReceivedTimestamp": "2026-10-17T06:25:21.481778Z",
+  "stageTimestamp": "2026-10-17T06:25:21.484918Z",
+  "annotations": {
+    "authorization.k8s.io/decision": "<masked>",
+    "authorization.k8s.io/reason": "<masked>"
+  }
+}
