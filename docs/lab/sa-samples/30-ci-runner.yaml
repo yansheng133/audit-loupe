@@ -1,0 +1,77 @@
+# 3. ci-runner: every 5 minutes creates a short-lived Pod, waits for it to finish, reads its
+#    log and deletes it, like the Jenkins Kubernetes plugin running an agent per build.
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: ci-runner, namespace: al-sample }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: ci-runner, namespace: al-sample }
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: ci-runner, namespace: al-sample }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: ci-runner }
+subjects: [{ kind: ServiceAccount, name: ci-runner, namespace: al-sample }]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: ci-runner-script, namespace: al-sample }
+data:
+  job.json: |
+    {"apiVersion":"v1","kind":"Pod",
+     "metadata":{"generateName":"ci-job-","labels":{"app":"ci-job"}},
+     "spec":{"restartPolicy":"Never","automountServiceAccountToken":false,
+       "containers":[{"name":"job","image":"registry.suse.com/bci/bci-micro:16.0",
+         "command":["sh","-c","echo build started; sleep 10; echo build ok"],
+         "resources":{"requests":{"cpu":"5m","memory":"8Mi"},"limits":{"memory":"32Mi"}}}]}}
+  run.sh: |
+    #!/bin/bash
+    SA=/var/run/secrets/kubernetes.io/serviceaccount
+    API=https://kubernetes.default.svc
+    P=$API/api/v1/namespaces/al-sample/pods
+    UA="ci-runner-sample/1.0 (simulates jenkins-kubernetes-plugin)"
+    req() {
+      printf 'Authorization: Bearer %s\n' "$(cat $SA/token)" \
+        | curl -sS --cacert $SA/ca.crt -A "$UA" -H @- "$@"
+    }
+    while true; do
+      name=$(req -X POST -H 'Content-Type: application/json' --data-binary @/scripts/job.json "$P" \
+        | grep -o '"name":"ci-job-[a-z0-9]*"' | head -1 | cut -d'"' -f4)
+      echo "$(date -u +%FT%TZ) created ${name:-FAILED}"
+      if [ -n "$name" ]; then
+        for _ in $(seq 60); do
+          phase=$(req "$P/$name" | grep -o '"phase":"[A-Za-z]*"' | head -1 | cut -d'"' -f4)
+          case "$phase" in Succeeded|Failed) break;; esac
+          sleep 3
+        done
+        echo "$(date -u +%FT%TZ) $name $phase log: $(req "$P/$name/log" | tr '\n' ' ')"
+        req -X DELETE -o /dev/null -w "%{http_code}" "$P/$name"; echo " deleted $name"
+      fi
+      sleep 300
+    done
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: ci-runner, namespace: al-sample }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: ci-runner } }
+  template:
+    metadata: { labels: { app: ci-runner } }
+    spec:
+      serviceAccountName: ci-runner
+      containers:
+        - name: runner
+          image: registry.suse.com/bci/bci-base:16.0
+          command: ["/bin/bash", "/scripts/run.sh"]
+          resources: { requests: { cpu: 5m, memory: 16Mi }, limits: { memory: 64Mi } }
+          volumeMounts: [{ name: scripts, mountPath: /scripts }]
+      volumes: [{ name: scripts, configMap: { name: ci-runner-script } }]

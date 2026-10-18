@@ -1,0 +1,28 @@
+# 4. external-tool: a legacy Secret-based ServiceAccount token, used from outside the cluster
+#    (external-tool.sh) to list Pods every 60 s straight against the apiserver.
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: external-tool, namespace: al-sample }
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: external-tool-token
+  namespace: al-sample
+  annotations:
+    kubernetes.io/service-account.name: external-tool
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: external-tool, namespace: al-sample }
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: external-tool, namespace: al-sample }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: external-tool }
+subjects: [{ kind: ServiceAccount, name: external-tool, namespace: al-sample }]

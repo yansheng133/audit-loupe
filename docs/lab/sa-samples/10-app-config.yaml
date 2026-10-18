@@ -1,0 +1,75 @@
+# 1. app-config: every 30 s reads one ConfigMap and one Secret of its own namespace with its
+#    ServiceAccount token, like Spring Cloud Kubernetes reloading configuration.
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: app-config, namespace: al-sample }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: app-config-data, namespace: al-sample }
+data:
+  application.properties: |
+    greeting=hello
+---
+apiVersion: v1
+kind: Secret
+metadata: { name: app-config-secret, namespace: al-sample }
+stringData:
+  db-password: not-a-real-password
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: app-config, namespace: al-sample }
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["app-config-data"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["app-config-secret"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: app-config, namespace: al-sample }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: app-config }
+subjects: [{ kind: ServiceAccount, name: app-config, namespace: al-sample }]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: app-config-script, namespace: al-sample }
+data:
+  run.sh: |
+    #!/bin/bash
+    # The token is read from the projected file for every request and sent on stdin.
+    SA=/var/run/secrets/kubernetes.io/serviceaccount
+    API=https://kubernetes.default.svc
+    UA="app-config-sample/1.0 (simulates spring-cloud-kubernetes)"
+    get() {
+      printf 'Authorization: Bearer %s\n' "$(cat $SA/token)" \
+        | curl -sS -o /dev/null -w "%{http_code} $1\n" --cacert $SA/ca.crt -A "$UA" -H @- "$API$1"
+    }
+    while true; do
+      echo "$(date -u +%FT%TZ) $(get /api/v1/namespaces/al-sample/configmaps/app-config-data)"
+      echo "$(date -u +%FT%TZ) $(get /api/v1/namespaces/al-sample/secrets/app-config-secret)"
+      sleep 30
+    done
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: app-config, namespace: al-sample }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: app-config } }
+  template:
+    metadata: { labels: { app: app-config } }
+    spec:
+      serviceAccountName: app-config
+      containers:
+        - name: app
+          image: registry.suse.com/bci/bci-base:16.0
+          command: ["/bin/bash", "/scripts/run.sh"]
+          resources: { requests: { cpu: 5m, memory: 16Mi }, limits: { memory: 64Mi } }
+          volumeMounts: [{ name: scripts, mountPath: /scripts }]
+      volumes: [{ name: scripts, configMap: { name: app-config-script } }]
