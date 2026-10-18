@@ -1,0 +1,68 @@
+# 2. pod-watcher: list and watch every Pod in the cluster, like kube-state-metrics. Lists
+#    once, then watches from the last resourceVersion it saw (5-minute watches, bookmarks on);
+#    lists again only when a watch cannot resume.
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: pod-watcher, namespace: al-sample }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: al-sample-pod-watcher }
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: al-sample-pod-watcher }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: al-sample-pod-watcher }
+subjects: [{ kind: ServiceAccount, name: pod-watcher, namespace: al-sample }]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: pod-watcher-script, namespace: al-sample }
+data:
+  run.sh: |
+    #!/bin/bash
+    SA=/var/run/secrets/kubernetes.io/serviceaccount
+    API=https://kubernetes.default.svc
+    UA="pod-watcher-sample/1.0 (simulates kube-state-metrics)"
+    req() {
+      printf 'Authorization: Bearer %s\n' "$(cat $SA/token)" \
+        | curl -sS -N --cacert $SA/ca.crt -A "$UA" -H @- "$@"
+    }
+    rv=""
+    while true; do
+      if [ -z "$rv" ]; then
+        rv=$(req --max-time 60 "$API/api/v1/pods?limit=500" | grep -o '"resourceVersion":"[0-9]*"' | head -1 | grep -o '[0-9]*')
+        echo "$(date -u +%FT%TZ) list rv=$rv"
+        [ -z "$rv" ] && { sleep 10; continue; }
+      fi
+      # Each line of the stream is one event; remember the last resourceVersion seen.
+      last=$(req --max-time 330 "$API/api/v1/pods?watch=1&allowWatchBookmarks=true&timeoutSeconds=300&resourceVersion=$rv" \
+        | while read -r line; do
+            case "$line" in *'"code":410'*|*'"type":"ERROR"'*) echo gone; break;; esac
+            echo "$line" | grep -o '"resourceVersion":"[0-9]*"' | head -1 | grep -o '[0-9]*'
+          done | tail -1)
+      if [ "$last" = gone ] || [ -z "$last" ]; then rv=""; else rv=$last; fi
+      echo "$(date -u +%FT%TZ) watch ended, next rv=${rv:-relist}"
+    done
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: pod-watcher, namespace: al-sample }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: pod-watcher } }
+  template:
+    metadata: { labels: { app: pod-watcher } }
+    spec:
+      serviceAccountName: pod-watcher
+      containers:
+        - name: watcher
+          image: registry.suse.com/bci/bci-base:16.0
+          command: ["/bin/bash", "/scripts/run.sh"]
+          resources: { requests: { cpu: 5m, memory: 16Mi }, limits: { memory: 64Mi } }
+          volumeMounts: [{ name: scripts, mountPath: /scripts }]
+      volumes: [{ name: scripts, configMap: { name: pod-watcher-script } }]

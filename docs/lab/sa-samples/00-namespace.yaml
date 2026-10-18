@@ -1,0 +1,8 @@
+# SA sample traffic for the volume lab. Everything lives in al-sample; each sample has its
+# own ServiceAccount with only the permissions it needs.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: al-sample
+  labels:
+    audit-loupe.dev/lab: sample
