@@ -247,7 +247,7 @@ mod tests {
         let ev = r#"{"auditID":"x1","stage":"ResponseComplete","verb":"delete","user":{"username":"system:admin"},
           "objectRef":{"resource":"namespaces","name":"legacy"},"responseStatus":{"code":200},"stageTimestamp":"2026-10-14T15:00:00Z"}"#;
         let r = to_record(&parse_body(ev.replace('\n', " ").as_bytes()).unwrap()[0]).unwrap();
-        s.insert_event("c1", &r, &crate::rules::evaluate(&r, &crate::config::Config::test())).unwrap();
+        s.insert_event("c1", &r).unwrap();
         s.take_anchors(chrono::Utc::now()).unwrap();
         s
     }

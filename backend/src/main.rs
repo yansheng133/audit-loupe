@@ -12,6 +12,7 @@ mod rancher;
 mod relations;
 mod restore;
 mod rules;
+mod rulestate;
 mod store;
 mod watch;
 mod windows;
@@ -35,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
         other => anyhow::bail!("unknown command {other:?}; use server, collect-file, collect-rancher, collect-watch, collect-neuvector or seed-demo"),
     }
     let cfg = Arc::new(config::Config::from_env()?);
-    let store = store::Store::open(&cfg.db_path)?;
+    let store = store::Store::open_with(&cfg.db_path, cfg.clone())?;
     if cmd == "seed-demo" {
         demo::seed(&store, &cfg)?;
         info!(db = %cfg.db_path, "demo data written");

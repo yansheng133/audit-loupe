@@ -35,6 +35,26 @@ server:
   #    clusters: [c-m-xxxxx]
   #    ranges: [{ from: "2026-10-20T22:00:00+08:00", to: "2026-10-21T02:00:00+08:00" }]
   changeWindows: []
+  # Rule settings. Anything not listed keeps its default; a mistake (unknown rule or field,
+  # missing reason) stops the server from starting, with the place named in its log.
+  # Rules: namespace_deleted, rbac_changed, pod_exec, bypassed_rancher, gitops_bypassed,
+  # outside_change_window, user_deleted, secret_read, credential_issued, off_hours,
+  # forbidden, login_failed. Severity: high, medium or low.
+  # An exception lists where a rule does not apply; every field given must match, "*" is a
+  # wildcard, users match the name, Rancher user ID or IdP principal, resources are
+  # "secrets" or "deployments.apps". until (optional) is a date (end of that day in
+  # server.timezone) or an RFC 3339 time.
+  #  pod_exec:
+  #    severity: high
+  #    except:
+  #      - namespaces: ["dev-*"]
+  #        reason: 開發環境允許除錯
+  #        until: "2026-12-31"
+  #  secret_read:
+  #    enabled: false
+  # After a change, records stored earlier keep their old judgement; the UI offers to judge
+  # them again.
+  rules: {}
   persistence:
     # SQLite on a volume. Empty storageClass uses the cluster default; RKE2 ships none.
     storageClass: ""

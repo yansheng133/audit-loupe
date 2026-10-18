@@ -84,8 +84,8 @@ export default {
 
       return `${ String(d.getHours()).padStart(2, '0') }:${ String(d.getMinutes()).padStart(2, '0') }:${ String(d.getSeconds()).padStart(2, '0') }`;
     },
-    sev(r) {
-      return RULE_SEV[r] || 'low';
+    sev(e, r) {
+      return e.sev?.[r] || RULE_SEV[r] || 'low';
     },
   },
 };
@@ -132,7 +132,7 @@ export default {
                 v-for="r in e.alerts"
                 :key="r"
                 class="pill"
-                :class="sev(r)"
+                :class="sev(e, r)"
               >{{ T.rules[r] || r }}</span>
             </span>
           </span>

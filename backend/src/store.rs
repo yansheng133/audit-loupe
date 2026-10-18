@@ -2,7 +2,7 @@
 
 use crate::audit::{Record, Source, Via};
 use crate::diff::{diff, normalize, same_content, Change};
-use crate::rules::Alert;
+use crate::rules::{judge, Alert, Lookup};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Serialize;
@@ -10,12 +10,16 @@ use crate::integrity::{link, Fields};
 use crate::relations::{extract, pod_template, selector_matches};
 use crate::watch::ObjMsg;
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 pub struct Store {
-    conn: Arc<Mutex<Connection>>,
+    pub(crate) conn: Arc<Mutex<Connection>>,
+    /// Settings that decide alerts (rules, change windows, working hours).
+    pub(crate) cfg: Arc<crate::config::Config>,
+    /// The re-judging of stored records after a settings change, when one has run.
+    pub(crate) job: Arc<Mutex<Option<crate::rulestate::Job>>>,
 }
 
 const SCHEMA: &str = r#"
@@ -184,6 +188,8 @@ pub struct EventRow {
     pub request_uri: String,
     pub request_object: Option<Value>,
     pub alerts: Vec<String>,
+    /// Severity of each alert as judged (by the settings in force then, or at the last re-judging).
+    pub alert_severity: BTreeMap<String, String>,
     /// Set when the change was matched to a stored object version.
     pub version_id: Option<i64>,
     pub changes: Option<Vec<Change>>,
@@ -397,6 +403,7 @@ pub struct StoryEvent {
     pub namespace: String,
     pub name: String,
     pub alerts: Vec<String>,
+    pub alert_severity: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -458,11 +465,57 @@ const WORKLOAD_KINDS: &str = "('Deployment','StatefulSet','DaemonSet','Job','Cro
 const WRITE_VERBS: &str = "('create','update','patch','delete','deletecollection')";
 
 /// Whether a record counts as a change on the time axis: the same rule as the default timeline.
-fn counts(r: &Record, alerts: &[Alert]) -> bool {
+pub(crate) fn counts(r: &Record, alerts: &[Alert]) -> bool {
     crate::audit::is_write(&r.verb)
         || matches!(r.subresource.as_str(), "exec" | "attach" | "portforward")
         || r.source == Source::Rancher
         || !alerts.is_empty()
+}
+
+/// "rule:severity,rule:severity" as aggregated from the alerts table.
+fn rules_of(agg: &Option<String>) -> Vec<String> {
+    agg.as_deref().map(|s| s.split(',').map(|x| x.split(':').next().unwrap_or(x).to_string()).collect()).unwrap_or_default()
+}
+
+fn severities_of(agg: &Option<String>) -> BTreeMap<String, String> {
+    agg.as_deref()
+        .map(|s| s.split(',').filter_map(|x| x.split_once(':')).map(|(r, v)| (r.to_string(), v.to_string())).collect())
+        .unwrap_or_default()
+}
+
+/// Where alert-derived data goes: the live tables, or the shadow tables a re-judging fills
+/// before it replaces the live ones in one step.
+#[derive(Clone, Copy)]
+pub(crate) struct Tables {
+    pub stories: &'static str,
+    pub hourly: &'static str,
+    pub set_story: &'static str,
+}
+
+impl Tables {
+    pub const LIVE: Tables = Tables { stories: "stories", hourly: "hourly", set_story: "UPDATE events SET story_id=?1 WHERE id=?2" };
+    pub const SHADOW: Tables = Tables { stories: "rc_stories", hourly: "rc_hourly", set_story: "INSERT INTO rc_story_of (story_id, event_id) VALUES (?1, ?2)" };
+}
+
+/// The latest stored version of an object at a time; if none was stored by then (the object
+/// was first seen later), the earliest one.
+pub(crate) fn version_as_of(c: &Connection, cluster: &str, group: &str, resource: &str, ns: &str, name: &str, at_ms: i64) -> anyhow::Result<Option<Value>> {
+    let mut st = c.prepare_cached(
+        "SELECT body FROM versions WHERE cluster=?1 AND api_group=?2 AND resource=?3 AND namespace=?4 AND name=?5
+         ORDER BY observed_ms <= ?6 DESC, CASE WHEN observed_ms <= ?6 THEN -observed_ms ELSE observed_ms END, id DESC LIMIT 1",
+    )?;
+    let body: Option<String> = st.query_row(params![cluster, group, resource, ns, name, at_ms], |r| r.get(0)).optional()?;
+    Ok(body.and_then(|b| serde_json::from_str::<Value>(&b).ok()))
+}
+
+impl Lookup for Connection {
+    fn namespace_labels(&self, cluster: &str, ns: &str, at_ms: i64) -> anyhow::Result<Option<Map<String, Value>>> {
+        Ok(version_as_of(self, cluster, "", "namespaces", "", ns, at_ms)?
+            .and_then(|v| v.pointer("/metadata/labels").and_then(Value::as_object).cloned()))
+    }
+    fn fleet_source(&self, cluster: &str, group: &str, resource: &str, ns: &str, name: &str, at_ms: i64) -> anyhow::Result<Option<String>> {
+        Ok(version_as_of(self, cluster, group, resource, ns, name, at_ms)?.as_ref().and_then(fleet_marker))
+    }
 }
 
 fn ms(t: &DateTime<Utc>) -> i64 {
@@ -482,7 +535,13 @@ fn changes_for(change: &str, prev: Option<&Value>, body: &Value) -> Vec<Change> 
 }
 
 impl Store {
+    /// Open with the built-in rule settings.
+    #[cfg(test)]
     pub fn open(path: &str) -> anyhow::Result<Self> {
+        Self::open_with(path, Arc::new(crate::config::Config::defaults()))
+    }
+
+    pub fn open_with(path: &str, cfg: Arc<crate::config::Config>) -> anyhow::Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA)?;
@@ -507,7 +566,10 @@ impl Store {
             "CREATE INDEX IF NOT EXISTS events_pair ON events(cluster, user_id, source, ts_ms);
              CREATE INDEX IF NOT EXISTS events_link ON events(link_id);",
         )?;
-        Ok(Store { conn: Arc::new(Mutex::new(conn)) })
+        crate::rulestate::prepare(&conn)?;
+        let store = Store { conn: Arc::new(Mutex::new(conn)), cfg, job: Arc::new(Mutex::new(None)) };
+        store.register_settings(Utc::now().timestamp_millis())?;
+        Ok(store)
     }
 
     /// Match a newly stored record to the other half of the same action: the Rancher record
@@ -591,14 +653,20 @@ impl Store {
         Ok(out)
     }
 
-    fn bump(tx: &Transaction, cluster: &str, t: i64, key: &str, human: bool, writes: i64, alerts: i64) -> anyhow::Result<()> {
+    fn bump(tx: &Connection, cluster: &str, t: i64, key: &str, human: bool, writes: i64, alerts: i64) -> anyhow::Result<()> {
+        Self::bump_in(tx, Tables::LIVE, cluster, t, key, human, writes, alerts)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bump_in(tx: &Connection, tb: Tables, cluster: &str, t: i64, key: &str, human: bool, writes: i64, alerts: i64) -> anyhow::Result<()> {
         let hour = t - t.rem_euclid(3_600_000);
-        tx.execute(
-            "INSERT INTO hourly (cluster, hour_ms, actor_key, human, writes, alerts) VALUES (?1,?2,?3,?4,?5,?6)
+        tx.prepare_cached(&format!(
+            "INSERT INTO {h} (cluster, hour_ms, actor_key, human, writes, alerts) VALUES (?1,?2,?3,?4,?5,?6)
              ON CONFLICT(cluster, hour_ms, actor_key) DO UPDATE SET writes=writes+excluded.writes, alerts=alerts+excluded.alerts,
                human=max(human, excluded.human)",
-            params![cluster, hour, key, human as i64, writes, alerts],
-        )?;
+            h = tb.hourly
+        ))?
+        .execute(params![cluster, hour, key, human as i64, writes, alerts])?;
         Ok(())
     }
 
@@ -621,35 +689,42 @@ impl Store {
 
     /// Medium and high risk actions by the same person, the same way in, on the same cluster
     /// within 10 minutes of each other read as one story ("needs attention" list).
-    fn add_to_story(tx: &Transaction, id: i64, cluster: &str, key: &str, via: &str, t: i64, alerts: &[Alert]) -> anyhow::Result<()> {
+    fn add_to_story(tx: &Connection, id: i64, cluster: &str, key: &str, via: &str, t: i64, alerts: &[Alert]) -> anyhow::Result<()> {
+        Self::add_to_story_in(tx, Tables::LIVE, id, cluster, key, via, t, alerts)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn add_to_story_in(tx: &Connection, tb: Tables, id: i64, cluster: &str, key: &str, via: &str, t: i64, alerts: &[Alert]) -> anyhow::Result<()> {
         const GAP: i64 = 10 * 60_000;
         let sev = if alerts.iter().any(|a| a.severity == "high") { "high" } else { "medium" };
         let hit: Option<i64> = tx
-            .query_row(
-                "SELECT id FROM stories WHERE cluster=?1 AND actor_key=?2 AND via=?3 AND last_ms >= ?4 AND first_ms <= ?5
+            .prepare_cached(&format!(
+                "SELECT id FROM {st} WHERE cluster=?1 AND actor_key=?2 AND via=?3 AND last_ms >= ?4 AND first_ms <= ?5
                  ORDER BY abs(last_ms - ?6) LIMIT 1",
-                params![cluster, key, via, t - GAP, t + GAP, t],
-                |r| r.get(0),
-            )
+                st = tb.stories
+            ))?
+            .query_row(params![cluster, key, via, t - GAP, t + GAP, t], |r| r.get(0))
             .optional()?;
         let sid = match hit {
             Some(sid) => {
-                tx.execute(
-                    "UPDATE stories SET first_ms=min(first_ms, ?2), last_ms=max(last_ms, ?2), count=count+1,
+                tx.prepare_cached(&format!(
+                    "UPDATE {st} SET first_ms=min(first_ms, ?2), last_ms=max(last_ms, ?2), count=count+1,
                        severity=CASE WHEN severity='high' OR ?3='high' THEN 'high' ELSE 'medium' END WHERE id=?1",
-                    params![sid, t, sev],
-                )?;
+                    st = tb.stories
+                ))?
+                .execute(params![sid, t, sev])?;
                 sid
             }
             None => {
-                tx.execute(
-                    "INSERT INTO stories (cluster, actor_key, via, severity, first_ms, last_ms, count) VALUES (?1,?2,?3,?4,?5,?5,1)",
-                    params![cluster, key, via, sev, t],
-                )?;
+                tx.prepare_cached(&format!(
+                    "INSERT INTO {st} (cluster, actor_key, via, severity, first_ms, last_ms, count) VALUES (?1,?2,?3,?4,?5,?5,1)",
+                    st = tb.stories
+                ))?
+                .execute(params![cluster, key, via, sev, t])?;
                 tx.last_insert_rowid()
             }
         };
-        tx.execute("UPDATE events SET story_id=?1 WHERE id=?2", params![sid, id])?;
+        tx.prepare_cached(tb.set_story)?.execute(params![sid, id])?;
         Ok(())
     }
 
@@ -687,7 +762,7 @@ impl Store {
         drop(st);
         let mut ev = c.prepare_cached(
             "SELECT id, ts, verb, resource, subresource, namespace, name, actor,
-                    (SELECT group_concat(rule) FROM alerts a WHERE a.event_id=events.id)
+                    (SELECT group_concat(rule || ':' || severity) FROM alerts a WHERE a.event_id=events.id)
              FROM events WHERE story_id=?1 ORDER BY ts_ms",
         )?;
         for s in rows.iter_mut() {
@@ -696,7 +771,7 @@ impl Store {
                     let al: Option<String> = r.get(8)?;
                     Ok(StoryEvent {
                         id: r.get(0)?, ts: r.get(1)?, verb: r.get(2)?, resource: r.get(3)?, subresource: r.get(4)?,
-                        namespace: r.get(5)?, name: r.get(6)?, alerts: al.map(|a| a.split(',').map(String::from).collect()).unwrap_or_default(),
+                        namespace: r.get(5)?, name: r.get(6)?, alerts: rules_of(&al), alert_severity: severities_of(&al),
                     })
                 })?
                 .collect::<Result<_, _>>()?;
@@ -712,7 +787,7 @@ impl Store {
     /// Insert a batch in one transaction. Returns how many were new (collectors resend a batch
     /// that was not acknowledged, and exec sessions arrive twice). `cluster` is the sender's
     /// cluster; a record that names its own target cluster (Rancher proxy) goes there.
-    pub fn insert_events(&self, cluster: &str, batch: &[(Record, Vec<Alert>)]) -> anyhow::Result<usize> {
+    pub fn insert_events(&self, cluster: &str, batch: &[Record]) -> anyhow::Result<usize> {
         let mut c = self.conn.lock().unwrap();
         let tx = c.transaction()?;
         let mut stored = 0;
@@ -722,7 +797,7 @@ impl Store {
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
             )?;
             let mut al = tx.prepare_cached("INSERT INTO alerts (event_id, rule, severity) VALUES (?1,?2,?3)")?;
-            for (r, alerts) in batch {
+            for r in batch {
                 let cl = r.cluster.as_deref().unwrap_or(cluster);
                 // Request bodies are kept only for people; controller status writes are noise.
                 let body = if r.human { r.request_object.as_ref().map(|v| v.to_string()) } else { None };
@@ -750,13 +825,7 @@ impl Store {
                     "INSERT INTO chain (cluster, head_id, head_hash) VALUES (?1,?2,?3) ON CONFLICT(cluster) DO UPDATE SET head_id=excluded.head_id, head_hash=excluded.head_hash",
                     params![cl, id, h],
                 )?;
-                // A person writing to an object Fleet deploys: the change is not in Git.
-                let mut alerts = alerts.clone();
-                if r.human && crate::audit::is_write(&r.verb) && (200..300).contains(&r.code) && !r.name.is_empty()
-                    && Self::fleet_source(&tx, cl, &r.api_group, &r.resource, &r.namespace, &r.name)?.is_some() {
-                        alerts.push(Alert { rule: "gitops_bypassed", severity: "medium" });
-                    }
-                let alerts = &alerts;
+                let alerts = &judge(r, cl, &self.cfg, &*tx)?;
                 for a in alerts {
                     al.execute(params![id, a.rule, a.severity])?;
                 }
@@ -782,8 +851,8 @@ impl Store {
         Ok(stored)
     }
 
-    pub fn insert_event(&self, cluster: &str, r: &Record, alerts: &[Alert]) -> anyhow::Result<bool> {
-        Ok(self.insert_events(cluster, &[(r.clone(), alerts.to_vec())])? == 1)
+    pub fn insert_event(&self, cluster: &str, r: &Record) -> anyhow::Result<bool> {
+        Ok(self.insert_events(cluster, std::slice::from_ref(r))? == 1)
     }
 
     /// True if any version of this resource type was ever stored, i.e. a list is a re-list.
@@ -1646,20 +1715,6 @@ impl Store {
     }
 
     /// Labels of a namespace as last seen.
-    pub fn namespace_labels(&self, cluster: &str, ns: &str) -> anyhow::Result<Option<serde_json::Map<String, Value>>> {
-        let c = self.conn.lock().unwrap();
-        let body: Option<String> = c
-            .query_row(
-                "SELECT body FROM versions WHERE cluster=?1 AND api_group='' AND resource='namespaces' AND name=?2 ORDER BY id DESC LIMIT 1",
-                params![cluster, ns],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(body
-            .and_then(|b| serde_json::from_str::<Value>(&b).ok())
-            .and_then(|v| v.pointer("/metadata/labels").and_then(Value::as_object).cloned()))
-    }
-
     /// Namespace -> Rancher project ID, from the `field.cattle.io/projectId` label of each
     /// namespace's latest version.
     pub fn namespace_projects(&self, cluster: Option<&str>) -> anyhow::Result<Vec<(String, String, String)>> {
@@ -1685,7 +1740,7 @@ impl Store {
         let mut sql = String::from(
             "SELECT e.id,e.cluster,e.ts,e.actor,e.principal,e.human,e.via,e.caller,e.verb,e.api_group,e.resource,e.subresource,
                     e.namespace,e.name,e.code,e.source_ip,e.user_agent,e.request_uri,e.request_object,
-                    (SELECT group_concat(rule) FROM alerts a WHERE a.event_id=e.id),
+                    (SELECT group_concat(rule || ':' || severity) FROM alerts a WHERE a.event_id=e.id),
                     (SELECT v.id FROM versions v WHERE v.event_id=e.id ORDER BY v.id DESC LIMIT 1),
                     e.source,e.user_id,r.ts,r.user_agent,r.source_ip,r.request_uri,e.audit_id
              FROM events e LEFT JOIN events r ON r.id=e.link_id AND e.source='k8s'
@@ -1731,7 +1786,8 @@ impl Store {
                     api_group: r.get(9)?, resource: r.get(10)?, subresource: r.get(11)?, namespace: r.get(12)?,
                     name: r.get(13)?, code: r.get(14)?, source_ip: r.get(15)?, user_agent: r.get(16)?, request_uri: r.get(17)?,
                     request_object: ro.and_then(|s| serde_json::from_str(&s).ok()),
-                    alerts: al.map(|s| s.split(',').map(String::from).collect()).unwrap_or_default(),
+                    alerts: rules_of(&al),
+                    alert_severity: severities_of(&al),
                     version_id: r.get(20)?,
                     changes: None,
                     change: None,
@@ -1891,8 +1947,6 @@ impl Store {
 mod tests {
     use super::*;
     use crate::audit::{parse_body, to_record};
-    use crate::config::Config;
-    use crate::rules::evaluate;
     use chrono::TimeZone;
     use serde_json::json;
 
@@ -1924,8 +1978,8 @@ mod tests {
         let t1 = t0 + chrono::Duration::seconds(1);
         let vid = s.insert_version(&key(), "Deployment", "u1", &obj(5), "modified", t1).unwrap().unwrap();
         let r = patch("p1", "alice", "2026-10-14T02:00:00.600Z");
-        assert!(s.insert_event("c1", &r, &evaluate(&r, &Config::test())).unwrap());
-        assert!(!s.insert_event("c1", &r, &[]).unwrap(), "duplicates are ignored");
+        assert!(s.insert_event("c1", &r).unwrap());
+        assert!(!s.insert_event("c1", &r).unwrap(), "duplicates are ignored");
         assert_eq!(s.link_since(0).unwrap(), 1);
 
         let h = s.history(&key()).unwrap();
@@ -1949,8 +2003,8 @@ mod tests {
         // Watch lags: both versions are observed after both requests completed.
         let v2 = s.insert_version(&key(), "Deployment", "u1", &obj(2), "modified", t0 + chrono::Duration::seconds(4)).unwrap().unwrap();
         let v3 = s.insert_version(&key(), "Deployment", "u1", &obj(3), "modified", t0 + chrono::Duration::seconds(5)).unwrap().unwrap();
-        s.insert_event("c1", &patch("a", "alice", "2026-10-14T02:00:01Z"), &[]).unwrap();
-        s.insert_event("c1", &patch("b", "bob", "2026-10-14T02:00:02Z"), &[]).unwrap();
+        s.insert_event("c1", &patch("a", "alice", "2026-10-14T02:00:01Z")).unwrap();
+        s.insert_event("c1", &patch("b", "bob", "2026-10-14T02:00:02Z")).unwrap();
         assert_eq!(s.link_since(0).unwrap(), 2);
         let h = s.history(&key()).unwrap();
         let by_id = |id| h.iter().find(|v| v.id == id).unwrap().actor.clone();
@@ -1963,7 +2017,7 @@ mod tests {
         let s = Store::open(":memory:").unwrap();
         let t = Utc.with_ymd_and_hms(2026, 10, 14, 2, 0, 0).unwrap();
         s.insert_version(&key(), "Deployment", "u1", &obj(1), "baseline", t).unwrap();
-        s.insert_event("c1", &patch("g", "alice", "2026-10-14T02:05:00Z"), &[]).unwrap();
+        s.insert_event("c1", &patch("g", "alice", "2026-10-14T02:05:00Z")).unwrap();
         s.insert_version(&key(), "Deployment", "u1", &obj(2), "resync", t + chrono::Duration::minutes(10)).unwrap();
         assert_eq!(s.link_since(0).unwrap(), 1);
         let h = s.history(&key()).unwrap();
@@ -1982,8 +2036,8 @@ mod tests {
         let s = Store::open(":memory:").unwrap();
         let t = Utc.with_ymd_and_hms(2026, 10, 14, 2, 0, 0).unwrap();
         s.insert_version(&key(), "Deployment", "u1", &obj(1), "baseline", t).unwrap();
-        s.insert_event("c1", &patch("g1", "bob", "2026-10-14T02:03:00Z"), &[]).unwrap();
-        s.insert_event("c1", &patch("g2", "alice", "2026-10-14T02:05:00Z"), &[]).unwrap();
+        s.insert_event("c1", &patch("g1", "bob", "2026-10-14T02:03:00Z")).unwrap();
+        s.insert_event("c1", &patch("g2", "alice", "2026-10-14T02:05:00Z")).unwrap();
         s.insert_version(&key(), "Deployment", "u1", &obj(2), "resync", t + chrono::Duration::minutes(10)).unwrap();
         assert_eq!(s.link_since(0).unwrap(), 0);
         let h = s.history(&key()).unwrap();
@@ -2059,8 +2113,8 @@ mod tests {
     fn rancher_and_downstream_halves_become_one_row() {
         // Downstream first, Rancher (whole seconds, a little later) second.
         let s = Store::open(":memory:").unwrap();
-        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00.700Z"), &[]).unwrap();
-        s.insert_event("local", &rancher_put("r1", "2026-10-14T10:00:01+08:00"), &[]).unwrap();
+        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00.700Z")).unwrap();
+        s.insert_event("local", &rancher_put("r1", "2026-10-14T10:00:01+08:00")).unwrap();
         let rows = all(&s);
         assert_eq!(rows.len(), 1, "the Rancher half is hidden");
         assert_eq!((rows[0].source.as_str(), rows[0].user_id.as_str()), ("k8s", "u-1"));
@@ -2068,25 +2122,25 @@ mod tests {
 
         // Rancher first; the downstream record arrives later and still pairs.
         let s = Store::open(":memory:").unwrap();
-        s.insert_event("local", &rancher_put("r1", "2026-10-14T02:00:00Z"), &[]).unwrap();
+        s.insert_event("local", &rancher_put("r1", "2026-10-14T02:00:00Z")).unwrap();
         assert_eq!(all(&s)[0].source, "rancher", "until then, the Rancher record stands alone");
-        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00.400Z"), &[]).unwrap();
+        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00.400Z")).unwrap();
         assert_eq!(all(&s).len(), 1);
     }
 
     #[test]
     fn pairing_needs_the_same_action_and_time() {
         let s = Store::open(":memory:").unwrap();
-        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00Z"), &[]).unwrap();
+        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00Z")).unwrap();
         // Too late: 10 s after.
-        s.insert_event("local", &rancher_put("r1", "2026-10-14T02:00:10Z"), &[]).unwrap();
+        s.insert_event("local", &rancher_put("r1", "2026-10-14T02:00:10Z")).unwrap();
         // Other cluster.
         let mut other = rancher_put("r2", "2026-10-14T02:00:01Z");
         other.cluster = Some("c2".into());
-        s.insert_event("local", &other, &[]).unwrap();
+        s.insert_event("local", &other).unwrap();
         assert_eq!(all(&s).len(), 3);
         // Two edits in a row pair one to one, nearest first.
-        s.insert_event("c1", &patch("k2", "alice", "2026-10-14T02:00:09.800Z"), &[]).unwrap();
+        s.insert_event("c1", &patch("k2", "alice", "2026-10-14T02:00:09.800Z")).unwrap();
         assert_eq!(all(&s).len(), 3);
     }
 
@@ -2097,9 +2151,9 @@ mod tests {
         s.insert_version(&key(), "Deployment", "u1", &obj(1), "baseline", t0).unwrap();
         let vid = s.insert_version(&key(), "Deployment", "u1", &obj(2), "modified", t0 + chrono::Duration::seconds(1)).unwrap().unwrap();
         // Only Rancher's record so far: the version is credited to it.
-        s.insert_event("local", &rancher_put("r1", "2026-10-14T02:00:01Z"), &[]).unwrap();
+        s.insert_event("local", &rancher_put("r1", "2026-10-14T02:00:01Z")).unwrap();
         assert_eq!(s.link_since(0).unwrap(), 1);
-        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00.900Z"), &[]).unwrap();
+        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00.900Z")).unwrap();
         let rows = all(&s);
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].source.as_str(), rows[0].version_id), ("k8s", Some(vid)));
@@ -2118,7 +2172,7 @@ mod tests {
                source_ip TEXT NOT NULL, user_agent TEXT NOT NULL, request_uri TEXT NOT NULL, request_object TEXT, UNIQUE(cluster, audit_id));
              INSERT INTO events VALUES (1,'c1','old',0,'1970-01-01T00:00:00Z','bob','',1,'direct','bob','delete','','namespaces','','','x',200,'','','',NULL);").unwrap();
         let s = Store::open(p).unwrap();
-        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00Z"), &[]).unwrap();
+        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00Z")).unwrap();
         let rows = all(&s);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].source, "k8s", "existing rows default to the Kubernetes source");
@@ -2163,11 +2217,11 @@ mod tests {
     fn deleted_and_readded_user_is_one_person_with_two_lifetimes() {
         let s = Store::open(":memory:").unwrap();
         s.apply_objects("local", &[user_msg("list", "A", "2026-10-13T00:00:00Z", 0)]).unwrap();
-        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00Z"), &[]).unwrap();
+        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00Z")).unwrap();
         s.apply_objects("local", &[user_msg("deleted", "A", "2026-10-13T00:00:00Z", 180)]).unwrap();
         // Same principal logs in again: same u-1, new object.
         s.apply_objects("local", &[user_msg("modified", "B", "2026-10-14T05:00:00Z", 300)]).unwrap();
-        s.insert_event("c1", &patch("k2", "alice.chen", "2026-10-14T06:00:00Z"), &[]).unwrap();
+        s.insert_event("c1", &patch("k2", "alice.chen", "2026-10-14T06:00:00Z")).unwrap();
 
         let actors = s.actors(0, i64::MAX).unwrap();
         assert_eq!(actors.len(), 1, "merged by user ID");
@@ -2216,10 +2270,9 @@ mod tests {
     #[test]
     fn risky_bursts_become_one_story_and_hours_are_counted() {
         let s = Store::open(":memory:").unwrap();
-        let cfg = Config::test();
         for (id, ts) in [("a", "2026-10-14T15:00:00Z"), ("b", "2026-10-14T15:06:00Z"), ("c", "2026-10-14T15:30:00Z")] {
             let r = direct(id, "create", "clusterrolebindings", id, ts);
-            s.insert_event("c1", &r, &evaluate(&r, &cfg)).unwrap();
+            s.insert_event("c1", &r).unwrap();
         }
         let st = s.stories(None, 0, i64::MAX).unwrap();
         assert_eq!(st.iter().map(|x| x.count).collect::<Vec<_>>(), vec![2, 1], "15:00 and 15:06 together, 15:30 alone");
@@ -2231,9 +2284,9 @@ mod tests {
     #[test]
     fn a_paired_rancher_half_is_not_counted_twice() {
         let s = Store::open(":memory:").unwrap();
-        s.insert_event("local", &rancher_put("r1", "2026-10-14T02:00:01Z"), &[]).unwrap();
+        s.insert_event("local", &rancher_put("r1", "2026-10-14T02:00:01Z")).unwrap();
         assert_eq!(s.hourly(None, 0, i64::MAX).unwrap()[0].writes, 1);
-        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00.900Z"), &[]).unwrap();
+        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00.900Z")).unwrap();
         let h = s.hourly(None, 0, i64::MAX).unwrap();
         assert_eq!(h.iter().map(|x| x.writes).sum::<i64>(), 1, "{h:?}");
     }
@@ -2249,7 +2302,7 @@ mod tests {
         let ns = ObjKey { api_group: "".into(), resource: "namespaces".into(), namespace: "".into(), name: "shop".into(), ..key() };
         s.insert_version(&ns, "Namespace", "n1", &json!({"metadata":{"name":"shop","labels":{"field.cattle.io/projectId":"p-abc"}}}), "baseline", t).unwrap();
         assert_eq!(s.namespace_projects(None).unwrap(), vec![("c1".into(), "shop".into(), "p-abc".into())]);
-        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00Z"), &[]).unwrap();
+        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00Z")).unwrap();
         let c = s.clusters(0, i64::MAX).unwrap();
         assert_eq!((c[0].cluster.as_str(), c[0].k8s_events, c[0].rancher_events), ("c1", 1, 0));
     }
@@ -2269,7 +2322,7 @@ mod tests {
         let t1 = t0 + chrono::Duration::days(3);
         let line = format!(r#"{{"auditID":"g1","requestURI":"/v3/clusterroletemplatebindings","method":"POST","user":{{"name":"u-carol","extra":{{"username":["carol"]}}}},"responseCode":201,"responseTimestamp":"{}"}}"#, t1.to_rfc3339());
         let r = crate::rancher::to_record(&crate::rancher::parse_fixture(&line)[0]).unwrap();
-        s.insert_event("local", &r, &[]).unwrap();
+        s.insert_event("local", &r).unwrap();
         mk("clusterroletemplatebindings", "c-m-1", "crtb-x", "b1", json!({"clusterName":"c-m-1","roleTemplateName":"cluster-owner","userName":"u-dave"}), "modified", t1 + chrono::Duration::seconds(1));
         // Later Rancher deletes the user, then cleans up the binding itself.
         let t2 = t0 + chrono::Duration::days(10);
@@ -2292,7 +2345,7 @@ mod tests {
     fn chain_detects_tampering_and_survives_retention() {
         let s = Store::open(":memory:").unwrap();
         for (i, ts) in ["2026-09-01T00:00:00Z", "2026-09-02T00:00:00Z", "2026-10-14T00:00:00Z", "2026-10-14T01:00:00Z"].iter().enumerate() {
-            s.insert_event("c1", &patch(&format!("p{i}"), "alice", ts), &[]).unwrap();
+            s.insert_event("c1", &patch(&format!("p{i}"), "alice", ts)).unwrap();
         }
         let r = &s.verify_chain(None).unwrap()[0];
         assert_eq!((r.verified, r.first_bad_id), (4, None));
@@ -2320,10 +2373,10 @@ mod tests {
         let fleet = json!({"metadata":{"name":"web","namespace":"shop","labels":{"fleet.cattle.io/managed-by-kind":"gitrepo","fleet.cattle.io/managed-by-namespace":"fleet-default","fleet.cattle.io/managed-by-name":"shop-apps"}},"spec":{"replicas":3}});
         s.insert_version(&key(), "Deployment", "u1", &fleet, "baseline", t).unwrap();
         let r = patch("h1", "alice", "2026-10-14T02:00:00Z");
-        s.insert_event("c1", &r, &[]).unwrap();
+        s.insert_event("c1", &r).unwrap();
         let fleet_fix = r#"{"auditID":"f1","stage":"ResponseComplete","verb":"patch","user":{"username":"system:serviceaccount:cattle-fleet-system:fleet-agent"},
           "objectRef":{"resource":"deployments","namespace":"shop","name":"web","apiGroup":"apps"},"responseStatus":{"code":200},"stageTimestamp":"2026-10-14T02:00:06Z"}"#;
-        s.insert_event("c1", &to_record(&parse_body(fleet_fix.replace('\n', " ").as_bytes()).unwrap()[0]).unwrap(), &[]).unwrap();
+        s.insert_event("c1", &to_record(&parse_body(fleet_fix.replace('\n', " ").as_bytes()).unwrap()[0]).unwrap()).unwrap();
         let g = s.gitops_bypasses(0, i64::MAX).unwrap();
         assert_eq!(g.len(), 1, "only the person's edit");
         assert_eq!(g[0].source.as_deref(), Some("gitrepo/fleet-default/shop-apps"));
@@ -2333,7 +2386,7 @@ mod tests {
         s.insert_version(&other, "Deployment", "u2", &obj(1), "baseline", t).unwrap();
         let mut r = patch("h2", "alice", "2026-10-14T03:00:00Z");
         r.name = "api".into();
-        s.insert_event("c1", &r, &[]).unwrap();
+        s.insert_event("c1", &r).unwrap();
         assert_eq!(s.gitops_bypasses(0, i64::MAX).unwrap().len(), 1);
         assert_eq!(fleet_marker(&json!({"metadata":{"annotations":{"objectset.rio.cattle.io/id":"default-shop"}}})).as_deref(), Some("objectset/default-shop"));
     }
@@ -2376,11 +2429,11 @@ mod tests {
         let t = Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap();
         // id 1 is kept by prune (a version points at it), id 2 goes, id 3 stays.
         s.insert_version(&key(), "Deployment", "u1", &obj(1), "baseline", t).unwrap();
-        s.insert_event("c1", &patch("a", "alice", "2026-09-01T00:00:00Z"), &[]).unwrap();
+        s.insert_event("c1", &patch("a", "alice", "2026-09-01T00:00:00Z")).unwrap();
         s.insert_version(&key(), "Deployment", "u1", &obj(2), "modified", t + chrono::Duration::seconds(1)).unwrap();
         assert_eq!(s.link_since(0).unwrap(), 1);
-        s.insert_event("c1", &patch("b", "alice", "2026-09-02T00:00:00Z"), &[]).unwrap();
-        s.insert_event("c1", &patch("c", "alice", "2026-10-14T00:00:00Z"), &[]).unwrap();
+        s.insert_event("c1", &patch("b", "alice", "2026-09-02T00:00:00Z")).unwrap();
+        s.insert_event("c1", &patch("c", "alice", "2026-10-14T00:00:00Z")).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 10, 15, 0, 0, 0).unwrap();
         s.prune(30, now).unwrap();
         s.prune(30, now + chrono::Duration::hours(6)).unwrap();
@@ -2390,10 +2443,10 @@ mod tests {
         // Everything old: the newest record stays, so IDs keep growing.
         let s = Store::open(":memory:").unwrap();
         for (i, ts) in ["2026-09-01T00:00:00Z", "2026-09-02T00:00:00Z"].iter().enumerate() {
-            s.insert_event("c1", &patch(&format!("p{i}"), "alice", ts), &[]).unwrap();
+            s.insert_event("c1", &patch(&format!("p{i}"), "alice", ts)).unwrap();
         }
         s.prune(30, now).unwrap();
-        s.insert_event("c1", &patch("new", "alice", "2026-10-14T00:00:00Z"), &[]).unwrap();
+        s.insert_event("c1", &patch("new", "alice", "2026-10-14T00:00:00Z")).unwrap();
         let ids: Vec<i64> = s.conn.lock().unwrap().prepare("SELECT id FROM events ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
         assert_eq!(ids, vec![2, 3]);
         assert_eq!(s.verify_chain(None).unwrap()[0].first_bad_id, None);
@@ -2402,19 +2455,19 @@ mod tests {
     #[test]
     fn review_fixes_late_rancher_half_is_forwarded() {
         let s = Store::open(":memory:").unwrap();
-        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00.700Z"), &[]).unwrap();
+        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00.700Z")).unwrap();
         // The downstream record goes out first.
         let first = s.forward_records(0, i64::MAX, 100).unwrap();
         assert_eq!(first.len(), 1);
         s.forward_done("t", Some(first[0].id), None, None).unwrap();
         // The Rancher half arrives late and pairs with it: it must still be sent.
-        s.insert_event("local", &rancher_put("r1", "2026-10-14T10:00:01+08:00"), &[]).unwrap();
+        s.insert_event("local", &rancher_put("r1", "2026-10-14T10:00:01+08:00")).unwrap();
         let late = s.forward_records(first[0].id, i64::MAX, 100).unwrap();
         assert_eq!((late.len(), late[0].source.as_str()), (1, "rancher"));
         // But a Rancher half paired before its partner was sent stays hidden.
         let s = Store::open(":memory:").unwrap();
-        s.insert_event("local", &rancher_put("r1", "2026-10-14T10:00:01+08:00"), &[]).unwrap();
-        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00.700Z"), &[]).unwrap();
+        s.insert_event("local", &rancher_put("r1", "2026-10-14T10:00:01+08:00")).unwrap();
+        s.insert_event("c1", &patch("k1", "alice", "2026-10-14T02:00:00.700Z")).unwrap();
         let both = s.forward_records(0, i64::MAX, 100).unwrap();
         assert_eq!((both.len(), both[0].source.as_str(), both[0].rancher_user_agent.as_deref()), (1, "k8s", Some("kubectl/v1.35.0")));
     }
@@ -2446,7 +2499,7 @@ mod tests {
           "objectRef":{"resource":"namespaces","namespace":"old","name":"old","apiVersion":"v1"},
           "responseStatus":{"code":200},"stageTimestamp":"2026-10-14T02:00:00.500Z"}"#;
         let r = to_record(&parse_body(ev.as_bytes()).unwrap()[0]).unwrap();
-        s.insert_event("c1", &r, &[]).unwrap();
+        s.insert_event("c1", &r).unwrap();
         assert_eq!(s.link_since(0).unwrap(), 1);
         let h = s.history(&ns).unwrap();
         assert_eq!((h[0].change.as_str(), h[0].actor.as_deref()), ("deleting", Some("system:admin")));

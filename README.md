@@ -22,6 +22,7 @@ Answers *who changed what, when, and how* across Rancher-managed Kubernetes clus
 - **還原用 YAML**：產生改之前的內容，只產生、不套用。
 - **收集狀態**：每個收集元件的回報、中斷時段、找不到 audit log 的叢集。
 - **SUSE Security**：exec 之後被判定為違規的程序（不是完整指令紀錄）。
+- **規則可調**：每條規則可以開關、調整嚴重度、設定不適用的範圍（附理由，可設到期日）。設定變更後，可以選擇用新設定重新計算過去的紀錄，原始紀錄不變。
 
 ## 第一版的做法 / M1 approach
 

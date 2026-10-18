@@ -1,6 +1,5 @@
 use crate::audit::{parse_body, to_record};
 use crate::config::Config;
-use crate::rules::evaluate;
 use crate::store::{ObjKey, Query, Store};
 use axum::body::Bytes;
 use axum::extract::DefaultBodyLimit;
@@ -80,22 +79,8 @@ async fn ingest(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> R
         _ => return (StatusCode::BAD_REQUEST, format!("unsupported source {source:?}")).into_response(),
     };
     let store = s.store.clone();
-    let cfg = s.cfg.clone();
-    let work = move || -> anyhow::Result<usize> {
-        let mut batch = Vec::with_capacity(records.len());
-        for r in records {
-            let mut a = evaluate(&r, &cfg);
-            if !cfg.change_windows.is_empty() && r.human && crate::audit::is_write(&r.verb) && (200..300).contains(&r.code) {
-                let cl = r.cluster.clone().unwrap_or_else(|| cluster.clone());
-                let labels = if r.namespace.is_empty() { None } else { store.namespace_labels(&cl, &r.namespace)? };
-                if crate::windows::allowed(&cfg.change_windows, &cl, labels.as_ref(), r.ts, &cfg.tz) == Some(false) {
-                    a.push(crate::rules::Alert { rule: "outside_change_window", severity: "medium" });
-                }
-            }
-            batch.push((r, a));
-        }
-        store.insert_events(&cluster, &batch)
-    };
+    // Rules are applied as each record is stored, with what is stored about its object.
+    let work = move || store.insert_events(&cluster, &records);
     match tokio::task::spawn_blocking(work).await {
         Ok(Ok(stored)) => Json(json!({"received": received, "skipped": skipped, "stored": stored})).into_response(),
         Ok(Err(e)) => err(e),
@@ -120,6 +105,34 @@ async fn ingest_objects(s: AppState, cluster: String, body: &[u8]) -> Response {
     let store = s.store.clone();
     match tokio::task::spawn_blocking(move || store.apply_objects(&cluster, &msgs)).await {
         Ok(Ok(stored)) => Json(json!({"received": received, "stored": stored})).into_response(),
+        Ok(Err(e)) => err(e),
+        Err(e) => err(e.into()),
+    }
+}
+
+/// The rule settings in force, earlier settings, and whether stored records were judged by
+/// other settings than these (and how long judging them again would take).
+async fn rules(State(s): State<AppState>) -> Response {
+    match tokio::task::spawn_blocking(move || s.store.rule_status()).await {
+        Ok(Ok(st)) => Json(st).into_response(),
+        Ok(Err(e)) => err(e),
+        Err(e) => err(e.into()),
+    }
+}
+
+/// Judge every stored record again with the settings in force. Through the Rancher service
+/// proxy a POST needs "create" on services/proxy, which plain viewers do not have.
+#[derive(Deserialize)]
+struct RecomputeParams {
+    /// force=1: judge everything again even when no settings change is recorded.
+    force: Option<u8>,
+}
+
+async fn recompute(State(s): State<AppState>, Q(p): Q<RecomputeParams>) -> Response {
+    let force = p.force == Some(1);
+    match tokio::task::spawn_blocking(move || s.store.start_recompute(force)).await {
+        Ok(Ok(true)) => (StatusCode::ACCEPTED, Json(json!({"started": true}))).into_response(),
+        Ok(Ok(false)) => (StatusCode::CONFLICT, Json(json!({"started": false, "error": "already running, or nothing to judge again"}))).into_response(),
         Ok(Err(e)) => err(e),
         Err(e) => err(e.into()),
     }
@@ -538,6 +551,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/projects", get(projects))
         .route("/api/stories", get(stories))
         .route("/api/alerts", get(alerts))
+        .route("/api/rules", get(rules))
+        .route("/api/rules/recompute", post(recompute))
         .with_state(state)
 }
 
@@ -616,7 +631,8 @@ mod tests {
     async fn changes_outside_a_window_are_flagged() {
         let mut cfg = Config::test();
         cfg.change_windows = crate::windows::parse(r#"[{"name":"w","days":"6","hours":"0-24"}]"#).unwrap();
-        let st = AppState { store: Store::open(":memory:").unwrap(), cfg: Arc::new(cfg) };
+        let cfg = Arc::new(cfg);
+        let st = AppState { store: Store::open_with(":memory:", cfg.clone()).unwrap(), cfg };
         // A Thursday: the only window is Saturdays.
         let (code, _) = post(ingest_router(st.clone()), Some("test-token"), "k8s-audit", LINE.into(), false).await;
         assert_eq!(code, StatusCode::OK);
@@ -658,5 +674,18 @@ mod tests {
         let (code, body) = post(ingest_router(state()), Some("test-token"), "k8s-audit", enc.finish().unwrap(), true).await;
         assert_eq!(code, StatusCode::OK, "{body}");
         assert!(body.contains("\"stored\":1"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn rules_status_and_recompute_refusal() {
+        let app = router(state());
+        let res = app.clone().oneshot(Request::get("/api/rules").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap()).unwrap();
+        assert_eq!(v["rules"][0]["id"], "namespace_deleted");
+        assert_eq!(v["rules"][0]["defaultSeverity"], "high");
+        assert!(v["pending"].is_null());
+        let res = app.oneshot(Request::post("/api/rules/recompute").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT, "nothing to judge again");
     }
 }

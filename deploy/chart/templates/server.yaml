@@ -74,6 +74,9 @@ spec:
             {{- with .Values.server.changeWindows }}
             - { name: AL_CHANGE_WINDOWS, value: {{ toJson . | quote }} }
             {{- end }}
+            {{- with .Values.server.rules }}
+            - { name: AL_RULES, value: {{ toJson . | quote }} }
+            {{- end }}
             {{- with .Values.server.forward }}
             {{- if .syslog }}
             - { name: AL_FORWARD_SYSLOG, value: {{ .syslog | quote }} }
