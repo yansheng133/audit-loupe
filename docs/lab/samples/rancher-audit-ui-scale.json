@@ -1,0 +1,121 @@
+{
+  "auditID": "9de606ca-3325-43dc-90ae-c148281f4eae",
+  "requestURI": "/k8s/clusters/c-m-26kbxk5f/v1/apps.deployments/al-lab-test/al-demo",
+  "user": {
+    "name": "user-kgw7z",
+    "group": [
+      "system:authenticated",
+      "system:cattle:authenticated"
+    ],
+    "extra": {
+      "principalid": [
+        "local://user-kgw7z"
+      ],
+      "requesthost": [
+        "localhost:8443"
+      ],
+      "requesttokenid": [
+        "<masked>"
+      ],
+      "username": [
+        "admin"
+      ]
+    }
+  },
+  "method": "PUT",
+  "remoteAddr": "192.0.2.3:1710",
+  "responseCode": 200,
+  "requestTimestamp": "2026-10-17T06:25:21Z",
+  "responseTimestamp": "2026-10-17T06:25:21Z",
+  "requestHeader": {
+    "Accept": [
+      "application/json"
+    ],
+    "Accept-Encoding": [
+      "gzip, deflate, br, zstd"
+    ],
+    "Accept-Language": [
+      "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7"
+    ],
+    "Connection": [
+      "keep-alive"
+    ],
+    "Content-Length": [
+      "1696"
+    ],
+    "Content-Type": [
+      "application/json"
+    ],
+    "Cookie": [
+      "<masked>"
+    ],
+    "Origin": [
+      "https://localhost:8443"
+    ],
+    "Referer": [
+      "https://localhost:8443/dashboard/c/c-m-26kbxk5f/explorer/apps.deployment/al-lab-test/al-demo"
+    ],
+    "Sec-Ch-Ua": [
+      "\"Google Chrome\";v=\"155\", \"Chromium\";v=\"155\", \"Not(A:Brand\";v=\"24\""
+    ],
+    "Sec-Ch-Ua-Mobile": [
+      "?0"
+    ],
+    "Sec-Ch-Ua-Platform": [
+      "\"macOS\""
+    ],
+    "Sec-Fetch-Dest": [
+      "empty"
+    ],
+    "Sec-Fetch-Mode": [
+      "cors"
+    ],
+    "Sec-Fetch-Site": [
+      "same-origin"
+    ],
+    "User-Agent": [
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
+    ],
+    "X-Api-Csrf": [
+      "<masked>"
+    ],
+    "X-Api-Url-Prefix": [
+      "<masked>"
+    ]
+  },
+  "responseHeader": {
+    "Cache-Control": [
+      "no-cache, no-store, must-revalidate",
+      "no-cache, no-store, must-revalidate"
+    ],
+    "Content-Encoding": [
+      "gzip"
+    ],
+    "Content-Length": [
+      "1569"
+    ],
+    "Content-Type": [
+      "application/json"
+    ],
+    "Date": [
+      "Sat, 17 Oct 2026 06:25:21 GMT"
+    ],
+    "Expires": [
+      "Wed 24 Feb 1982 18:42:00 GMT"
+    ],
+    "Warning": [
+      "299 - unknown field \"_summaries\""
+    ],
+    "X-Api-Cattle-Auth": [
+      "<masked>",
+      "<masked>"
+    ],
+    "X-Api-Schemas": [
+      "<masked>"
+    ],
+    "X-Content-Type-Options": [
+      "nosniff",
+      "nosniff"
+    ]
+  }
+}
