@@ -697,7 +697,8 @@ mod tests {
 
     #[test]
     fn records_kept_past_retention_do_not_bring_back_counts_and_story_ids_move_on() {
-        let s = Store::open(":memory:").unwrap();
+        // Timestamps follow the clock, so off_hours would depend on when the test runs.
+        let s = Store::open_with(":memory:", with_rules(r#"{"off_hours": {"enabled": false}}"#)).unwrap();
         let old = (chrono::Utc::now() - chrono::Duration::days(60)).to_rfc3339();
         let new = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
         s.insert_event("c1", &exec("e0", "alice", "shop", &old)).unwrap();
