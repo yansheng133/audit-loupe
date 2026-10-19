@@ -1,0 +1,68 @@
+# Checks every pull request to main and every push to main. No secrets; read-only token.
+# The UI extension lives in its own repository (yansheng133/audit-loupe-ui) with Rancher's
+# official extension workflows.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: backend tests
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          cargo --version
+      - name: Test
+        run: cargo test --locked
+
+  chart:
+    name: helm chart
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - name: Lint
+        run: |
+          helm lint deploy/chart
+          for f in deploy/chart/ci/*.yaml; do helm lint deploy/chart -f "$f"; done
+      - name: Render
+        run: |
+          set -euo pipefail
+          for f in deploy/chart/ci/*.yaml; do
+            echo "== $f"
+            helm template audit-loupe deploy/chart -n audit-loupe-system -f "$f" > "/tmp/$(basename "$f" .yaml).out"
+          done
+          # The rules example must reach the server as AL_RULES; the downstream one has no server.
+          grep -q 'AL_RULES' /tmp/local.out || { echo "AL_RULES missing from the local render"; exit 1; }
+          grep -q 'pod_exec' /tmp/local.out || { echo "rules example missing from AL_RULES"; exit 1; }
+          if grep -q 'AL_RULES' /tmp/downstream.out; then echo "downstream render must not contain the server"; exit 1; fi
+      - name: Versions agree
+        run: |
+          set -euo pipefail
+          cargo_v=$(sed -n 's/^version = "\(.*\)"/\1/p' backend/Cargo.toml | head -1)
+          chart_v=$(sed -n 's/^version: *//p' deploy/chart/Chart.yaml)
+          app_v=$(sed -n 's/^appVersion: *"\{0,1\}\([^"]*\)"\{0,1\}/\1/p' deploy/chart/Chart.yaml)
+          echo "Cargo $cargo_v, chart $chart_v, appVersion $app_v"
+          [ "$cargo_v" = "$app_v" ] && [ "$cargo_v" = "$chart_v" ]

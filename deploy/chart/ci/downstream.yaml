@@ -1,0 +1,11 @@
+# CI only: a downstream RKE2 cluster (collectors only), as in docs/deploy.md section 4.
+collector:
+  ingest:
+    url: https://audit-loupe-ingest.example.com
+    caSecret: audit-loupe-ca
+  token:
+    existingSecret: audit-loupe-collector-token
+  watch:
+    enabled: true
+  file:
+    enabled: true

@@ -1,0 +1,29 @@
+# CI only: the cluster Rancher runs in (server + collectors), as in docs/deploy.md section 3,
+# plus a rules example so the AL_RULES rendering is exercised.
+server:
+  enabled: true
+  tokens:
+    existingSecret: audit-loupe-tokens
+  ingress:
+    enabled: true
+    host: audit-loupe-ingest.example.com
+    tlsSecret: audit-loupe-ingest-tls
+  rules:
+    pod_exec:
+      severity: high
+      except:
+        - namespaces: ["dev-*"]
+          reason: ci example
+          until: "2026-12-31"
+    secret_read:
+      enabled: false
+collector:
+  ingest:
+    url: http://audit-loupe.audit-loupe-system.svc:8081
+  token:
+    existingSecret: audit-loupe-collector-token
+  watch:
+    enabled: true
+    rancherTypes: true
+  rancher:
+    enabled: true

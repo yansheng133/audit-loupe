@@ -46,13 +46,20 @@ Answers *who changed what, when, and how* across Rancher-managed Kubernetes clus
 | 路徑 | 內容 |
 |---|---|
 | `backend/` | Rust（axum、kube-rs、SQLite）。`cargo test`；`audit-loupe seed-demo` 產生示意資料 |
-| `ui/pkg/audit-loupe/` | Rancher UI extension（UI extensions v3） |
 | `deploy/chart/` | Helm chart（server 與各收集元件，values 決定角色） |
 | `deploy/policy/` | RKE2 apiserver audit policy |
-| `scripts/` | 建置映像檔 |
+| `scripts/` | 在本機建置映像檔（離線環境或自建 registry） |
+| `.github/workflows/` | CI：PR 檢查（`ci.yml`）、版本 tag 發佈多架構映像檔（`release-images.yml`） |
 | `docs/lab/` | 實機驗證任務書 |
 | `mock/` | 介面設計模型 |
 | `docs/archive/m0/` | 試吃版的 webhook 做法與 lab 任務書，僅供參考 |
+
+UI extension 在另一個 repo：[yansheng133/audit-loupe-ui](https://github.com/yansheng133/audit-loupe-ui)，用 Rancher 官方的 extension workflow 發佈。
+
+## 發佈 / Release
+
+- 每個 PR 與 main 的每次 push 都會跑後端測試與 Helm chart 檢查（`ci.yml`），沒過不能合併。
+- 推一個版本 tag（例如 `v0.3.0`）會在 amd64 與 arm64 的機器上各自建置映像檔，合成多架構的 `audit-loupe-server`、`audit-loupe-collector` 推到 Docker Hub（`release-images.yml`）。tag、`backend/Cargo.toml`、`deploy/chart/Chart.yaml` 的版本必須一致，否則不會發佈。
 
 ## 授權 / License
 
