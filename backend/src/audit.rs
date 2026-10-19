@@ -269,6 +269,11 @@ pub fn parse_body(body: &[u8]) -> anyhow::Result<Vec<Event>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ci_must_fail() {
+        assert_eq!(1, 2);
+    }
+
     use super::*;
 
     const VIA_RANCHER: &str = r#"{"kind":"Event","apiVersion":"audit.k8s.io/v1","level":"Request","auditID":"a1","stage":"ResponseComplete",
