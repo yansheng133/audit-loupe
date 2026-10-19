@@ -1,8 +1,0 @@
-product:
-  audit-loupe: Audit Loupe
-auditLoupe:
-  nav:
-    changes: 變更地圖
-    access: 權限覆核
-    coverage: 收集狀態
-    rules: 規則
