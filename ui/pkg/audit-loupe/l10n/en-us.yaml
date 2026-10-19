@@ -1,8 +1,0 @@
-product:
-  audit-loupe: Audit Loupe
-auditLoupe:
-  nav:
-    changes: Change Map
-    access: Access Review
-    coverage: Collection Status
-    rules: Rules
