@@ -2,6 +2,8 @@
 # pushed, each on a runner of that architecture (backend/Dockerfile has no cross-compile
 # step), then joins them into one multi-architecture tag per image.
 # Needs repository secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN (set by the owner).
+# The build and merge jobs drive the runner's own Docker, so they run on the runner host;
+# what they build is still SUSE BCI (see backend/Dockerfile).
 name: Release images
 
 on:
@@ -18,6 +20,7 @@ jobs:
   version:
     name: tag matches the code
     runs-on: ubuntu-24.04
+    container: registry.suse.com/bci/bci-base:15.7-5.23.49@sha256:b9d19a145a6a7832291fcaf354c61b9d229e38dc4b47ea90e885d9dc02079beb
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:

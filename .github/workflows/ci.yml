@@ -20,6 +20,8 @@ jobs:
   backend:
     name: backend tests
     runs-on: ubuntu-24.04
+    # Same Rust image as backend/Dockerfile's build stage.
+    container: registry.suse.com/bci/rust:1.98.1-1.2.21@sha256:af8218cc18c6d1c81d21e38b2655507455d63ee4df94675dd8a284aba038dc4d
     defaults:
       run:
         working-directory: backend
@@ -27,17 +29,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Rust toolchain
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-          cargo --version
+      - run: cargo --version
       - name: Test
         run: cargo test --locked
 
   chart:
     name: helm chart
     runs-on: ubuntu-24.04
+    container: registry.suse.com/bci/bci-base:15.7-5.23.49@sha256:b9d19a145a6a7832291fcaf354c61b9d229e38dc4b47ea90e885d9dc02079beb
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
