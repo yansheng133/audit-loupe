@@ -1,0 +1,2 @@
+# Values used only by CI (helm lint / helm template); not part of the packaged chart.
+ci/

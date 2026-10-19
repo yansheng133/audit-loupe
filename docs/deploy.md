@@ -41,11 +41,15 @@ policy 在 `deploy/policy/rke2-audit-policy.yaml`：只記變更（含 request b
 
 ### 2.3 映像檔
 
+`docker.io/yansheng133/audit-loupe-server` 與 `audit-loupe-collector`（同一個程式，以子命令區分角色），amd64 與 arm64 都有，由 GitHub Actions 在推版本 tag 時發佈。
+
+離線環境或要推到內部 registry 時，在目標架構的機器上自行建置：
+
 ```bash
-scripts/build-images.sh 0.2.0 --push
+REPO=registry.example.com/audit-loupe scripts/build-images.sh 0.3.0 --push
 ```
 
-產生 `docker.io/yansheng133/audit-loupe-server` 與 `audit-loupe-collector`（同一個程式，以子命令區分角色）。離線環境請推到內部 registry，安裝時改 `image.*.repository`。
+安裝時改 `image.*.repository`。
 
 ### 2.4 每座叢集一把 token
 
@@ -154,7 +158,12 @@ collector:
 
 ## 7. UI extension
 
-Rancher 的 Extensions 頁面加入 Audit Loupe 的 extension repository 後安裝（repository 由 `ui/` 的 GitHub Actions 產生）。安裝後：
+UI extension 的原始碼在 [yansheng133/audit-loupe-ui](https://github.com/yansheng133/audit-loupe-ui)，由 Rancher 官方的 extension workflow 發佈成 Helm repository。
+
+1. 在 Rancher 的 `Apps` → `Repositories` 加入 `https://yansheng133.github.io/audit-loupe-ui`。
+2. 到 Extensions 頁面安裝 Audit Loupe。
+
+安裝後：
 
 - 左上選單的全域應用多一個「Audit Loupe」，開啟變更地圖。
 - 每座叢集的 Dashboard 多一張卡片，點了直接以該叢集篩選開啟。

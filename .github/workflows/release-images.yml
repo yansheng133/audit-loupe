@@ -1,0 +1,100 @@
+# Builds the server and collector images for amd64 and arm64 when a version tag (v0.3.0) is
+# pushed, each on a runner of that architecture (backend/Dockerfile has no cross-compile
+# step), then joins them into one multi-architecture tag per image.
+# Needs repository secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN (set by the owner).
+# The build and merge jobs drive the runner's own Docker, so they run on the runner host;
+# what they build is still SUSE BCI (see backend/Dockerfile).
+name: Release images
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  REPO: docker.io/yansheng133
+
+jobs:
+  version:
+    name: tag matches the code
+    runs-on: ubuntu-24.04
+    # bci-base sets no PATH in its image config; without one, a step that adds to PATH
+    # (setup-helm) leaves only that directory and `sh` is no longer found.
+    container:
+      image: registry.suse.com/bci/bci-base:15.7-5.23.49@sha256:b9d19a145a6a7832291fcaf354c61b9d229e38dc4b47ea90e885d9dc02079beb
+      env:
+        PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: v
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          cargo_v=$(sed -n 's/^version = "\(.*\)"/\1/p' backend/Cargo.toml | head -1)
+          app_v=$(sed -n 's/^appVersion: *"\{0,1\}\([^"]*\)"\{0,1\}/\1/p' deploy/chart/Chart.yaml)
+          echo "tag $tag, Cargo $cargo_v, appVersion $app_v"
+          [ "$tag" = "$cargo_v" ] && [ "$tag" = "$app_v" ] || { echo "tag, Cargo.toml and Chart.yaml appVersion must agree"; exit 1; }
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build ${{ matrix.arch }}
+    needs: version
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: backend
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.REPO }}/audit-loupe-server:${{ needs.version.outputs.version }}-${{ matrix.arch }}
+            ${{ env.REPO }}/audit-loupe-collector:${{ needs.version.outputs.version }}-${{ matrix.arch }}
+
+  merge:
+    name: multi-arch tags
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Create and check
+        env:
+          V: ${{ needs.version.outputs.version }}
+          PLATFORMS: |
+            import json, sys
+            m = json.load(sys.stdin)
+            print(" ".join(sorted(x["platform"]["os"] + "/" + x["platform"]["architecture"] for x in m["manifests"])))
+        run: |
+          set -euo pipefail
+          for img in audit-loupe-server audit-loupe-collector; do
+            docker buildx imagetools create -t "$REPO/$img:$V" "$REPO/$img:$V-amd64" "$REPO/$img:$V-arm64"
+            # The raw manifest list must hold exactly linux/amd64 and linux/arm64.
+            plats=$(docker buildx imagetools inspect --raw "$REPO/$img:$V" | python3 -c "$PLATFORMS")
+            echo "$img:$V -> $plats"
+            [ "$plats" = "linux/amd64 linux/arm64" ] || { echo "$img:$V platforms are '$plats'"; exit 1; }
+          done
