@@ -1,6 +1,6 @@
 # 回報：lab 收尾
 
-執行：2026-10-21 00:35–00:40（台北）。對應：`docs/lab/lab-cleanup-task.md`（依 `overnight-1020-task.md` 修改：保留 `al-lab-*` 使用者與 `audit-loupe-viewer`）。
+執行：2026-10-21 00:36–00:38（台北）。對應：`docs/lab/lab-cleanup-task.md`（依 `overnight-1020-task.md` 修改：保留 `al-lab-*` 使用者與 `audit-loupe-viewer`）。
 
 ## 一句話結論
 
