@@ -4,10 +4,16 @@
 //! Rancher pod's `rancher-audit-log` sidecar, which copies the log file to its output.
 //!
 //! `collect-file` follows the kube-apiserver audit log on an RKE2 control-plane node.
-//! It remembers how far it has read (inode + byte offset) in a small state file, so a
-//! restart resumes where it stopped, and it only moves that position forward after the
-//! server has accepted the batch. Rotation is handled by finishing the rotated file
-//! (found again by its inode) before switching to the new one.
+//! It remembers which file it is on (inode plus a hash of the file's first bytes, so a reused
+//! inode is not taken for the same file), how far the server has acknowledged, and the time of
+//! the last record acknowledged. Only what is read while the collector runs is sent:
+//! - A restart starts at the end of the current `audit.log`; what was written while the
+//!   collector was down is not read afterwards, and that period is reported to the server as
+//!   not collected, from the last record acknowledged to the start.
+//! - A rotation while it runs is followed: the rotated file is read to its end, then each newer
+//!   rotated file in order, then `audit.log`.
+//! - A file that disappears (or is replaced under the same inode) before it was read to the
+//!   end is reported as not collected at once, from the last record acknowledged.
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -58,6 +64,11 @@ impl Sender {
     }
 
     pub async fn send(&self, lines: &[u8]) -> anyhow::Result<()> {
+        self.send_for_reply(lines).await.map(|_| ())
+    }
+
+    /// Like `send`, and returns the server's answer (for ingest: received/skipped/stored).
+    pub async fn send_for_reply(&self, lines: &[u8]) -> anyhow::Result<String> {
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         enc.write_all(lines)?;
         let res = self
@@ -75,14 +86,46 @@ impl Sender {
             let text = res.text().await.unwrap_or_default();
             anyhow::bail!("server answered {status}: {}", text.chars().take(200).collect::<String>());
         }
-        Ok(())
+        Ok(res.text().await.unwrap_or_default())
     }
 }
 
+/// How many bytes at the start of a file identify it, together with its inode.
+const HEAD_BYTES: u64 = 1024;
+
+/// Where collect-file stands. `head` identifies the file beyond its inode; `last_ms` is the
+/// time of the last record the server acknowledged (where a "not collected" period starts);
+/// `pending` holds such reports until the server has taken them.
 #[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq)]
 pub struct Position {
     pub inode: u64,
     pub offset: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<Head>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending: Vec<Gap>,
+}
+
+/// SHA-256 of a file's first `len` bytes (up to HEAD_BYTES).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Head {
+    pub len: u64,
+    pub sha256: String,
+}
+
+/// A period the collector did not collect, as sent to the server (source "gap").
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Gap {
+    pub collector: String,
+    pub instance: String,
+    pub from_ms: i64,
+    pub to_ms: i64,
+    pub reason: String,
+    #[serde(default)]
+    pub detail: String,
 }
 
 impl Position {
@@ -96,6 +139,110 @@ impl Position {
         fs::rename(&tmp, path)?;
         Ok(())
     }
+    /// Start `file` from `offset`, keeping the time of the last record and pending reports.
+    fn at(&self, file: &Path, offset: u64) -> anyhow::Result<Position> {
+        Ok(Position { inode: fs::metadata(file)?.ino(), offset, head: Some(head_of(file)?), last_ms: self.last_ms, pending: self.pending.clone() })
+    }
+}
+
+fn sha256_hex(b: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn first_bytes(path: &Path, n: u64) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    File::open(path)?.take(n).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+pub fn head_of(path: &Path) -> std::io::Result<Head> {
+    let buf = first_bytes(path, HEAD_BYTES)?;
+    Ok(Head { len: buf.len() as u64, sha256: sha256_hex(&buf) })
+}
+
+/// Whether `path` still starts with the recorded bytes. Shorter than recorded: another file.
+pub fn same_head(path: &Path, head: &Head) -> bool {
+    first_bytes(path, head.len).is_ok_and(|b| b.len() as u64 == head.len && sha256_hex(&b) == head.sha256)
+}
+
+/// Files rotated out of `path` (`audit-<UTC time>.log` next to `audit.log`), oldest first;
+/// the time in the name sorts as text.
+pub fn rotated_files(path: &Path) -> Vec<PathBuf> {
+    let (Some(dir), Some(stem)) = (path.parent(), path.file_stem().and_then(|s| s.to_str())) else { return vec![] };
+    let prefix = format!("{stem}-");
+    let suffix = path.extension().and_then(|e| e.to_str()).map(|e| format!(".{e}")).unwrap_or_default();
+    let mut v: Vec<PathBuf> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&prefix) && n.ends_with(&suffix)))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Rotated files oldest first, then the live file: the order the records were written in.
+fn in_write_order(path: &Path) -> Vec<PathBuf> {
+    let mut v = rotated_files(path);
+    if path.exists() {
+        v.push(path.to_path_buf());
+    }
+    v
+}
+
+/// The file the position refers to: same inode and, when known, the same first bytes.
+pub fn locate(path: &Path, pos: &Position) -> Option<PathBuf> {
+    in_write_order(path).into_iter().find(|p| {
+        fs::metadata(p).is_ok_and(|m| m.ino() == pos.inode) && pos.head.as_ref().is_none_or(|h| same_head(p, h))
+    })
+}
+
+/// The files written after `file`, in order.
+fn newer_than(path: &Path, file: &Path) -> Vec<PathBuf> {
+    let all = in_write_order(path);
+    match all.iter().position(|p| p == file) {
+        Some(i) => all[i + 1..].to_vec(),
+        None => vec![],
+    }
+}
+
+/// The time of an audit record (the one `audit::to_record` stamps it with, near enough).
+fn record_ms(line: &[u8]) -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_slice(line).ok()?;
+    let t = v.get("stageTimestamp").or_else(|| v.get("requestReceivedTimestamp"))?.as_str()?;
+    Some(DateTime::parse_from_rfc3339(t).ok()?.timestamp_millis())
+}
+
+/// The time of the last record in a chunk of whole lines.
+fn last_record_ms(chunk: &[u8]) -> Option<i64> {
+    chunk.split(|b| *b == b'\n').rev().find_map(record_ms)
+}
+
+/// The time of the first record in a file.
+fn first_record_ms(path: &Path) -> Option<i64> {
+    let (chunk, _) = read_lines(path, 0, 64 << 10).ok()?;
+    chunk.split(|b| *b == b'\n').find_map(record_ms)
+}
+
+/// Offset just after the last complete line: where a restart starts reading.
+pub fn end_of_last_line(path: &Path) -> anyhow::Result<u64> {
+    let mut f = File::open(path)?;
+    let len = f.metadata()?.len();
+    let mut end = len;
+    let mut buf = vec![0u8; 64 << 10];
+    while end > 0 {
+        let start = end.saturating_sub(buf.len() as u64);
+        let n = (end - start) as usize;
+        f.seek(SeekFrom::Start(start))?;
+        f.read_exact(&mut buf[..n])?;
+        if let Some(i) = buf[..n].iter().rposition(|b| *b == b'\n') {
+            return Ok(start + i as u64 + 1);
+        }
+        end = start;
+    }
+    Ok(0)
 }
 
 /// Read complete lines starting at `offset`, at most `max` bytes.
@@ -133,44 +280,16 @@ pub fn read_lines(path: &Path, offset: u64, max: usize) -> anyhow::Result<(Vec<u
     }
 }
 
-/// After rotation the old file lives on under another name in the same directory.
-pub fn find_by_inode(dir: &Path, inode: u64) -> Option<PathBuf> {
-    fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).find(|p| fs::metadata(p).map(|m| m.ino() == inode).unwrap_or(false))
-}
-
-/// What to read next, given the saved position and the file currently at `path`.
-#[derive(Debug, PartialEq)]
-pub enum Next {
-    /// Keep reading this file from the saved offset.
-    Same(PathBuf),
-    /// The saved file was rotated away; finish it before switching.
-    Rotated(PathBuf),
-    /// Start the current file from the beginning (first run of a new file, or truncated).
-    Restart,
-    /// Nothing to read yet.
-    Missing,
-}
-
-pub fn next_source(path: &Path, pos: &Position) -> Next {
-    let Ok(meta) = fs::metadata(path) else { return Next::Missing };
-    if pos.inode == 0 {
-        return Next::Restart;
-    }
-    if meta.ino() == pos.inode {
-        if meta.len() < pos.offset { Next::Restart } else { Next::Same(path.to_path_buf()) }
-    } else {
-        match path.parent().and_then(|d| find_by_inode(d, pos.inode)) {
-            Some(old) => Next::Rotated(old),
-            None => Next::Restart, // rotated file already removed; nothing left to recover
-        }
-    }
-}
-
-/// What a collector reports about itself every minute (coverage page).
+/// What a collector reports about itself (coverage page): every minute, or every
+/// AL_HEARTBEAT_SECS seconds.
 pub type Health = Arc<Mutex<serde_json::Map<String, serde_json::Value>>>;
 
 pub fn set(h: &Health, key: &str, v: serde_json::Value) {
     h.lock().unwrap().insert(key.to_string(), v);
+}
+
+fn instance_name() -> String {
+    std::env::var("NODE_NAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "unknown".into())
 }
 
 /// Send a heartbeat every minute, with or without data, so the server can tell a quiet
@@ -179,76 +298,149 @@ pub fn heartbeat(collector: &'static str) -> anyhow::Result<Health> {
     let sender = Sender::from_env("heartbeat")?;
     let health: Health = Default::default();
     let h = health.clone();
-    let instance = std::env::var("NODE_NAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_else(|_| "unknown".into());
+    let instance = instance_name();
+    let every = env_or("AL_HEARTBEAT_SECS", "60").parse::<u64>().unwrap_or(60).max(1);
     tokio::spawn(async move {
         // Let the collector fill in its report before the first beat.
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(3.min(every))).await;
         loop {
             let details = serde_json::Value::Object(h.lock().unwrap().clone());
             let body = serde_json::json!({"collector": collector, "instance": instance, "version": env!("CARGO_PKG_VERSION"), "details": details});
             if let Err(e) = sender.send(body.to_string().as_bytes()).await {
                 warn!(error = %e, "heartbeat failed");
             }
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            tokio::time::sleep(Duration::from_secs(every)).await;
         }
     });
     Ok(health)
 }
 
+/// Bytes not yet acknowledged: the rest of the file being read and every file written after it.
+fn lag_bytes(path: &Path, source: &Path, offset: u64) -> u64 {
+    let len = |p: &Path| fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    len(source).saturating_sub(offset) + newer_than(path, source).iter().map(|p| len(p)).sum::<u64>()
+}
+
+/// The file to go on with after a loss: the oldest one whose first record comes after the last
+/// record acknowledged (so newer rotated files still on disk are read), else `audit.log`.
+fn resume_after_loss(path: &Path, last_ms: Option<i64>) -> PathBuf {
+    let after = |p: &PathBuf| match (last_ms, first_record_ms(p)) {
+        (Some(l), Some(f)) => f > l,
+        _ => false,
+    };
+    in_write_order(path).into_iter().find(after).unwrap_or_else(|| path.to_path_buf())
+}
+
+fn gap(from_ms: i64, to_ms: i64, reason: &str, detail: &str) -> Gap {
+    Gap { collector: "file".into(), instance: instance_name(), from_ms, to_ms: to_ms.max(from_ms), reason: reason.into(), detail: detail.into() }
+}
+
 /// Follow the audit log forever.
 pub async fn run_file() -> anyhow::Result<()> {
     let sender = Sender::from_env("k8s-audit")?;
+    let gaps = Sender::from_env("gap")?;
     let health = heartbeat("file")?;
     let path = PathBuf::from(env_or("AL_AUDIT_LOG", "/var/lib/rancher/rke2/server/logs/audit.log"));
     let state_dir = PathBuf::from(env_or("AL_STATE_DIR", "/var/lib/audit-loupe"));
     fs::create_dir_all(&state_dir)?;
     let state = state_dir.join("position.json");
+    let started_ms = Utc::now().timestamp_millis();
     let mut pos = Position::load(&state);
-    info!(file = %path.display(), ?pos, "following audit log");
+    let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if pos.inode != 0 {
+        // A restart: what was written while the collector was down is not read. The last
+        // record acknowledged dates the stop; a state file from before 0.3.2 has no such time,
+        // so its last write (made when the server acknowledged a batch) stands in for it.
+        let from = pos.last_ms.or_else(|| {
+            fs::metadata(&state).ok()?.modified().ok().map(|t| DateTime::<Utc>::from(t).timestamp_millis())
+        });
+        let from = from.unwrap_or(started_ms);
+        pos.pending.push(gap(from, started_ms, "collector-restart", &name(&path)));
+        pos.last_ms = Some(started_ms);
+        pos = if path.exists() {
+            let end = end_of_last_line(&path)?;
+            pos.at(&path, end)?
+        } else {
+            // No audit.log yet: the next one to appear is read from its start, as on a first run.
+            Position { last_ms: pos.last_ms, pending: pos.pending, ..Default::default() }
+        };
+        warn!(from_ms = from, to_ms = started_ms, offset = pos.offset, "restarted: reading from now on; the downtime is reported as not collected");
+        pos.save(&state)?;
+    }
+    info!(file = %path.display(), offset = pos.offset, "following audit log");
     let mut backoff = 1u64;
     loop {
-        let next = next_source(&path, &pos);
-        set(&health, "auditLog", serde_json::json!(if next == Next::Missing { "missing" } else { "present" }));
-        if let Ok(m) = fs::metadata(&path)
-            && m.ino() == pos.inode {
-                set(&health, "lagBytes", serde_json::json!(m.len().saturating_sub(pos.offset)));
+        if !pos.pending.is_empty() {
+            match send_gaps(&gaps, &pos.pending).await {
+                Ok(()) => {
+                    pos.pending.clear();
+                    pos.save(&state)?;
+                }
+                Err(e) => warn!(error = %e, "reporting a not-collected period failed; will retry"),
             }
-        let (source, restart) = match next {
-            Next::Missing => {
+        }
+        set(&health, "auditLog", serde_json::json!(if path.exists() { "present" } else { "missing" }));
+        if !path.exists() && rotated_files(&path).is_empty() {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+        if pos.inode == 0 {
+            // First run (read the current file from its start), or a restart that found no file.
+            if !path.exists() {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
-            Next::Restart => {
-                let ino = fs::metadata(&path)?.ino();
-                if pos.inode != 0 {
-                    warn!(old = pos.inode, new = ino, "starting the current file from the beginning");
-                }
-                pos = Position { inode: ino, offset: 0 };
-                pos.save(&state)?;
-                continue;
-            }
-            Next::Same(p) => (p, false),
-            Next::Rotated(p) => (p, true),
+            pos = pos.at(&path, 0)?;
+            pos.save(&state)?;
+            continue;
+        }
+        // Shorter than what was already read: truncated or replaced in place, not the same file.
+        let len = |p: &Path| fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        let Some(source) = locate(&path, &pos).filter(|p| len(p) >= pos.offset) else {
+            // The file being read is gone: removed (rotated out past maxbackup) or replaced under
+            // the same inode. What was left of it is lost; say so now, from the last record.
+            let replaced = in_write_order(&path).iter().any(|p| fs::metadata(p).is_ok_and(|m| m.ino() == pos.inode));
+            let reason = if replaced { "file-replaced" } else { "file-removed" };
+            let next = resume_after_loss(&path, pos.last_ms);
+            let now = Utc::now().timestamp_millis();
+            let from = pos.last_ms.unwrap_or(now);
+            let to = first_record_ms(&next).unwrap_or(now);
+            warn!(reason, from_ms = from, to_ms = to, next = %next.display(), "the file being read is gone before it was read to the end; reporting the loss");
+            pos.pending.push(gap(from, to, reason, ""));
+            pos = pos.at(&next, 0)?;
+            pos.save(&state)?;
+            continue;
         };
+        set(&health, "lagBytes", serde_json::json!(lag_bytes(&path, &source, pos.offset)));
+        // The first bytes are recorded as the file grows, up to HEAD_BYTES.
+        if pos.head.as_ref().is_none_or(|h| h.len < HEAD_BYTES) {
+            pos.head = Some(head_of(&source)?);
+        }
         let (chunk, consumed) = read_lines(&source, pos.offset, MAX_BATCH)?;
         if chunk.is_empty() {
-            if restart {
-                // Rotated file fully read; move to the new one.
-                let ino = fs::metadata(&path)?.ino();
-                info!(finished = %source.display(), "switching to the new audit log");
-                pos = Position { inode: ino, offset: 0 };
+            if let Some(next) = newer_than(&path, &source).into_iter().next() {
+                // A rotated file read to its end: go on with the next one written.
+                info!(finished = %source.display(), next = %next.display(), "rotated file read to the end");
+                pos = pos.at(&next, 0)?;
                 pos.save(&state)?;
                 continue;
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
             continue;
         }
-        match sender.send(&chunk).await {
-            Ok(()) => {
+        match sender.send_for_reply(&chunk).await {
+            Ok(reply) => {
                 pos.offset += consumed;
+                if let Some(t) = last_record_ms(&chunk) {
+                    pos.last_ms = Some(t);
+                }
                 pos.save(&state)?;
                 backoff = 1;
-                set(&health, "lastSentMs", serde_json::json!(chrono::Utc::now().timestamp_millis()));
+                set(&health, "lastSentMs", serde_json::json!(Utc::now().timestamp_millis()));
+                let skipped = serde_json::from_str::<serde_json::Value>(&reply).ok().and_then(|v| v.get("skipped")?.as_u64()).unwrap_or(0);
+                if skipped > 0 {
+                    warn!(skipped, file = %source.display(), "the server set aside lines it could not read; they are recorded there");
+                }
             }
             Err(e) => {
                 warn!(error = %e, retry_in = backoff, "send failed; will resend the same lines");
@@ -257,6 +449,13 @@ pub async fn run_file() -> anyhow::Result<()> {
             }
         }
     }
+}
+
+async fn send_gaps(sender: &Sender, gaps: &[Gap]) -> anyhow::Result<()> {
+    for g in gaps {
+        sender.send(serde_json::to_string(g)?.as_bytes()).await?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------
@@ -479,40 +678,64 @@ mod tests {
     }
 
     #[test]
-    fn rotation_finishes_the_old_file_first() {
+    fn rotated_files_in_write_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("audit.log");
+        for n in ["audit-2026-10-20T02-00-00.000.log", "audit-2026-10-19T23-00-00.000.log", "other.log", "audit.log"] {
+            fs::write(dir.path().join(n), "x\n").unwrap();
+        }
+        let names: Vec<String> = in_write_order(&p).iter().map(|f| f.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["audit-2026-10-19T23-00-00.000.log", "audit-2026-10-20T02-00-00.000.log", "audit.log"]);
+        let first = dir.path().join("audit-2026-10-19T23-00-00.000.log");
+        assert_eq!(newer_than(&p, &first).len(), 2);
+        assert!(newer_than(&p, &p).is_empty());
+    }
+
+    #[test]
+    fn rotation_is_followed_by_inode_and_first_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("audit.log");
         fs::write(&p, "old1\nold2\n").unwrap();
-        let ino = fs::metadata(&p).unwrap().ino();
-        let pos = Position { inode: ino, offset: 5 };
-        assert_eq!(next_source(&p, &pos), Next::Same(p.clone()));
+        let pos = Position::default().at(&p, 5).unwrap();
+        assert_eq!(locate(&p, &pos), Some(p.clone()));
         // kube-apiserver renames the file and starts a new one.
         let rotated = dir.path().join("audit-2026-10-17T01-00-00.000.log");
         fs::rename(&p, &rotated).unwrap();
         fs::write(&p, "new1\n").unwrap();
-        assert_eq!(next_source(&p, &pos), Next::Rotated(rotated.clone()));
-        let (chunk, _) = read_lines(&rotated, pos.offset, MAX_BATCH).unwrap();
-        assert_eq!(chunk, b"old2\n");
+        assert_eq!(locate(&p, &pos), Some(rotated.clone()));
+        assert_eq!(lag_bytes(&p, &rotated, pos.offset), 5 + 5);
+        // Same inode, other content: not the file that was being read.
+        fs::write(&rotated, "else\nelse\n").unwrap();
+        assert_eq!(locate(&p, &pos), None);
     }
 
     #[test]
-    fn truncation_and_first_run_restart() {
+    fn restart_starts_after_the_last_complete_line() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("audit.log");
-        assert_eq!(next_source(&p, &Position::default()), Next::Missing);
-        fs::write(&p, "a\n").unwrap();
-        assert_eq!(next_source(&p, &Position::default()), Next::Restart);
-        let ino = fs::metadata(&p).unwrap().ino();
-        assert_eq!(next_source(&p, &Position { inode: ino, offset: 99 }), Next::Restart);
+        fs::write(&p, "{\"a\":1}\n{\"b\":2}\n{\"c\":").unwrap();
+        assert_eq!(end_of_last_line(&p).unwrap(), 16);
+        fs::write(&p, "no newline yet").unwrap();
+        assert_eq!(end_of_last_line(&p).unwrap(), 0);
     }
 
     #[test]
-    fn position_round_trips() {
+    fn record_times_come_from_the_audit_event() {
+        let chunk = b"{\"stageTimestamp\":\"2026-10-20T00:00:01.5Z\"}\n{\"requestReceivedTimestamp\":\"2026-10-20T00:00:02Z\"}\nbroken\n";
+        assert_eq!(last_record_ms(chunk), Some(1792454402000));
+        assert_eq!(record_ms(b"broken"), None);
+    }
+
+    #[test]
+    fn position_round_trips_and_reads_the_old_format() {
         let dir = tempfile::tempdir().unwrap();
         let s = dir.path().join("position.json");
         assert_eq!(Position::load(&s), Position::default());
-        let p = Position { inode: 42, offset: 1234 };
+        let p = Position { inode: 42, offset: 1234, head: Some(Head { len: 3, sha256: "ab".into() }), last_ms: Some(7), pending: vec![] };
         p.save(&s).unwrap();
         assert_eq!(Position::load(&s), p);
+        // Written by 0.3.1 and earlier.
+        fs::write(&s, r#"{"inode":42,"offset":1234}"#).unwrap();
+        assert_eq!(Position::load(&s), Position { inode: 42, offset: 1234, ..Default::default() });
     }
 }

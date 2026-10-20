@@ -13,6 +13,11 @@
 - **collect-watch**：物件版本（改了什麼）。每座要稽核的叢集都裝。
 - **collect-rancher**：Rancher API audit log（經 Rancher 的操作與 Rancher 本身的管理動作）。只裝在 Rancher 所在叢集。
 - **collect-file**：RKE2 kube-apiserver audit log（包含繞過 Rancher 的操作）。裝在 RKE2 叢集，跑在 control plane 節點上。
+  - 只送「收集元件在跑的時候」讀到的紀錄。收集元件重新啟動時，從目前 `audit.log` 的結尾開始讀；停機期間寫進去的紀錄（含停機期間輪替出去的檔）**不會事後補讀**，那段時間在收集狀態頁記成「沒有收集」，原因 `collector-restart`，起點是停機前最後送出的那筆紀錄的時間。
+  - 收集元件在跑的時候發生輪替，會把輪替出去的檔讀完，再依序讀較新的檔。
+  - 正在讀的檔還沒讀完就被刪掉（`--audit-log-maxbackup` 把它刪了）或被換掉，會立刻記一筆「沒有收集」（`file-removed`／`file-replaced`），不用等心跳中斷 3 分鐘。
+  - 認檔不只看 inode，也比對檔案開頭的雜湊，所以 inode 被重複使用時不會從舊位置接著讀。
+  - log 裡有一行讀不懂時，server 只把那一行擱置（記長度與 sha256，不存內容），同一批的其他行照常存入；收集狀態的 `/api/coverage` 看得到被擱置的行。
 
 收集元件一律推送到 server，不需要 server 連回各叢集。
 

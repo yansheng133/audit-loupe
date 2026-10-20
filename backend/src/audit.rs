@@ -267,6 +267,26 @@ pub fn parse_body(body: &[u8]) -> anyhow::Result<Vec<Event>> {
     Ok(out)
 }
 
+/// Like `parse_body`, but a line that does not parse is set aside (with the reason) instead of
+/// failing the whole batch: one damaged line in the log must not stop everything after it.
+pub fn parse_body_lenient(body: &[u8]) -> (Vec<Event>, Vec<(Vec<u8>, String)>) {
+    if let Ok(evs) = parse_body(body) {
+        return (evs, Vec::new());
+    }
+    let (mut good, mut bad) = (Vec::new(), Vec::new());
+    for line in body.split(|b| *b == b'\n') {
+        let line = line.trim_ascii();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<Event>(line) {
+            Ok(ev) => good.push(ev),
+            Err(e) => bad.push((line.to_vec(), e.to_string())),
+        }
+    }
+    (good, bad)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

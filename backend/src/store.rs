@@ -105,6 +105,11 @@ CREATE TABLE IF NOT EXISTS security_events (
   UNIQUE (cluster, nv_id)
 );
 CREATE INDEX IF NOT EXISTS security_pod ON security_events(cluster, namespace, ts_ms);
+CREATE TABLE IF NOT EXISTS rejected_lines (
+  id INTEGER PRIMARY KEY, cluster TEXT NOT NULL, source TEXT NOT NULL, received_ms INTEGER NOT NULL,
+  len INTEGER NOT NULL, sha256 TEXT NOT NULL, error TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS rejected_time ON rejected_lines(received_ms);
 CREATE TABLE IF NOT EXISTS listing (
   cluster TEXT NOT NULL, api_group TEXT NOT NULL, resource TEXT NOT NULL, first INTEGER NOT NULL,
   PRIMARY KEY (cluster, api_group, resource)
@@ -289,9 +294,15 @@ const GAP_MS: i64 = 180_000;
 pub struct CoverageRow {
     pub cluster: String,
     pub collectors: Vec<Value>,
-    /// Silences of a collector; toMs null means it is still silent.
+    /// Periods not collected: silences of a collector (toMs null: still silent) and periods a
+    /// collector reported itself, each with a reason.
     pub gaps: Vec<Value>,
+    /// Lines a collector sent that could not be read, set aside so the rest of the batch was stored.
+    pub rejected: Vec<Value>,
 }
+
+/// Reason shown for a gap found from missing heartbeats (stored as '').
+const SILENT: &str = "collector-silent";
 
 pub struct RestoreSource {
     pub cluster: String,
@@ -561,6 +572,16 @@ impl Store {
             .collect::<Result<_, _>>()?;
         if !beat_cols.iter().any(|h| h == "first_ms") {
             conn.execute_batch("ALTER TABLE heartbeats ADD COLUMN first_ms INTEGER")?;
+        }
+        // 0.3.2: gaps reported by a collector say why; '' is a heartbeat silence.
+        let gap_cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('gaps')")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        for col in ["reason", "detail"] {
+            if !gap_cols.iter().any(|h| h == col) {
+                conn.execute_batch(&format!("ALTER TABLE gaps ADD COLUMN {col} TEXT NOT NULL DEFAULT ''"))?;
+            }
         }
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS events_pair ON events(cluster, user_id, source, ts_ms);
@@ -1638,6 +1659,31 @@ impl Store {
         Ok(())
     }
 
+    /// A period a collector says it did not collect (it restarted, or a file went away unread).
+    pub fn record_gap(&self, cluster: &str, g: &crate::collect::Gap) -> anyhow::Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "INSERT INTO gaps (cluster, collector, instance, from_ms, to_ms, reason, detail) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![cluster, g.collector, g.instance, g.from_ms, g.to_ms, g.reason, g.detail],
+        )?;
+        Ok(())
+    }
+
+    /// Lines set aside from a batch: only their length, hash and the parse error are kept.
+    pub fn record_rejected(&self, cluster: &str, source: &str, now_ms: i64, lines: &[(Vec<u8>, String)]) -> anyhow::Result<()> {
+        use sha2::{Digest, Sha256};
+        let c = self.conn.lock().unwrap();
+        for (line, error) in lines {
+            let hash: String = Sha256::digest(line).iter().map(|b| format!("{b:02x}")).collect();
+            let error: String = error.chars().take(200).collect();
+            c.execute(
+                "INSERT INTO rejected_lines (cluster, source, received_ms, len, sha256, error) VALUES (?1,?2,?3,?4,?5,?6)",
+                params![cluster, source, now_ms, line.len() as i64, hash, error],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Per cluster: each collector's last check-in and report, and gaps in the range
     /// (including a silence still going on).
     pub fn coverage(&self, from_ms: i64, to_ms: i64, now_ms: i64) -> anyhow::Result<Vec<CoverageRow>> {
@@ -1646,16 +1692,21 @@ impl Store {
             .prepare("SELECT cluster, collector, instance, last_ms, details FROM heartbeats ORDER BY cluster, collector, instance")?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
             .collect::<Result<_, _>>()?;
-        let gaps: Vec<(String, String, String, i64, i64)> = c
-            .prepare("SELECT cluster, collector, instance, from_ms, to_ms FROM gaps WHERE to_ms >= ?1 AND from_ms <= ?2 ORDER BY from_ms")?
-            .query_map(params![from_ms, to_ms], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+        type GapRow = (String, String, String, i64, i64, String, String);
+        let gaps: Vec<GapRow> = c
+            .prepare("SELECT cluster, collector, instance, from_ms, to_ms, reason, detail FROM gaps WHERE to_ms >= ?1 AND from_ms <= ?2 ORDER BY from_ms")?
+            .query_map(params![from_ms, to_ms], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?
+            .collect::<Result<_, _>>()?;
+        let rejected: Vec<(String, String, i64, i64, String, String)> = c
+            .prepare("SELECT cluster, source, received_ms, len, sha256, error FROM rejected_lines WHERE received_ms BETWEEN ?1 AND ?2 ORDER BY received_ms")?
+            .query_map(params![from_ms, to_ms], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
             .collect::<Result<_, _>>()?;
         let mut out: Vec<CoverageRow> = Vec::new();
         let row = |out: &mut Vec<CoverageRow>, cl: &str| -> usize {
             match out.iter().position(|r| r.cluster == cl) {
                 Some(i) => i,
                 None => {
-                    out.push(CoverageRow { cluster: cl.to_string(), collectors: vec![], gaps: vec![] });
+                    out.push(CoverageRow { cluster: cl.to_string(), collectors: vec![], gaps: vec![], rejected: vec![] });
                     out.len() - 1
                 }
             }
@@ -1666,12 +1717,17 @@ impl Store {
             out[i].collectors.push(json!({"collector": col, "instance": inst, "lastMs": last, "stale": stale,
                                           "details": serde_json::from_str::<Value>(&details).unwrap_or(Value::Null)}));
             if stale && last <= to_ms {
-                out[i].gaps.push(json!({"collector": col, "instance": inst, "fromMs": last, "toMs": null}));
+                out[i].gaps.push(json!({"collector": col, "instance": inst, "fromMs": last, "toMs": null, "reason": SILENT, "detail": ""}));
             }
         }
-        for (cl, col, inst, f, t) in gaps {
+        for (cl, col, inst, f, t, reason, detail) in gaps {
             let i = row(&mut out, &cl);
-            out[i].gaps.push(json!({"collector": col, "instance": inst, "fromMs": f, "toMs": t}));
+            let reason = if reason.is_empty() { SILENT.to_string() } else { reason };
+            out[i].gaps.push(json!({"collector": col, "instance": inst, "fromMs": f, "toMs": t, "reason": reason, "detail": detail}));
+        }
+        for (cl, source, at, len, sha, error) in rejected {
+            let i = row(&mut out, &cl);
+            out[i].rejected.push(json!({"source": source, "receivedMs": at, "len": len, "sha256": sha, "error": error}));
         }
         Ok(out)
     }
