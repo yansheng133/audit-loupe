@@ -3,8 +3,8 @@
 在 Rancher 裡回答「誰、在什麼時候、透過什麼管道、對哪個物件、改了什麼」。
 Answers *who changed what, when, and how* across Rancher-managed Kubernetes clusters, inside the Rancher UI.
 
-**狀態：M1、M2 的程式完成，尚未在真實叢集跑過。** 後端 72 個測試通過；收集元件以假的 Kubernetes／SUSE Security API 跑過完整流程；介面以示意資料在獨立頁面驗證過，還沒載入 Rancher。實機驗證見 [`docs/lab/m1-m2-lab-task.md`](docs/lab/m1-m2-lab-task.md)。
-**Status: M1 and M2 code complete, not yet run on a real cluster.** 72 backend tests pass; collectors were run end to end against fake Kubernetes and SUSE Security APIs; the UI was checked with demo data in a standalone page, not yet inside Rancher.
+**狀態：在 lab 實際運作中，還沒有正式版。** lab 是 Rancher 加一座 RKE2 下游叢集，收集元件、後端與介面都裝在 Rancher 裡實際使用。每個 PR 都會跑後端測試、Helm chart 檢查，以及每天約 71 萬筆資料的效能閘門。實機驗證的任務書與報告在 [`docs/lab/`](docs/lab/)。
+**Status: running in a lab, no stable release yet.** The lab is Rancher plus one downstream RKE2 cluster, with the collectors, backend and UI installed and in use inside Rancher. Every pull request runs the backend tests, Helm chart checks and a performance gate at about 710,000 records a day. Lab task books and reports are in [`docs/lab/`](docs/lab/).
 
 - 設計：[`docs/design.md`](docs/design.md)
 - 部署：[`docs/deploy.md`](docs/deploy.md)
