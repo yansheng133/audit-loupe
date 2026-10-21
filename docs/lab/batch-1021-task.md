@@ -113,7 +113,7 @@ Sam 10/21 的決定（需求第 4 節第 7–14 點）優先於計畫原文，�
 
 ### (5) 讓 Sam 看介面
 - 不要自己登入 Rancher（Sam 自己登入）。
-- 在 UI repo 的 `feat/v5` 確認 `API=https://rancher.192.168.128.3.nip.io scripts/dev.sh` 可以啟動、編譯沒有錯誤，然後停掉。
+- 在 UI repo 的 `feat/v5` 確認 `API=https://rancher.192.0.2.10.nip.io scripts/dev.sh` 可以啟動、編譯沒有錯誤，然後停掉。
 - 在報告裡寫好 Sam 要執行的指令與要看的頁面網址。
 
 ## 6. 總報告
