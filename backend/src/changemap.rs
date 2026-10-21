@@ -176,6 +176,8 @@ fn parse_key(k: &str) -> Option<ObjKey> {
 }
 
 const STATES: [&str; 4] = ["look", "unclear", "blind", "clear"];
+/// The relations tab's name for records nobody could be found for.
+const NO_ACTOR: &str = "(找不到執行者)";
 fn rank(s: &str) -> usize {
     match s {
         "look" => 0,
@@ -198,6 +200,9 @@ struct Op {
     actor: String,
     category: &'static str,
     note: String,
+    /// The identity's reason as a code the page translates; `None` for a whitelist reason,
+    /// which is shown as the administrator wrote it.
+    note_code: Option<&'static str>,
     via: String,
     verb: String,
     severity: Option<String>,
@@ -218,6 +223,9 @@ struct Obj {
     state: &'static str,
     severity: Option<String>,
     reason: String,
+    /// Why, as a code the page translates (v0.2): alert-high, alert-medium, no-apiserver-audit,
+    /// found-on-reconnect, near-gap.
+    reason_code: &'static str,
     last: i64,
 }
 
@@ -452,13 +460,14 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         let (actor, human, ua, uid): (String, bool, String, String) = (r.get(2)?, r.get::<_, i64>(3)? == 1, r.get(11)?, r.get(12)?);
         // The identity table decides the class (whitelist included); records stored without
         // going through ingest (tests) fall back to the built-in rules.
-        let (category, note) = match idents.get(&(actor.clone(), uid.clone())) {
+        let (category, reason) = match idents.get(&(actor.clone(), uid.clone())) {
             Some((c, n)) => (*c, n.clone()),
             None => {
                 let (c, n) = crate::identity::builtin(&actor, human, &ua, principals.get(&uid).map(String::as_str));
                 (c, n.to_string())
             }
         };
+        let (note, note_code) = (crate::identity::reason_text(&reason).to_string(), crate::identity::reason_code(&reason));
         if !with_system {
             if ui_maintenance(&resource, &name) {
                 hidden_ui += 1;
@@ -474,7 +483,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         // the verb: current kubectl opens these over a websocket with GET, older ones with POST
         // (create). Other subresources keep the old rule: only a create is named after them.
         let verb = if matches!(sub.as_str(), "exec" | "attach" | "portforward") || (!sub.is_empty() && verb == "create") { sub.clone() } else { verb };
-        let op = Op { t: r.get(1)?, cluster, key, resource, namespace, name, actor, category, note, via: r.get(4)?, verb, severity, unattributed: false, hashed: r.get(14)? };
+        let op = Op { t: r.get(1)?, cluster, key, resource, namespace, name, actor, category, note, note_code, via: r.get(4)?, verb, severity, unattributed: false, hashed: r.get(14)? };
         add(op, &api_group, &mut objs, &mut ops);
     }
     drop(rows);
@@ -502,7 +511,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         }
         let key = format!("{cluster}/{api_group}/{resource}/{namespace}/{name}");
         let op = Op {
-            t: r.get(1)?, cluster, key, resource, namespace, name, actor: String::new(), category: "unknown", note: "找不到執行者".into(),
+            t: r.get(1)?, cluster, key, resource, namespace, name, actor: String::new(), category: "unknown", note: "找不到執行者".into(), note_code: Some("no-actor"),
             via: "unknown".into(), verb: r.get(6)?, severity: None, unattributed: true, hashed: false,
         };
         add(op, &api_group, &mut objs, &mut ops);
@@ -521,12 +530,12 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     }
     drop(st);
 
-    let unclear_reason = |cluster: &str| -> String {
+    let unclear_reason = |cluster: &str| -> (&'static str, String) {
         let cols = collectors.get(cluster);
         if cols.is_some_and(|c| !c.contains("file")) {
-            "這座叢集沒有收 apiserver audit log：只看得到物件變了，看不到是誰改的".into()
+            ("no-apiserver-audit", "這座叢集沒有收 apiserver audit log：只看得到物件變了，看不到是誰改的".into())
         } else {
-            "收集中斷後重新連線比對物件版本才發現的變更，找不到對應的 audit 紀錄".into()
+            ("found-on-reconnect", "收集中斷後重新連線比對物件版本才發現的變更，找不到對應的 audit 紀錄".into())
         }
     };
     let in_gap = |cluster: &str, t: i64| gaps.iter().any(|(cl, f, to, _)| cl == cluster && t >= f - SLOT_GRACE_MS && t <= to + SLOT_GRACE_MS);
@@ -535,14 +544,14 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         let sev = o.ops.iter().filter_map(|i| ops[*i].severity.clone()).min_by_key(|s| if s == "high" { 0 } else { 1 });
         if let Some(s) = sev {
             o.state = "look";
-            o.reason = if s == "high" { "當天有高風險警示".into() } else { "當天有中風險警示".into() };
+            (o.reason_code, o.reason) = if s == "high" { ("alert-high", "當天有高風險警示".into()) } else { ("alert-medium", "當天有中風險警示".into()) };
             o.severity = Some(s);
         } else if o.ops.iter().any(|i| ops[*i].unattributed) {
             o.state = "unclear";
-            o.reason = unclear_reason(&o.cluster);
+            (o.reason_code, o.reason) = unclear_reason(&o.cluster);
         } else if o.ops.iter().any(|i| in_gap(&o.cluster, ops[*i].t)) {
             o.state = "blind";
-            o.reason = "有紀錄落在收集中斷前後 10 分鐘內，可能不完整".into();
+            (o.reason_code, o.reason) = ("near-gap", "有紀錄落在收集中斷前後 10 分鐘內，可能不完整".into());
         } else {
             o.state = "clear";
         }
@@ -571,7 +580,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         let ops_json: Vec<Value> = list
             .iter()
             .take(DETAIL_OPS)
-            .map(|op| json!({"t": op.t, "who": op.actor, "category": op.category, "note": op.note, "verb": op.verb, "via": op.via,
+            .map(|op| json!({"t": op.t, "who": op.actor, "category": op.category, "note": op.note, "noteCode": op.note_code, "verb": op.verb, "via": op.via,
                              "raw": {"verb": op.verb, "resource": op.resource, "user": op.actor}}))
             .collect();
         // Objects this one refers to (v0.1, point 3); kept apart from the settings below.
@@ -588,6 +597,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         let mut depends: Vec<Value> = Vec::new();
         if o.kind == "Pod" && list.iter().any(|op| matches!(op.verb.as_str(), "exec" | "attach")) {
             depends.push(json!({
+                "code": "suse-security",
                 "setting": "是否啟用 SUSE Security 收集",
                 "text": "容器裡輸入的指令不在 audit log。有啟用時，這裡會列出 SUSE Security 判定違規的程序。",
             }));
@@ -604,7 +614,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
             _ => "pending",
         };
         Ok(json!({
-            "key": o.key, "batch": o.name == BATCH, "state": o.state, "severity": o.severity, "stateReason": o.reason,
+            "key": o.key, "batch": o.name == BATCH, "state": o.state, "severity": o.severity, "stateReason": o.reason, "stateReasonCode": o.reason_code,
             "strip": ticks(o), "ops": ops_json, "dependsOn": depends, "related": related, "hasVersions": has_versions, "hashChain": hash,
         }))
     };
@@ -674,7 +684,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     }
     let gaps_json: Vec<Value> = gaps
         .iter()
-        .map(|(cl, f, t, col)| json!({"cluster": cl, "fromMs": f, "toMs": t, "kind": "heartbeat", "reason": format!("收集元件 {col} 沒有回報")}))
+        .map(|(cl, f, t, col)| json!({"cluster": cl, "fromMs": f, "toMs": t, "kind": "heartbeat", "collector": col, "reasonCode": "collector-silent", "reason": format!("收集元件 {col} 沒有回報")}))
         .collect();
 
     // Prefer the latest op with a known author; fall back to the latest unattributed change.
@@ -712,9 +722,9 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
                 let l = latest_op(o);
                 json!({
                     "key": o.key, "kind": o.kind, "name": o.name, "namespace": o.namespace, "cluster": o.cluster, "batch": o.name == BATCH,
-                    "state": o.state, "severity": o.severity, "stateReason": o.reason,
+                    "state": o.state, "severity": o.severity, "stateReason": o.reason, "stateReasonCode": o.reason_code,
                     "ops": o.ops.len(), "lastMs": o.last, "ticks": ticks(o),
-                    "who": {"name": l.actor, "category": l.category, "note": l.note},
+                    "who": {"name": l.actor, "category": l.category, "note": l.note, "noteCode": l.note_code},
                     "via": l.via,
                 })
             })
@@ -731,7 +741,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         for o in &shown {
             for i in &o.ops {
                 let op = &ops[*i];
-                let id = if op.actor.is_empty() { "(找不到執行者)".to_string() } else { op.actor.clone() };
+                let id = if op.actor.is_empty() { NO_ACTOR.to_string() } else { op.actor.clone() };
                 let e = idents.entry(id.clone()).or_insert((op.category, 0));
                 e.1 += 1;
                 let bypass = op.via == "direct" && matches!(op.category, "human" | "unknown");
@@ -747,7 +757,8 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         for (id, (cat, _)) in &idents {
             let nid = ident_node(id);
             let label = if group { format!("{cat}（群組）") } else { id.clone() };
-            nodes.entry(nid.clone()).or_insert(json!({"id": nid, "type": "identity", "label": label, "category": cat}));
+            // `group` and `noActor` let the page word these labels in its own language (v0.2).
+            nodes.entry(nid.clone()).or_insert(json!({"id": nid, "type": "identity", "label": label, "category": cat, "group": group, "noActor": !group && id == NO_ACTOR}));
         }
         let mut edges: BTreeMap<(String, String), (i64, bool)> = BTreeMap::new();
         for ((id, via), (n, b)) in &e_iv {
@@ -786,15 +797,15 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         for o in &shown {
             let first = |pred: &dyn Fn(&Op) -> bool| o.ops.iter().map(|i| &ops[*i]).filter(|op| pred(op)).map(|op| op.t).min();
             if let Some(t) = first(&|op| op.severity.is_some()) {
-                evs.push(json!({"t": t, "subject": o.key, "from": "clear", "to": "look", "reason": "第一次出現中、高風險警示（近似：v0 以此代替物件狀態轉變）", "source": "state"}));
+                evs.push(json!({"t": t, "subject": o.key, "from": "clear", "to": "look", "reasonCode": "first-alert", "reason": "當天第一次出現中、高風險警示", "source": "state"}));
             }
             if let Some(t) = first(&|op| op.unattributed) {
-                evs.push(json!({"t": t, "subject": o.key, "from": "clear", "to": "unclear", "reason": "第一次出現找不到執行者的變更（近似：v0 以此代替物件狀態轉變）", "source": "state"}));
+                evs.push(json!({"t": t, "subject": o.key, "from": "clear", "to": "unclear", "reasonCode": "first-unattributed", "reason": "當天第一次出現找不到執行者的變更", "source": "state"}));
             }
         }
         for (cl, f, t, col) in &gaps {
-            evs.push(json!({"t": f, "subject": cl, "from": "ok", "to": "blind", "reason": format!("收集元件 {col} 停止回報"), "source": "heartbeat"}));
-            evs.push(json!({"t": t, "subject": cl, "from": "blind", "to": "ok", "reason": format!("收集元件 {col} 恢復回報"), "source": "heartbeat"}));
+            evs.push(json!({"t": f, "subject": cl, "from": "ok", "to": "blind", "reasonCode": "collector-stopped", "collector": col, "reason": format!("收集元件 {col} 停止回報"), "source": "heartbeat"}));
+            evs.push(json!({"t": t, "subject": cl, "from": "blind", "to": "ok", "reasonCode": "collector-resumed", "collector": col, "reason": format!("收集元件 {col} 恢復回報"), "source": "heartbeat"}));
         }
         evs.sort_by_key(|e| std::cmp::Reverse(e["t"].as_i64().unwrap_or(0)));
         evs.truncate(EVENTS);

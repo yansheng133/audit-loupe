@@ -114,6 +114,38 @@ mod tests {
         }
     }
 
+    /// Every reason on the page also comes as a code the page can say in its own language,
+    /// and nothing on it is worded for developers (v0.2).
+    #[test]
+    fn reasons_come_as_codes() {
+        let cfg = crate::config::Config::test();
+        let s = crate::store::Store::open(":memory:").unwrap();
+        crate::demo::seed(&s, &cfg).unwrap();
+        let day = {
+            let c = s.conn.lock().unwrap();
+            let t: i64 = c.query_row("SELECT max(ts_ms) FROM events", [], |r| r.get(0)).unwrap();
+            chrono::DateTime::from_timestamp_millis(t).unwrap().with_timezone(&cfg.tz).format("%Y-%m-%d").to_string()
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        let page = changemap(&s, cfg.tz, &Params { day: Some(day.clone()), ..Default::default() }, now).unwrap();
+        let rows = page["rows"].as_array().unwrap();
+        for r in rows {
+            let code = r["stateReasonCode"].as_str().unwrap_or("");
+            match r["state"].as_str().unwrap() {
+                "look" => assert!(code.starts_with("alert-"), "{r}"),
+                "unclear" => assert!(["no-apiserver-audit", "found-on-reconnect"].contains(&code), "{r}"),
+                "blind" => assert_eq!(code, "near-gap"),
+                _ => assert_eq!(code, ""),
+            }
+            if r["who"]["name"].as_str().is_some_and(|n| !n.is_empty()) && r["who"]["category"] != "human" {
+                assert!(r["who"]["noteCode"].is_string(), "{r}");
+            }
+        }
+        let events = changemap(&s, cfg.tz, &Params { day: Some(day), tab: Some("events".into()), ..Default::default() }, now).unwrap();
+        assert!(events["events"].as_array().unwrap().iter().all(|e| e["reasonCode"].is_string()), "{events}");
+        assert!(!events.to_string().contains("v0") && !page.to_string().contains("近似"));
+    }
+
     /// The page's query must be answered from the index alone, without reading the table.
     #[test]
     fn the_page_query_reads_only_the_index() {

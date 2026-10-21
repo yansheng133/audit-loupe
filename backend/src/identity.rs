@@ -125,37 +125,64 @@ pub fn classify(actor: &str, user_id: &str, human: bool, user_agent: &str, princ
 }
 
 /// The built-in rules (report-ui-facts section B). `human` is the record's own guess from the
-/// name; `principals` the Rancher user's principal IDs (JSON array), when known.
+/// name; `principals` the Rancher user's principal IDs (JSON array), when known. Returns the
+/// class and a reason code; the page says the reason in the user's language (`reason_text`
+/// is the Chinese one, for API clients that show text).
 pub fn builtin(actor: &str, human: bool, user_agent: &str, principals: Option<&str>) -> (&'static str, &'static str) {
     if let Some(rest) = actor.strip_prefix("system:serviceaccount:") {
         let ns = rest.split(':').next().unwrap_or("");
         return if ns.starts_with("cattle-") {
-            ("rancher", "Rancher 安裝的元件所用的 ServiceAccount")
+            ("rancher", "sa-rancher")
         } else if ns == "kube-system" {
-            ("component", "叢集內建元件")
+            ("component", "sa-kube-system")
         } else {
-            ("serviceaccount", "工作負載的 ServiceAccount")
+            ("serviceaccount", "sa-workload")
         };
     }
     match actor {
-        "system:admin" => return ("human", "管理者憑證，對不到個人"),
-        "system:cattle:error" => return ("unknown", "Rancher 未通過驗證的請求，看不出是誰"),
-        "" => return ("unknown", "找不到執行者"),
+        "system:admin" => return ("human", "admin-cert"),
+        "system:cattle:error" => return ("unknown", "rancher-unauthenticated"),
+        "" => return ("unknown", "no-actor"),
         _ => {}
     }
     if actor.starts_with("system:") || actor.ends_with("cloud-controller-manager") || user_agent.starts_with("cloud-controller-manager/") {
-        return ("component", "叢集內建元件");
+        return ("component", "system-component");
     }
     if let Some(p) = principals {
         if p.contains("system://") {
-            return ("rancher", "Rancher 內部帳號（叢集佈建）");
+            return ("rancher", "rancher-provisioning");
         }
         let ids: Vec<String> = serde_json::from_str(p).unwrap_or_default();
         if human && !ids.is_empty() && ids.iter().all(|i| i.starts_with("local://")) {
-            return ("human", "Rancher 本機帳號，可能多人共用");
+            return ("human", "rancher-local-user");
         }
     }
-    if human { ("human", "") } else { ("unknown", "看不出是人或程式") }
+    if human { ("human", "") } else { ("unknown", "unclassified") }
+}
+
+/// The reason codes `builtin` gives, and what each means (Chinese, for API clients that show
+/// text as it comes; the UI has its own wording per language).
+pub const REASONS: [(&str, &str); 10] = [
+    ("sa-rancher", "Rancher 安裝的元件所用的 ServiceAccount"),
+    ("sa-kube-system", "叢集內建元件"),
+    ("sa-workload", "工作負載的 ServiceAccount"),
+    ("admin-cert", "管理者憑證，對不到個人"),
+    ("rancher-unauthenticated", "Rancher 未通過驗證的請求，看不出是誰"),
+    ("no-actor", "找不到執行者"),
+    ("system-component", "叢集內建元件"),
+    ("rancher-provisioning", "Rancher 內部帳號（叢集佈建）"),
+    ("rancher-local-user", "Rancher 本機帳號，可能多人共用"),
+    ("unclassified", "看不出是人或程式"),
+];
+
+/// A reason code as text; anything that is not a code (a whitelist reason) as it is.
+pub fn reason_text(code: &str) -> &str {
+    REASONS.iter().find(|(c, _)| *c == code).map(|(_, t)| *t).unwrap_or(code)
+}
+
+/// The reason code, if `s` is one.
+pub fn reason_code(s: &str) -> Option<&'static str> {
+    REASONS.iter().find(|(c, _)| *c == s).map(|(c, _)| *c)
 }
 
 pub fn class_name(s: &str) -> &'static str {
@@ -245,7 +272,8 @@ pub fn list(c: &Connection) -> anyhow::Result<Vec<serde_json::Value>> {
         .query_map([], |r| {
             Ok(serde_json::json!({
                 "name": r.get::<_, String>(0)?, "userId": r.get::<_, String>(1)?, "class": r.get::<_, String>(2)?,
-                "reason": r.get::<_, String>(3)?, "source": r.get::<_, String>(4)?, "firstMs": r.get::<_, i64>(5)?,
+                "reasonCode": reason_code(&r.get::<_, String>(3)?), "reason": reason_text(&r.get::<_, String>(3)?),
+                "source": r.get::<_, String>(4)?, "firstMs": r.get::<_, i64>(5)?,
             }))
         })?
         .collect::<Result<_, _>>()?;
@@ -285,7 +313,10 @@ mod tests {
         for (actor, human, ua, p, want) in cases {
             assert_eq!(classify(actor, "", *human, ua, *p, &none).class, *want, "{actor}");
         }
-        assert_eq!(builtin("admin", true, "", Some(r#"["local://user-kgw7z"]"#)), ("human", "Rancher 本機帳號，可能多人共用"));
+        assert_eq!(builtin("admin", true, "", Some(r#"["local://user-kgw7z"]"#)), ("human", "rancher-local-user"));
+        assert_eq!(reason_text("rancher-local-user"), "Rancher 本機帳號，可能多人共用");
+        assert_eq!(reason_text("排程工具"), "排程工具", "a whitelist reason is shown as written");
+        assert!(REASONS.iter().all(|(c, _)| reason_code(c) == Some(*c)));
     }
 
     #[test]

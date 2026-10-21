@@ -123,3 +123,10 @@ v0 是原型：開頁時直接查現有資料表，**不做彙總表、不調效
    - `recompute`：規則或白名單改了之後的重新判斷；`done`、`total` 是筆數。
    - 只有 `progress` 沒有 `dataNote` 時，`meta` 裡就沒有 `dataNote` 與 `dataUntilMs`。介面要分別判斷，不能假設 `meta` 一定有 `dataNote`。
 2. **事件分頁**：照 Sam 10/21 的決定，不另外存一張狀態轉變表，從當天的警示、找不到執行者的變化與缺口推出來。需求文件第 5 節 (5) 的「狀態轉變記成事件，直接讀」以此為準。
+3. **理由改成代碼**（介面依 Rancher 的語言自己說，不再中英混雜）。原本的中文文字欄位保留，給直接讀 API 的人：
+   - 物件：`stateReasonCode`：`alert-high`、`alert-medium`、`no-apiserver-audit`（**取決於設定**：這座叢集沒有收 apiserver audit log）、`found-on-reconnect`、`near-gap`；清楚的物件是空字串。
+   - 身分：`who.noteCode`、`detail.ops[].noteCode`：`sa-rancher`、`sa-kube-system`、`sa-workload`、`admin-cert`、`rancher-unauthenticated`、`no-actor`、`system-component`、`rancher-provisioning`、`rancher-local-user`、`unclassified`。白名單的理由是管理者自己寫的文字，`noteCode` 為 null，`note` 照原文顯示。
+   - `detail.dependsOn[].code`：`suse-security`。
+   - 缺口：`timeline.gaps[]` 加 `collector` 與 `reasonCode: "collector-silent"`。
+   - 事件：`reasonCode`：`first-alert`、`first-unattributed`、`collector-stopped`、`collector-resumed`（後兩者帶 `collector`）。
+   - 關係圖的身分節點加 `group`（多個身分合併成一類）與 `noActor`（找不到執行者）。
