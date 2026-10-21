@@ -26,6 +26,8 @@ pub struct Params {
     pub cursor: Option<String>,
     pub select: Option<String>,
     pub system: Option<String>,
+    /// Object key for `/api/changemap/detail`.
+    pub key: Option<String>,
 }
 
 /// Parse a query string that may repeat `cluster`.
@@ -43,6 +45,7 @@ pub fn parse_query(q: &str) -> Params {
             "cursor" => p.cursor = Some(v),
             "select" => p.select = Some(v),
             "system" => p.system = Some(v),
+            "key" => p.key = Some(v),
             _ => {}
         }
     }
@@ -133,6 +136,78 @@ fn kind_from_resource(resource: &str) -> String {
     known.iter().find(|(r, _)| *r == resource).map(|(_, k)| k.to_string()).unwrap_or_else(|| resource.to_string())
 }
 
+/// Requests that leave no object behind (API contract v0.1, point 1). They are not changes to
+/// an object, so they are counted in `hidden.requestOnly` instead of listed.
+const REQUEST_ONLY: [&str; 5] = ["tokenreviews", "subjectaccessreviews", "selfsubjectaccessreviews", "selfsubjectreviews", "localsubjectaccessreviews"];
+
+/// Name shown for a write without a name: `deletecollection`, or a create whose name the
+/// server generated (v0.1, point 1).
+pub const BATCH: &str = "*";
+
+/// First instant of a local day. Where midnight does not exist (clocks jump forward at 00:00),
+/// the day starts at the first local minute that does.
+fn day_start(tz: chrono_tz::Tz, d: NaiveDate) -> i64 {
+    let mut t = d.and_hms_opt(0, 0, 0).unwrap();
+    for _ in 0..24 * 60 {
+        if let Some(dt) = tz.from_local_datetime(&t).earliest() {
+            return dt.timestamp_millis();
+        }
+        t += chrono::Duration::minutes(1);
+    }
+    Utc.from_utc_datetime(&d.and_hms_opt(0, 0, 0).unwrap()).timestamp_millis()
+}
+
+/// Page cursor (v0.1, point 2). Opaque to the page: hex of the newest event and version ids
+/// seen when the first page was read (so later pages are cut from the same data) and the sort
+/// key of the last row shown.
+#[derive(Debug, PartialEq)]
+struct Cursor {
+    ev_max: i64,
+    ver_max: i64,
+    rank: usize,
+    last: i64,
+    key: String,
+}
+
+fn enc_cursor(c: &Cursor) -> String {
+    format!("{}\n{}\n{}\n{}\n{}", c.ev_max, c.ver_max, c.rank, c.last, c.key).bytes().map(|b| format!("{b:02x}")).collect()
+}
+
+fn dec_cursor(s: &str) -> Option<Cursor> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes: Option<Vec<u8>> = (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect();
+    let text = String::from_utf8(bytes?).ok()?;
+    let mut it = text.splitn(5, '\n');
+    Some(Cursor {
+        ev_max: it.next()?.parse().ok()?,
+        ver_max: it.next()?.parse().ok()?,
+        rank: it.next()?.parse().ok()?,
+        last: it.next()?.parse().ok()?,
+        key: it.next()?.to_string(),
+    })
+}
+
+/// An object key `cluster/apiGroup/resource/namespace/name` taken apart.
+#[derive(Debug, Clone)]
+struct ObjKey {
+    cluster: String,
+    api_group: String,
+    resource: String,
+    namespace: String,
+    name: String,
+}
+
+fn parse_key(k: &str) -> Option<ObjKey> {
+    let mut it = k.splitn(5, '/');
+    let (cluster, api_group, resource, namespace, name) = (it.next()?, it.next()?, it.next()?, it.next()?, it.next()?);
+    if cluster.is_empty() || resource.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some(ObjKey { cluster: cluster.into(), api_group: api_group.into(), resource: resource.into(), namespace: namespace.into(), name: name.into() })
+}
+
 const STATES: [&str; 4] = ["look", "unclear", "blind", "clear"];
 fn rank(s: &str) -> usize {
     match s {
@@ -211,20 +286,48 @@ pub fn warm(store: &Store) {
     chain_status(store, Utc::now().timestamp_millis());
 }
 
+/// One page view. `AL_DATA_NOTE`, when set, is shown as a note on the page (v0.1, point 5).
 pub fn changemap(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64) -> anyhow::Result<Value> {
+    let note = std::env::var("AL_DATA_NOTE").ok().filter(|n| !n.is_empty());
+    build(store, tz, p, now_ms, None, note.as_deref())
+}
+
+/// The detail of one object (v0.1, point 4): what a click on a row needs, without working out
+/// the whole page again. `Null` when the object has nothing that day.
+pub fn detail(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64) -> anyhow::Result<Value> {
+    let key = p.key.as_deref().and_then(parse_key).ok_or_else(|| anyhow::anyhow!("key: expected cluster/apiGroup/resource/namespace/name"))?;
+    let v = build(store, tz, p, now_ms, Some(&key), None)?;
+    Ok(v.get("detail").cloned().unwrap_or(Value::Null))
+}
+
+fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option<&ObjKey>, note: Option<&str>) -> anyhow::Result<Value> {
     let day = match p.day.as_deref().filter(|d| !d.is_empty()) {
         Some(d) => NaiveDate::parse_from_str(d, "%Y-%m-%d").map_err(|e| anyhow::anyhow!("day: {e}"))?,
         None => Utc::now().with_timezone(&tz).date_naive(),
     };
-    let start = tz.from_local_datetime(&day.and_hms_opt(0, 0, 0).unwrap()).earliest().unwrap().timestamp_millis();
-    let end = tz.from_local_datetime(&day.succ_opt().unwrap().and_hms_opt(0, 0, 0).unwrap()).earliest().unwrap().timestamp_millis();
+    let start = day_start(tz, day);
+    let end = day_start(tz, day.succ_opt().ok_or_else(|| anyhow::anyhow!("day: out of range"))?);
     let tab = p.tab.as_deref().unwrap_or("overview");
     let with_system = p.system.as_deref() == Some("1");
     let clusters: HashSet<&str> = p.cluster.iter().map(String::as_str).collect();
     let ns_filter = p.namespace.as_deref().filter(|s| !s.is_empty());
     let chains = chain_status(store, now_ms);
 
+    let cursor = match p.cursor.as_deref().filter(|c| !c.is_empty()) {
+        Some(s) => Some(dec_cursor(s).ok_or_else(|| anyhow::anyhow!("cursor: not one this server gave out"))?),
+        None => None,
+    };
+
     let c = store.conn.lock().unwrap();
+    // Later pages are cut from the data the first page saw, so rows neither repeat nor go missing
+    // while new records arrive (v0.1, point 2).
+    let (ev_max, ver_max): (i64, i64) = match &cursor {
+        Some(k) => (k.ev_max, k.ver_max),
+        None => (
+            c.query_row("SELECT coalesce(max(id), 0) FROM events", [], |r| r.get(0))?,
+            c.query_row("SELECT coalesce(max(id), 0) FROM versions", [], |r| r.get(0))?,
+        ),
+    };
     let principals: HashMap<String, String> =
         c.prepare("SELECT user_id, principal_ids FROM users")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
     // Which collectors each cluster runs decides why a change has no author.
@@ -251,6 +354,7 @@ pub fn changemap(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64) -> a
     let mut ops: Vec<Op> = Vec::new();
     let mut hidden_system = 0i64;
     let mut hidden_ui = 0i64;
+    let mut hidden_request = 0i64;
     let mut objs: HashMap<String, Obj> = HashMap::new();
     let add = |op: Op, api_group: &str, objs: &mut HashMap<String, Obj>, ops: &mut Vec<Op>| {
         let o = objs.entry(op.key.clone()).or_insert_with(|| Obj {
@@ -272,10 +376,15 @@ pub fn changemap(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64) -> a
         "SELECT e.cluster, e.ts_ms, e.actor, e.human, e.via, e.verb, e.api_group, e.resource, e.subresource, e.namespace, e.name,
                 e.user_agent, e.user_id, e.source, e.hash IS NOT NULL,
                 (SELECT CASE WHEN max(a.severity='high') THEN 'high' WHEN max(a.severity='medium') THEN 'medium' END FROM alerts a WHERE a.event_id=e.id)
-         FROM events e WHERE e.ts_ms >= ?1 AND e.ts_ms < ?2 AND {}",
-        crate::store::SHOWN_PUB
+         FROM events e WHERE e.ts_ms >= ?1 AND e.ts_ms < ?2 AND e.id <= ?3 AND {} {}",
+        crate::store::SHOWN_PUB,
+        if only.is_some() { "AND e.cluster = ?4 AND e.resource = ?5 AND e.namespace = ?6 AND e.name = ?7" } else { "" }
     ))?;
-    let mut rows = st.query(params![start, end])?;
+    let only_name = |k: &ObjKey| if k.name == BATCH { String::new() } else { k.name.clone() };
+    let mut rows = match only {
+        Some(k) => st.query(params![start, end, ev_max, k.cluster, k.resource, k.namespace, only_name(k)])?,
+        None => st.query(params![start, end, ev_max])?,
+    };
     while let Some(r) = rows.next()? {
         let cluster: String = r.get(0)?;
         if !clusters.is_empty() && !clusters.contains(cluster.as_str()) {
@@ -286,9 +395,19 @@ pub fn changemap(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64) -> a
         if !is_write(&source, &verb, &sub) && severity.is_none() {
             continue;
         }
-        let (namespace, name, resource, api_group): (String, String, String, String) = (r.get(9)?, r.get(10)?, r.get(7)?, r.get(6)?);
-        if ns_filter.is_some_and(|n| n != namespace) || name.is_empty() {
+        let (namespace, mut name, resource, api_group): (String, String, String, String) = (r.get(9)?, r.get(10)?, r.get(7)?, r.get(6)?);
+        if ns_filter.is_some_and(|n| n != namespace) || only.is_some_and(|k| k.api_group != api_group) {
             continue;
+        }
+        // A write without a name is a deletecollection or a create the server named. It is
+        // listed as one batch row per resource and namespace; requests that leave no object
+        // behind are only counted (v0.1, point 1).
+        if name.is_empty() {
+            if REQUEST_ONLY.contains(&resource.as_str()) {
+                hidden_request += 1;
+                continue;
+            }
+            name = BATCH.to_string();
         }
         let (actor, human, ua, uid): (String, bool, String, String) = (r.get(2)?, r.get::<_, i64>(3)? == 1, r.get(11)?, r.get(12)?);
         let (category, note) = categorize(&actor, human, &ua, principals.get(&uid).map(String::as_str));
@@ -312,16 +431,18 @@ pub fn changemap(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64) -> a
 
     let mut st = c.prepare(
         "SELECT cluster, observed_ms, api_group, resource, namespace, name, change FROM versions
-         WHERE event_id IS NULL AND change <> 'baseline' AND observed_ms >= ?1 AND observed_ms < ?2",
+         WHERE event_id IS NULL AND change <> 'baseline' AND observed_ms >= ?1 AND observed_ms < ?2 AND id <= ?3",
     )?;
-    let mut rows = st.query(params![start, end])?;
+    let mut rows = st.query(params![start, end, ver_max])?;
     while let Some(r) = rows.next()? {
         let cluster: String = r.get(0)?;
         if !clusters.is_empty() && !clusters.contains(cluster.as_str()) {
             continue;
         }
         let (api_group, resource, namespace, name): (String, String, String, String) = (r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?);
-        if ns_filter.is_some_and(|n| n != namespace) {
+        if ns_filter.is_some_and(|n| n != namespace)
+            || only.is_some_and(|k| k.api_group != api_group || k.resource != resource || k.namespace != namespace || k.name != name)
+        {
             continue;
         }
         if !with_system && ui_maintenance(&resource, &name) {
@@ -374,6 +495,71 @@ pub fn changemap(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64) -> a
         } else {
             o.state = "clear";
         }
+    }
+
+    let ticks = |o: &Obj| -> Vec<Value> {
+        let mut v: Vec<&Op> = o.ops.iter().map(|i| &ops[*i]).collect();
+        v.sort_by_key(|op| op.t);
+        if v.len() > TICKS {
+            // Keep every alert and an even spread of the rest.
+            let step = v.len() as f64 / TICKS as f64;
+            let alerts: Vec<&Op> = v.iter().copied().filter(|op| op.severity.is_some()).collect();
+            let mut keep: Vec<&Op> = (0..TICKS).map(|i| v[(i as f64 * step) as usize]).collect();
+            keep.extend(alerts);
+            keep.sort_by_key(|op| op.t);
+            keep.dedup_by_key(|op| (op.t, op.severity.is_some()));
+            v = keep;
+        }
+        v.iter().map(|op| json!({"t": op.t, "alert": op.severity.is_some()})).collect()
+    };
+    // What the right-hand panel shows for one object.
+    let detail_of = |sel: Option<&Obj>| -> anyhow::Result<Value> {
+        let Some(o) = sel else { return Ok(Value::Null) };
+        let mut list: Vec<&Op> = o.ops.iter().map(|i| &ops[*i]).collect();
+        list.sort_by_key(|op| std::cmp::Reverse(op.t));
+        let ops_json: Vec<Value> = list
+            .iter()
+            .take(DETAIL_OPS)
+            .map(|op| json!({"t": op.t, "who": op.actor, "category": op.category, "note": op.note, "verb": op.verb, "via": op.via,
+                             "raw": {"verb": op.verb, "resource": op.resource, "user": op.actor}}))
+            .collect();
+        // Objects this one refers to (v0.1, point 3); kept apart from the settings below.
+        let mut st = c.prepare_cached(
+            "SELECT DISTINCT rel, to_kind, to_ns, to_name FROM relations WHERE cluster=?1 AND from_kind=?2 AND from_ns=?3 AND from_name=?4 LIMIT 50",
+        )?;
+        let related: Vec<Value> = st
+            .query_map(params![o.cluster, o.kind, o.namespace, o.name], |r| {
+                Ok(json!({"rel": r.get::<_, String>(0)?, "kind": r.get::<_, String>(1)?, "namespace": r.get::<_, String>(2)?, "name": r.get::<_, String>(3)?}))
+            })?
+            .collect::<Result<_, _>>()?;
+        // Settings that decide what the records can show. v0.1 has one: what was typed inside a
+        // container is never in the audit log.
+        let mut depends: Vec<Value> = Vec::new();
+        if o.kind == "Pod" && list.iter().any(|op| matches!(op.verb.as_str(), "exec" | "attach")) {
+            depends.push(json!({
+                "setting": "是否啟用 SUSE Security 收集",
+                "text": "容器裡輸入的指令不在 audit log。有啟用時，這裡會列出 SUSE Security 判定違規的程序。",
+            }));
+        }
+        let has_versions: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM versions WHERE cluster=?1 AND api_group=?2 AND resource=?3)",
+            params![o.cluster, o.api_group, o.resource],
+            |r| r.get(0),
+        )?;
+        let hash = match chains.as_ref().map(|m| m.get(&o.cluster)) {
+            Some(Some((Some(_), _))) => "broken",
+            _ if list.iter().any(|op| !op.unattributed && !op.hashed) => "pending",
+            Some(Some(_)) => "ok",
+            _ => "pending",
+        };
+        Ok(json!({
+            "key": o.key, "batch": o.name == BATCH, "state": o.state, "severity": o.severity, "stateReason": o.reason,
+            "strip": ticks(o), "ops": ops_json, "dependsOn": depends, "related": related, "hasVersions": has_versions, "hashChain": hash,
+        }))
+    };
+    if let Some(k) = only {
+        let key = format!("{}/{}/{}/{}/{}", k.cluster, k.api_group, k.resource, k.namespace, k.name);
+        return Ok(json!({"detail": detail_of(objs.get(&key))?}));
     }
 
     let mut list: Vec<&Obj> = objs.values().collect();
@@ -440,21 +626,6 @@ pub fn changemap(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64) -> a
         .map(|(cl, f, t, col)| json!({"cluster": cl, "fromMs": f, "toMs": t, "kind": "heartbeat", "reason": format!("收集元件 {col} 沒有回報")}))
         .collect();
 
-    let ticks = |o: &Obj| -> Vec<Value> {
-        let mut v: Vec<&Op> = o.ops.iter().map(|i| &ops[*i]).collect();
-        v.sort_by_key(|op| op.t);
-        if v.len() > TICKS {
-            // Keep every alert and an even spread of the rest.
-            let step = v.len() as f64 / TICKS as f64;
-            let alerts: Vec<&Op> = v.iter().copied().filter(|op| op.severity.is_some()).collect();
-            let mut keep: Vec<&Op> = (0..TICKS).map(|i| v[(i as f64 * step) as usize]).collect();
-            keep.extend(alerts);
-            keep.sort_by_key(|op| op.t);
-            keep.dedup_by_key(|op| (op.t, op.severity.is_some()));
-            v = keep;
-        }
-        v.iter().map(|op| json!({"t": op.t, "alert": op.severity.is_some()})).collect()
-    };
     // Prefer the latest op with a known author; fall back to the latest unattributed change.
     let latest_op = |o: &Obj| -> &Op { o.ops.iter().map(|i| &ops[*i]).max_by_key(|op| (!op.unattributed, op.t)).unwrap() };
 
@@ -465,20 +636,31 @@ pub fn changemap(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64) -> a
             .map(|(c, t)| (c.clone(), json!(Utc.timestamp_millis_opt(*t).unwrap().to_rfc3339_opts(chrono::SecondsFormat::Millis, true))))
             .collect::<serde_json::Map<_, _>>(),
         "counts": counts,
-        "hidden": {"system": hidden_system, "uiMaintenance": hidden_ui},
+        "hidden": {"system": hidden_system, "uiMaintenance": hidden_ui, "requestOnly": hidden_request},
         "timeline": {"slotMinutes": slot_min, "lines": lines, "gaps": gaps_json},
     });
 
     if tab == "overview" {
-        let offset: usize = p.cursor.as_deref().and_then(|c| c.parse().ok()).unwrap_or(0);
-        let page: Vec<Value> = shown
+        let after = cursor.as_ref().map(|k| (k.rank, std::cmp::Reverse(k.last), k.key.as_str()));
+        let mut rest: Vec<&Obj> = shown
             .iter()
-            .skip(offset)
-            .take(PAGE)
+            .copied()
+            .filter(|o| after.is_none_or(|a| (rank(o.state), std::cmp::Reverse(o.last), o.key.as_str()) > a))
+            .take(PAGE + 1)
+            .collect();
+        let more = rest.len() > PAGE;
+        rest.truncate(PAGE);
+        let next = if more {
+            rest.last().map(|o| enc_cursor(&Cursor { ev_max, ver_max, rank: rank(o.state), last: o.last, key: o.key.clone() }))
+        } else {
+            None
+        };
+        let page: Vec<Value> = rest
+            .iter()
             .map(|o| {
                 let l = latest_op(o);
                 json!({
-                    "key": o.key, "kind": o.kind, "name": o.name, "namespace": o.namespace, "cluster": o.cluster,
+                    "key": o.key, "kind": o.kind, "name": o.name, "namespace": o.namespace, "cluster": o.cluster, "batch": o.name == BATCH,
                     "state": o.state, "severity": o.severity, "stateReason": o.reason,
                     "ops": o.ops.len(), "lastMs": o.last, "ticks": ticks(o),
                     "who": {"name": l.actor, "category": l.category, "note": l.note},
@@ -487,7 +669,7 @@ pub fn changemap(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64) -> a
             })
             .collect();
         resp["rows"] = json!(page);
-        resp["next"] = if offset + PAGE < shown.len() { json!((offset + PAGE).to_string()) } else { Value::Null };
+        resp["next"] = json!(next);
     }
 
     if tab == "relations" {
@@ -567,41 +749,10 @@ pub fn changemap(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64) -> a
 
     // Detail of the selected object, or the first one in order.
     let sel = p.select.as_deref().and_then(|k| objs.get(k)).or_else(|| shown.first().copied());
-    resp["detail"] = match sel {
-        None => Value::Null,
-        Some(o) => {
-            let mut list: Vec<&Op> = o.ops.iter().map(|i| &ops[*i]).collect();
-            list.sort_by_key(|op| std::cmp::Reverse(op.t));
-            let ops_json: Vec<Value> = list
-                .iter()
-                .take(DETAIL_OPS)
-                .map(|op| json!({"t": op.t, "who": op.actor, "category": op.category, "note": op.note, "verb": op.verb, "via": op.via,
-                                 "raw": {"verb": op.verb, "resource": op.resource, "user": op.actor}}))
-                .collect();
-            let kind = o.kind.clone();
-            let mut st = c.prepare_cached(
-                "SELECT DISTINCT rel, to_kind, to_ns, to_name FROM relations WHERE cluster=?1 AND from_kind=?2 AND from_ns=?3 AND from_name=?4 LIMIT 50",
-            )?;
-            let depends: Vec<String> = st
-                .query_map(params![o.cluster, kind, o.namespace, o.name], |r| {
-                    let (rel, k, ns, n): (String, String, String, String) = (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?);
-                    Ok(if ns.is_empty() { format!("{rel}: {k} {n}") } else { format!("{rel}: {k} {ns}/{n}") })
-                })?
-                .collect::<Result<_, _>>()?;
-            let has_versions: bool = c
-                .query_row("SELECT EXISTS(SELECT 1 FROM versions WHERE cluster=?1 AND api_group=?2 AND resource=?3)", params![o.cluster, o.api_group, o.resource], |r| r.get(0))?;
-            let hash = match chains.as_ref().map(|m| m.get(&o.cluster)) {
-                Some(Some((Some(_), _))) => "broken",
-                _ if list.iter().any(|op| !op.unattributed && !op.hashed) => "pending",
-                Some(Some(_)) => "ok",
-                _ => "pending",
-            };
-            json!({
-                "key": o.key, "state": o.state, "severity": o.severity, "stateReason": o.reason,
-                "strip": ticks(o), "ops": ops_json, "dependsOn": depends, "hasVersions": has_versions, "hashChain": hash,
-            })
-        }
-    };
+    resp["detail"] = detail_of(sel)?;
+    if let Some(n) = note {
+        resp["meta"] = json!({"dataNote": n, "dataUntilMs": as_of.values().copied().max()});
+    }
     Ok(resp)
 }
 
@@ -704,15 +855,148 @@ mod tests {
         let p = Params { day: Some("2026-10-20".into()), ..Default::default() };
         let v = changemap(&s, chrono_tz::Asia::Taipei, &p, T).unwrap();
         assert_eq!(v["rows"].as_array().unwrap().len(), PAGE);
-        assert_eq!(v["next"], "100");
-        let p = Params { cursor: Some("100".into()), ..p };
+        let next = v["next"].as_str().unwrap().to_string();
+        assert!(next.parse::<i64>().is_err(), "the cursor is opaque, not an offset");
+        let p = Params { cursor: Some(next), ..p };
         let v = changemap(&s, chrono_tz::Asia::Taipei, &p, T).unwrap();
         assert_eq!(v["rows"].as_array().unwrap().len(), 50);
         assert!(v["next"].is_null());
+        let p = Params { cursor: Some("zz".into()), ..p };
+        assert!(changemap(&s, chrono_tz::Asia::Taipei, &p, T).is_err(), "a cursor the server did not give out is refused");
 
         let q = parse_query("day=2026-10-20&cluster=a&cluster=b&select=c%2F%2Fpods%2Fns%2Fx&tab=events");
         assert_eq!(q.cluster, vec!["a", "b"]);
         assert_eq!(q.select.as_deref(), Some("c//pods/ns/x"));
+    }
+
+    /// v0.1 point 2: records that arrive between two pages neither repeat rows nor push rows
+    /// off the next page.
+    #[test]
+    fn pages_hold_still_while_records_arrive() {
+        let s = store();
+        {
+            let c = s.conn.lock().unwrap();
+            for i in 0..150 {
+                ev(&c, i + 1, "c1", T + i * 1000, "alice", 1, "rancher", "patch", "configmaps", "app", &format!("cm{i}"));
+            }
+        }
+        let p = Params { day: Some("2026-10-20".into()), ..Default::default() };
+        let v1 = changemap(&s, chrono_tz::Asia::Taipei, &p, T).unwrap();
+        let mut keys: Vec<String> = v1["rows"].as_array().unwrap().iter().map(|r| r["key"].as_str().unwrap().to_string()).collect();
+        {
+            // A new object that sorts first, and a new write to an object already on page 1.
+            let c = s.conn.lock().unwrap();
+            ev(&c, 1000, "c1", T + 500_000, "bob", 1, "rancher", "patch", "configmaps", "app", "brand-new");
+            ev(&c, 1001, "c1", T + 600_000, "bob", 1, "rancher", "patch", "configmaps", "app", "cm149");
+        }
+        let p2 = Params { cursor: Some(v1["next"].as_str().unwrap().into()), ..p.clone() };
+        let v2 = changemap(&s, chrono_tz::Asia::Taipei, &p2, T).unwrap();
+        keys.extend(v2["rows"].as_array().unwrap().iter().map(|r| r["key"].as_str().unwrap().to_string()));
+        let unique: HashSet<&String> = keys.iter().collect();
+        assert_eq!(keys.len(), 150, "every object of the first view, once");
+        assert_eq!(unique.len(), 150);
+        assert!(!keys.iter().any(|k| k.ends_with("brand-new")), "records after the first page wait for a reload");
+        // A reload sees them.
+        let v3 = changemap(&s, chrono_tz::Asia::Taipei, &p, T).unwrap();
+        assert_eq!(v3["counts"]["objects"], 151);
+    }
+
+    /// v0.1 point 1: a deletecollection or a create the server named is one batch row;
+    /// requests that leave no object behind are only counted.
+    #[test]
+    fn batch_writes_are_listed_and_requests_are_counted() {
+        let s = store();
+        {
+            let c = s.conn.lock().unwrap();
+            ev(&c, 1, "c1", T, "alice", 1, "direct", "deletecollection", "pods", "app", "");
+            ev(&c, 2, "c1", T + 1000, "alice", 1, "direct", "deletecollection", "pods", "app", "");
+            ev(&c, 3, "c1", T + 2000, "alice", 1, "rancher", "create", "users", "", "");
+            ev(&c, 4, "c1", T + 3000, "alice", 1, "direct", "create", "selfsubjectaccessreviews", "", "");
+        }
+        let p = Params { day: Some("2026-10-20".into()), ..Default::default() };
+        let v = changemap(&s, chrono_tz::Asia::Taipei, &p, T).unwrap();
+        let rows = v["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        let pods = rows.iter().find(|r| r["key"] == "c1//pods/app/*").unwrap();
+        assert_eq!((pods["name"].as_str(), pods["batch"].as_bool(), pods["ops"].as_i64()), (Some("*"), Some(true), Some(2)));
+        assert!(rows.iter().any(|r| r["key"] == "c1//users//*" && r["batch"] == true));
+        assert_eq!(v["hidden"]["requestOnly"], 1);
+        assert_eq!(v["counts"]["ops"], 3);
+    }
+
+    /// v0.1 points 3 and 4: the detail call answers for one object; settings and related
+    /// objects are kept apart.
+    #[test]
+    fn detail_for_one_object() {
+        let s = store();
+        {
+            let c = s.conn.lock().unwrap();
+            ev(&c, 1, "c1", T, "alice", 1, "rancher", "patch", "configmaps", "app", "cfg");
+            c.execute(
+                "INSERT INTO events (id, cluster, audit_id, ts_ms, ts, actor, principal, human, via, caller, verb, api_group, resource, subresource,
+                                     namespace, name, code, source_ip, user_agent, request_uri, source, hash)
+                 VALUES (2, 'c1', '2', ?1, '', 'alice', '', 1, 'rancher', 'alice', 'create', '', 'pods', 'exec', 'app', 'web', 200, '', '', '', 'k8s', 'h')",
+                params![T + 1000],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO relations (cluster, from_kind, from_ns, from_name, rel, to_kind, to_ns, to_name) VALUES ('c1', 'Pod', 'app', 'web', 'mounts', 'ConfigMap', 'app', 'cfg')",
+                [],
+            )
+            .unwrap();
+            ev(&c, 3, "c1", T + 2000, "alice", 1, "direct", "deletecollection", "pods", "app", "");
+        }
+        let p = Params { day: Some("2026-10-20".into()), key: Some("c1//pods/app/web".into()), ..Default::default() };
+        let d = detail(&s, chrono_tz::Asia::Taipei, &p, T).unwrap();
+        assert_eq!(d["key"], "c1//pods/app/web");
+        assert_eq!(d["ops"].as_array().unwrap().len(), 1, "only this object's records");
+        assert_eq!(d["dependsOn"][0]["setting"], "是否啟用 SUSE Security 收集");
+        assert_eq!(d["related"][0], json!({"rel": "mounts", "kind": "ConfigMap", "namespace": "app", "name": "cfg"}));
+        // The same detail as the page gives for that object.
+        let page = changemap(&s, chrono_tz::Asia::Taipei, &Params { select: Some("c1//pods/app/web".into()), ..p.clone() }, T).unwrap();
+        assert_eq!(page["detail"], d);
+        // A configmap has no setting to name, and an empty list rather than related objects.
+        let d = detail(&s, chrono_tz::Asia::Taipei, &Params { key: Some("c1//configmaps/app/cfg".into()), ..p.clone() }, T).unwrap();
+        assert_eq!(d["dependsOn"], json!([]));
+        // The batch row of the same namespace answers too.
+        let d = detail(&s, chrono_tz::Asia::Taipei, &Params { key: Some("c1//pods/app/*".into()), ..p.clone() }, T).unwrap();
+        assert_eq!((d["batch"].as_bool(), d["ops"].as_array().unwrap().len()), (Some(true), 1));
+        // Nothing that day, and a malformed key.
+        assert!(detail(&s, chrono_tz::Asia::Taipei, &Params { key: Some("c1//pods/app/none".into()), ..p.clone() }, T).unwrap().is_null());
+        assert!(detail(&s, chrono_tz::Asia::Taipei, &Params { key: Some("c1/pods".into()), ..p }, T).is_err());
+    }
+
+    /// v0.1 point 5: the note is passed on with the time of the newest record.
+    #[test]
+    fn data_note_is_passed_on() {
+        let s = store();
+        {
+            let c = s.conn.lock().unwrap();
+            ev(&c, 1, "c1", T, "alice", 1, "rancher", "patch", "configmaps", "app", "cfg");
+        }
+        let p = Params { day: Some("2026-10-20".into()), ..Default::default() };
+        let v = build(&s, chrono_tz::Asia::Taipei, &p, T, None, Some("原型")).unwrap();
+        assert_eq!(v["meta"], json!({"dataNote": "原型", "dataUntilMs": T}));
+        let v = build(&s, chrono_tz::Asia::Taipei, &p, T, None, None).unwrap();
+        assert!(v.get("meta").is_none());
+    }
+
+    /// A day whose midnight does not exist (Havana moved clocks from 00:00 to 01:00 on
+    /// 2025-03-09) starts at the first minute that does, instead of stopping the server.
+    #[test]
+    fn day_without_a_midnight() {
+        let tz = chrono_tz::America::Havana;
+        let d = NaiveDate::from_ymd_opt(2025, 3, 9).unwrap();
+        assert!(tz.from_local_datetime(&d.and_hms_opt(0, 0, 0).unwrap()).earliest().is_none(), "the test needs a missing midnight");
+        let start = day_start(tz, d);
+        assert_eq!(start, tz.from_local_datetime(&d.and_hms_opt(1, 0, 0).unwrap()).earliest().unwrap().timestamp_millis());
+        let s = store();
+        let p = Params { day: Some("2025-03-09".into()), ..Default::default() };
+        let v = changemap(&s, tz, &p, T).unwrap();
+        assert_eq!(v["timeline"]["lines"][0]["slots"].as_array().unwrap().len(), 138, "the 23-hour day has 23 hours of slots");
+        let p = Params { day: Some("2025-03-08".into()), ..Default::default() };
+        let v = changemap(&s, tz, &p, T).unwrap();
+        assert_eq!(v["timeline"]["lines"][0]["slots"].as_array().unwrap().len(), 144, "the day before ends where that day starts");
     }
 
     #[test]

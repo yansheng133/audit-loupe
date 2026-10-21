@@ -121,6 +121,19 @@ async fn changemap(State(s): State<AppState>, uri: axum::http::Uri) -> Response 
     }
 }
 
+/// The right-hand detail of one object (v0.1): what a click on a row needs, without working
+/// out the whole page again. 404 when the object has nothing that day.
+async fn changemap_detail(State(s): State<AppState>, uri: axum::http::Uri) -> Response {
+    let p = crate::changemap::parse_query(uri.query().unwrap_or(""));
+    let (store, tz) = (s.store.clone(), s.cfg.tz);
+    match tokio::task::spawn_blocking(move || crate::changemap::detail(&store, tz, &p, Utc::now().timestamp_millis())).await {
+        Ok(Ok(serde_json::Value::Null)) => (StatusCode::NOT_FOUND, "no records for this object on that day").into_response(),
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => err(e.into()),
+    }
+}
+
 /// The rule settings in force, earlier settings, and whether stored records were judged by
 /// other settings than these (and how long judging them again would take).
 async fn rules(State(s): State<AppState>) -> Response {
@@ -541,6 +554,7 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/info", get(info))
         .route("/api/changemap", get(changemap))
+        .route("/api/changemap/detail", get(changemap_detail))
         .route("/api/actors", get(actors))
         .route("/api/users", get(users))
         .route("/api/timeline", get(timeline))
