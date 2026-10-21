@@ -88,3 +88,20 @@ v0 是原型：開頁時直接查現有資料表，**不做彙總表、不調效
   - v0 的物件狀態轉變可以用「第一次出現警示」「第一次出現執行者不明」來近似；`reason` 要寫明是近似。
 - **`detail.hasVersions`**：這類資源有沒有收物件版本。沒有時，介面停用三個動作按鈕。
 - **`detail.hashChain`**：`ok`／`broken`／`pending`，取自既有的 integrity 結果。
+
+## v0.1 變更（2026-10-21，Sam 同意）
+
+以下五點取代上面對應的規則；其他不變。
+
+1. **整批動作與沒有名稱的寫入要出現**（v0 會跳過 `name` 為空的紀錄）：
+   - `deletecollection`：當成一列，物件鍵為 `cluster/apiGroup/resource/namespace/*`；`name` 為 `*`，`kind` 照資源種類，`batch: true`。
+   - 沒有名稱的 `create`：先依資源分類，再照下面處理：
+     - 會留下物件的資源（例如用 `generateName` 建立）：能從紀錄取得實際名稱就用實際名稱；取不到就放進同一個 `*` 列，`batch: true`。
+     - 只是請求、不會留下物件的資源（例如 `tokenreviews`、`subjectaccessreviews`、`selfsubjectaccessreviews`、`selfsubjectreviews`、`localsubjectaccessreviews`）：不算物件變更，不列；計入 `hidden.requestOnly`。
+     - 分不出來的：列出來，`batch: true`，不要藏。
+2. **`cursor` 改成不透明字串**：由 server 依（狀態順序、`lastMs`、物件鍵）編碼，用 keyset 方式翻頁，不再用位移。介面只能原樣帶回，不能解析。
+3. **`detail.dependsOn` 只放設定項目**：
+   - 格式改為 `[{"setting": "是否啟用 SUSE Security 收集", "text": "容器裡輸入的指令不在 audit log。……"}]`。沒有就是空陣列。
+   - 相關物件改放新欄位 `detail.related`：`[{"rel": "mounts", "kind": "ConfigMap", "namespace": "", "name": ""}]`。
+4. **細節單獨一支 API**：`GET /api/changemap/detail?day=&key=`，只回 `detail` 物件。點一列時介面只打這支，不重打 `/api/changemap`。`/api/changemap` 開頁時照舊附預設選取的 `detail`。
+5. **原型標示**：server 設定了環境變數 `AL_DATA_NOTE` 時，回應多一個 `meta`：`{"dataNote": "<原文>", "dataUntilMs": <資料最後一筆的時間>}`。介面看到 `meta` 就在分頁列下方顯示一行提示。
