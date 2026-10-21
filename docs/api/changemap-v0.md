@@ -116,7 +116,7 @@ v0 是原型：開頁時直接查現有資料表，**不做彙總表、不調效
 
 ## v0.2（2026-10-21 晚）：開頁速度與進度
 
-欄位、參數與 cursor 都不變，回應內容與 v0.1 逐欄位相同（`backend/src/shown.rs` 與 `perf.rs` 的測試會比對）。只多了下面兩點：
+原有的參數、欄位與 cursor 意義都不變；讀索引和讀整天的結果逐欄位相同（`backend/src/shown.rs` 與 `perf.rs` 的測試會比對）。新增的欄位、參數與行為如下：
 
 1. **`meta.progress`**：有會改變畫面內容的工作正在進行時，回應帶 `meta.progress`，每一項是 `{"what": "index" | "recompute", "startedMs": <開始時間>, "done": <已完成或 null>, "total": <總量或 null>}`。
    - `index`：升級後第一次啟動，正在建立開頁用的索引。這段期間開頁照舊可用，只是比較慢；`done`、`total` 為 null（SQLite 不回報建索引的進度）。
@@ -132,3 +132,6 @@ v0 是原型：開頁時直接查現有資料表，**不做彙總表、不調效
    - 關係圖的身分節點加 `group`（多個身分合併成一類）與 `noActor`（找不到執行者）。
 4. **時間範圍**：`/api/changemap` 與 `/api/changemap/detail` 接受 `from`、`to`（毫秒，當天內）。總覽、件數、稽核狀態、關係、事件與細節只算範圍內的紀錄；時間列照樣是整天，讓人看得到範圍在一天裡的位置。不帶就是整天。
 5. **同時開同一個畫面**：server 算同一個畫面時，其他同時要同一個畫面的人等它算完、共用結果；算完之後才來的請求會重新算，所以重新整理一定看得到新紀錄。
+6. **列表少掉的兩種列**（第一層計畫 v2 的兩個顯示細節）：
+   - 只計入 `hidden.requestOnly`、不列成物件的請求，多了 Rancher 介面取得目前使用者的 `selfuser`、使用者與群組的搜尋（verb `search`）、登出（resource `logout` 或 verb `logout`）。
+   - 刪除 namespace 後，namespace controller 對每一種資源各送一次 `deletecollection`（實驗室一次約 110 筆）。這些紀錄併進那個 namespace 本身的列（`kind: Namespace`），不再各自成列；列上的「誰」是刪除 namespace 的人，不是 controller。細節的 `ops[]` 對這些紀錄多一個 `cascade`，值是被清空的資源（例如 `pods`），`raw.resource` 也是它；其他紀錄的 `cascade` 是 null。namespace controller 屬於系統元件，預設畫面本來就不顯示，帶 `system` 才看得到。

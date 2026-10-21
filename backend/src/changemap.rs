@@ -112,7 +112,22 @@ fn kind_from_resource(resource: &str) -> String {
 
 /// Requests that leave no object behind (API contract v0.1, point 1). They are not changes to
 /// an object, so they are counted in `hidden.requestOnly` instead of listed.
-const REQUEST_ONLY: [&str; 5] = ["tokenreviews", "subjectaccessreviews", "selfsubjectaccessreviews", "selfsubjectreviews", "localsubjectaccessreviews"];
+const REQUEST_ONLY: [&str; 7] = [
+    "tokenreviews", "subjectaccessreviews", "selfsubjectaccessreviews", "selfsubjectreviews", "localsubjectaccessreviews",
+    // Rancher: the "who am I" request its pages send, and logging out.
+    "selfuser", "logout",
+];
+
+/// Rancher actions that are requests, not changes: searching users and groups, logging out.
+const REQUEST_ONLY_ACTIONS: [&str; 2] = ["search", "logout"];
+
+fn request_only(resource: &str, verb: &str, name: &str) -> bool {
+    name.is_empty() && (REQUEST_ONLY.contains(&resource) || REQUEST_ONLY_ACTIONS.contains(&verb))
+}
+
+/// Deleting a namespace makes the namespace controller empty it with one `deletecollection`
+/// per kind, about 110 records. They are listed with the namespace itself, not as rows.
+pub const NAMESPACE_CONTROLLER: &str = "system:serviceaccount:kube-system:namespace-controller";
 
 /// Name shown for a write without a name: `deletecollection`, or a create whose name the
 /// server generated (v0.1, point 1).
@@ -212,6 +227,8 @@ struct Op {
     note_code: Option<&'static str>,
     via: String,
     verb: String,
+    /// For records listed with their namespace: the kind the namespace controller emptied.
+    cascade: Option<String>,
     severity: Option<String>,
     unattributed: bool,
     hashed: bool,
@@ -287,6 +304,13 @@ pub fn warm(store: &Store, tz: chrono_tz::Tz) {
 /// The page's query over the records it could list, answered from the `events_shown` index
 /// alone (see `shown.rs`). Same columns as the day scan; the User-Agent and the hash are not
 /// in the index and not needed for the list (the selected object's detail is read separately).
+fn only_filter_sql() -> String {
+    format!(
+        "AND e.cluster = ?4 AND ((e.resource = ?5 AND e.namespace = ?6 AND e.name = ?7)
+              OR (?5 = 'namespaces' AND ?6 = '' AND e.verb = 'deletecollection' AND e.actor = '{NAMESPACE_CONTROLLER}' AND e.namespace = ?7))"
+    )
+}
+
 pub fn shown_query() -> String {
     format!(
         "SELECT e.cluster, e.ts_ms, e.actor, e.human, e.via, e.verb, e.api_group, e.resource, e.subresource, e.namespace, e.name,
@@ -466,7 +490,12 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
                 (SELECT CASE WHEN max(a.severity='high') THEN 'high' WHEN max(a.severity='medium') THEN 'medium' END FROM alerts a WHERE a.event_id=e.id)
          FROM events e WHERE e.ts_ms >= ?1 AND e.ts_ms < ?2 AND e.id <= ?3 AND {} {}",
         crate::store::SHOWN_PUB,
-        if only.is_some() { "AND e.cluster = ?4 AND e.resource = ?5 AND e.namespace = ?6 AND e.name = ?7" } else { "" }
+        // A namespace's own detail also reads the records that emptied it.
+        if only.is_some() {
+            only_filter_sql()
+        } else {
+            String::new()
+        }
     );
     // INDEXED BY makes SQLite refuse the query rather than quietly read the whole table; if it
     // ever does, the page still works the slow way.
@@ -495,14 +524,17 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         if !is_write(s(13)?, s(5)?, s(8)?) && severity.is_none() {
             continue;
         }
-        if ns_filter.is_some_and(|n| n != s(9).unwrap_or_default()) || only.is_some_and(|k| k.api_group != s(6).unwrap_or_default()) {
+        // Emptying a deleted namespace is listed with the namespace (cluster-scoped, core group).
+        let cascade = s(5)? == "deletecollection" && s(2)? == NAMESPACE_CONTROLLER && !s(9)?.is_empty();
+        let group_ref = if cascade { "" } else { s(6)? };
+        if ns_filter.is_some_and(|n| n != s(9).unwrap_or_default()) || only.is_some_and(|k| k.api_group != group_ref) {
             continue;
         }
         // A write without a name is a deletecollection or a create the server named. It is
         // listed as one batch row per resource and namespace; requests that leave no object
         // behind are only counted (v0.1, point 1).
         let raw_name = s(10)?;
-        if raw_name.is_empty() && REQUEST_ONLY.contains(&s(7)?) {
+        if request_only(s(7)?, s(5)?, raw_name) {
             hidden_request += 1;
             continue;
         }
@@ -526,13 +558,17 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         }
         let (note, note_code) = (crate::identity::reason_text(reason).to_string(), crate::identity::reason_code(reason));
         let (cluster, actor, verb, sub) = (text(r, 0)?, text(r, 2)?, text(r, 5)?, text(r, 8)?);
-        let (namespace, name, resource, api_group) = (text(r, 9)?, name_ref.to_string(), text(r, 7)?, text(r, 6)?);
+        let (namespace, name, resource, api_group, cascade) = if cascade {
+            (String::new(), text(r, 9)?, "namespaces".to_string(), String::new(), Some(text(r, 7)?))
+        } else {
+            (text(r, 9)?, name_ref.to_string(), text(r, 7)?, text(r, 6)?, None)
+        };
         let key = format!("{cluster}/{api_group}/{resource}/{namespace}/{name}");
         // Shown as the subresource for entering a container (exec, attach, port-forward) whatever
         // the verb: current kubectl opens these over a websocket with GET, older ones with POST
         // (create). Other subresources keep the old rule: only a create is named after them.
         let verb = if matches!(sub.as_str(), "exec" | "attach" | "portforward") || (!sub.is_empty() && verb == "create") { sub.clone() } else { verb };
-        let op = Op { t: r.get(1)?, cluster, key, resource, namespace, name, actor, category, note, note_code, via: r.get(4)?, verb, severity, unattributed: false, hashed: r.get(14)? };
+        let op = Op { t: r.get(1)?, cluster, key, resource, namespace, name, actor, category, note, note_code, via: r.get(4)?, verb, cascade, severity, unattributed: false, hashed: r.get(14)? };
         add(op, &api_group, &mut objs, &mut ops);
     }
     drop(rows);
@@ -561,7 +597,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         let key = format!("{cluster}/{api_group}/{resource}/{namespace}/{name}");
         let op = Op {
             t: r.get(1)?, cluster, key, resource, namespace, name, actor: String::new(), category: "unknown", note: "找不到執行者".into(), note_code: Some("no-actor"),
-            via: "unknown".into(), verb: r.get(6)?, severity: None, unattributed: true, hashed: false,
+            via: "unknown".into(), verb: r.get(6)?, cascade: None, severity: None, unattributed: true, hashed: false,
         };
         add(op, &api_group, &mut objs, &mut ops);
     }
@@ -630,7 +666,8 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
             .iter()
             .take(DETAIL_OPS)
             .map(|op| json!({"t": op.t, "who": op.actor, "category": op.category, "note": op.note, "noteCode": op.note_code, "verb": op.verb, "via": op.via,
-                             "raw": {"verb": op.verb, "resource": op.resource, "user": op.actor}}))
+                             "cascade": op.cascade,
+                             "raw": {"verb": op.verb, "resource": op.cascade.as_deref().unwrap_or(&op.resource), "user": op.actor}}))
             .collect();
         // Objects this one refers to (v0.1, point 3); kept apart from the settings below.
         let mut st = c.prepare_cached(
@@ -737,7 +774,9 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         .collect();
 
     // Prefer the latest op with a known author; fall back to the latest unattributed change.
-    let latest_op = |o: &Obj| -> &Op { o.ops.iter().map(|i| &ops[*i]).max_by_key(|op| (!op.unattributed, op.t)).unwrap() };
+    // Who the row names: the latest attributed record, and for a namespace whoever deleted it
+    // rather than the controller that emptied it afterwards.
+    let latest_op = |o: &Obj| -> &Op { o.ops.iter().map(|i| &ops[*i]).max_by_key(|op| (!op.unattributed, op.cascade.is_none(), op.t)).unwrap() };
 
     let mut resp = json!({
         "day": day.format("%Y-%m-%d").to_string(),
@@ -1007,6 +1046,56 @@ mod tests {
         assert_eq!(r["rows"][0]["name"], "afternoon");
         assert_eq!(r["timeline"], v["timeline"], "the timeline is the whole day either way");
         assert_eq!(parse_query("day=2026-10-20&from=5&to=9").from, Some(5));
+    }
+
+    /// Rancher's "who am I" request, user search and logout are requests, not changes: only
+    /// counted, like token reviews.
+    #[test]
+    fn rancher_requests_are_only_counted() {
+        let s = store();
+        {
+            let c = s.conn.lock().unwrap();
+            ev(&c, 1, "c1", T, "alice", 1, "rancher", "create", "selfuser", "", "");
+            ev(&c, 2, "c1", T + 1000, "alice", 1, "rancher", "search", "principals", "", "");
+            ev(&c, 3, "c1", T + 2000, "alice", 1, "rancher", "logout", "tokens", "", "");
+            ev(&c, 4, "c1", T + 3000, "alice", 1, "rancher", "create", "logout", "", "");
+            ev(&c, 5, "c1", T + 4000, "alice", 1, "rancher", "patch", "configmaps", "app", "cfg");
+            c.execute("UPDATE events SET source='rancher' WHERE id < 5", []).unwrap();
+        }
+        let v = changemap(&s, chrono_tz::Asia::Taipei, &Params { day: Some("2026-10-20".into()), ..Default::default() }, T).unwrap();
+        assert_eq!(v["hidden"]["requestOnly"], 4, "{v}");
+        assert_eq!(v["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(v["rows"][0]["name"], "cfg");
+    }
+
+    /// Emptying a deleted namespace (one deletecollection per kind) is listed with the
+    /// namespace, not as a row per kind, and the namespace's detail shows it.
+    #[test]
+    fn emptying_a_namespace_is_one_row() {
+        let s = store();
+        {
+            let c = s.conn.lock().unwrap();
+            ev(&c, 1, "c1", T, "alice", 1, "direct", "delete", "namespaces", "", "gone");
+            for (i, res) in ["pods", "configmaps", "secrets", "roles"].iter().enumerate() {
+                ev(&c, 2 + i as i64, "c1", T + 5000 + i as i64, NAMESPACE_CONTROLLER, 0, "direct", "deletecollection", res, "gone", "");
+            }
+            // Someone else's deletecollection stays a batch row of its own.
+            ev(&c, 10, "c1", T + 9000, "alice", 1, "direct", "deletecollection", "pods", "app", "");
+        }
+        let p = Params { day: Some("2026-10-20".into()), system: Some("1".into()), ..Default::default() };
+        let v = changemap(&s, chrono_tz::Asia::Taipei, &p, T).unwrap();
+        let rows = v["rows"].as_array().unwrap();
+        let names: Vec<(&str, &str)> = rows.iter().map(|r| (r["kind"].as_str().unwrap(), r["name"].as_str().unwrap())).collect();
+        assert_eq!(rows.len(), 2, "{names:?}");
+        let ns = rows.iter().find(|r| r["kind"] == "Namespace").unwrap();
+        assert_eq!((ns["name"].as_str(), ns["ops"].as_i64()), (Some("gone"), Some(5)), "{ns}");
+        assert_eq!(ns["who"]["name"], "alice", "the row names who deleted it");
+        let d = detail(&s, chrono_tz::Asia::Taipei, &Params { key: Some(ns["key"].as_str().unwrap().into()), ..p.clone() }, T).unwrap();
+        let ops = d["ops"].as_array().unwrap();
+        assert_eq!(ops.len(), 5, "{d}");
+        assert!(ops.iter().any(|o| o["cascade"] == "secrets" && o["raw"]["resource"] == "secrets"));
+        // The same by reading every record of the day.
+        assert_eq!(v, changemap_by_scan(&s, chrono_tz::Asia::Taipei, &p, T).unwrap());
     }
 
     /// v0.1 point 2: records that arrive between two pages neither repeat rows nor push rows
