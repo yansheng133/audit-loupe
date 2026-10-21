@@ -1,6 +1,7 @@
 mod access;
 mod api;
 mod audit;
+mod changemap;
 mod collect;
 mod config;
 mod demo;
@@ -10,6 +11,7 @@ mod integrity;
 mod neuvector;
 mod rancher;
 mod relations;
+mod replay;
 mod restore;
 mod rules;
 mod rulestate;
@@ -33,7 +35,8 @@ async fn main() -> anyhow::Result<()> {
         "collect-rancher" => return collect::run_rancher().await,
         "collect-watch" => return watch::run().await,
         "collect-neuvector" => return neuvector::run().await,
-        other => anyhow::bail!("unknown command {other:?}; use server, collect-file, collect-rancher, collect-watch, collect-neuvector or seed-demo"),
+        "replay" => return replay::run().await,
+        other => anyhow::bail!("unknown command {other:?}; use server, collect-file, collect-rancher, collect-watch, collect-neuvector, replay or seed-demo"),
     }
     let cfg = Arc::new(config::Config::from_env()?);
     let store = store::Store::open_with(&cfg.db_path, cfg.clone())?;
@@ -49,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
     // Bind first so probes pass and audit batches are accepted while discovery runs.
     let state = api::AppState { store: store.clone(), cfg: cfg.clone() };
     let api_listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
+    changemap::warm(&store);
     let ingest_listener = tokio::net::TcpListener::bind(&cfg.ingest_listen).await?;
     info!(api = %cfg.listen, ingest = %cfg.ingest_listen, "serving");
 
