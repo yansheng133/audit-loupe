@@ -17,6 +17,10 @@ server:
           until: "2026-12-31"
     secret_read:
       enabled: false
+  identities:
+    - names: ["rke2-cloud-controller-manager"]
+      class: component
+      reason: ci example
 collector:
   ingest:
     url: http://audit-loupe.audit-loupe-system.svc:8081

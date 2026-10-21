@@ -55,6 +55,14 @@ server:
   # After a change, records stored earlier keep their old judgement; the UI offers to judge
   # them again.
   rules: {}
+  # Identities the built-in classification cannot tell apart. Classes: human, component,
+  # serviceaccount, rancher, unknown. names match the name or Rancher user ID, exactly or with
+  # "*" (at most 1000 names with "*"); reason is shown on the page. Rules only look at
+  # identities classified as human, so a change here is offered for judging again like rules.
+  #  - names: ["rke2-cloud-controller-manager"]
+  #    class: component
+  #    reason: 用憑證登入的 RKE2 元件，只能靠名稱認
+  identities: []
   persistence:
     # SQLite on a volume. Empty storageClass uses the cluster default; RKE2 ships none.
     storageClass: ""

@@ -349,7 +349,8 @@ impl Store {
         // (still referenced by a version) must not bring them back.
         let cutoff = Utc::now().timestamp_millis() - self.cfg.retention_days * 86_400_000;
         for (id, cluster, ts_ms, hidden, r) in rows {
-            let alerts = judge(r, cluster, &self.cfg, c)?;
+            let class = crate::identity::resolve(c, &self.cfg.identities, &r.actor, &r.user_id, r.human, &r.user_agent, *ts_ms)?;
+            let alerts = judge(r, crate::identity::is_person(class), cluster, &self.cfg, c)?;
             for a in &alerts {
                 al.execute(params![id, a.rule, a.severity])?;
             }
