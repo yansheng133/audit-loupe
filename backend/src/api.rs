@@ -110,6 +110,17 @@ async fn ingest_objects(s: AppState, cluster: String, body: &[u8]) -> Response {
     }
 }
 
+/// One page view of the change map (v0 prototype). `cluster` may repeat, so the raw query is parsed.
+async fn changemap(State(s): State<AppState>, uri: axum::http::Uri) -> Response {
+    let p = crate::changemap::parse_query(uri.query().unwrap_or(""));
+    let (store, tz) = (s.store.clone(), s.cfg.tz);
+    match tokio::task::spawn_blocking(move || crate::changemap::changemap(&store, tz, &p, Utc::now().timestamp_millis())).await {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => err(e.into()),
+    }
+}
+
 /// The rule settings in force, earlier settings, and whether stored records were judged by
 /// other settings than these (and how long judging them again would take).
 async fn rules(State(s): State<AppState>) -> Response {
@@ -529,6 +540,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/info", get(info))
+        .route("/api/changemap", get(changemap))
         .route("/api/actors", get(actors))
         .route("/api/users", get(users))
         .route("/api/timeline", get(timeline))

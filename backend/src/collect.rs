@@ -57,6 +57,16 @@ impl Sender {
         })
     }
 
+    /// A sender with explicit settings (the replay tool, no custom CA).
+    pub fn new(base: &str, token: String, source: &'static str) -> anyhow::Result<Self> {
+        Ok(Sender {
+            client: reqwest::Client::builder().timeout(Duration::from_secs(120)).build()?,
+            url: format!("{}/ingest/v1/batch", base.trim_end_matches('/')),
+            token,
+            source,
+        })
+    }
+
     pub async fn send(&self, lines: &[u8]) -> anyhow::Result<()> {
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         enc.write_all(lines)?;

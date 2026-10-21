@@ -131,6 +131,7 @@ const ADDED_COLUMNS: &[(&str, &str)] = &[
 const ACTOR_KEY: &str = "CASE WHEN user_id<>'' THEN user_id ELSE actor END";
 
 const SHOWN: &str = "NOT (e.source='rancher' AND e.link_id IS NOT NULL)";
+pub const SHOWN_PUB: &str = SHOWN;
 
 /// Window for matching a Rancher record to the downstream record of the same action, as
 /// (Rancher time - downstream time). Rancher stamps the response time to the whole second,
