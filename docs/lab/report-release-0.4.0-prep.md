@@ -93,6 +93,8 @@ helm --kubeconfig ~/audit-loupe-lab/ds-admin.kubeconfig -n audit-loupe-system ro
 
 ## CI 結果
 
-- PR #18（任務書）：`backend tests` 通過（2 分 3 秒），`helm chart` 寫報告時還在跑。
+- PR #18（任務書）：`backend tests` 通過（2 分 3 秒）。`helm chart` 從 15:35:52Z 開始，到 15:46Z 仍是 `in_progress`（平常約 15 秒）。我沒有重跑也沒有取消，請 Sam 看一下。
 - PR #19（`54f5c73`，補丁）：`backend tests` 通過（2 分 54 秒）、`helm chart` 通過（14 秒）。
+- PR #19（`6a16d18`，加上本報告）：`backend tests` 通過（2 分 50 秒）、`helm chart` 通過（11 秒）。
+- 這次 push 只加了 CI 結果這幾行，內容只有文件；它的 CI 結果寫在 PR #19 的留言。
 - audit-loupe-ui PR #5（`3fcfd85`）：`Find Extensions to Build` 通過（4 秒）、`Test build audit-loupe` 通過（54 秒）。
