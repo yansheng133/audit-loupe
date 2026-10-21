@@ -13,11 +13,22 @@
 - **collect-watch**：物件版本（改了什麼）。每座要稽核的叢集都裝。
 - **collect-rancher**：Rancher API audit log（經 Rancher 的操作與 Rancher 本身的管理動作）。只裝在 Rancher 所在叢集。
 - **collect-file**：RKE2 kube-apiserver audit log（包含繞過 Rancher 的操作）。裝在 RKE2 叢集，跑在 control plane 節點上。
-  - 只送「收集元件在跑的時候」讀到的紀錄。收集元件重新啟動時，從目前 `audit.log` 的結尾開始讀；停機期間寫進去的紀錄（含停機期間輪替出去的檔）**不會事後補讀**，那段時間在收集狀態頁記成「沒有收集」，原因 `collector-restart`，起點是停機前最後送出的那筆紀錄的時間。
-  - 收集元件在跑的時候發生輪替，會把輪替出去的檔讀完，再依序讀較新的檔。
-  - 正在讀的檔還沒讀完就被刪掉（`--audit-log-maxbackup` 把它刪了）或被換掉，會立刻記一筆「沒有收集」（`file-removed`／`file-replaced`），不用等心跳中斷 3 分鐘。
-  - 認檔不只看 inode，也比對檔案開頭的雜湊，所以 inode 被重複使用時不會從舊位置接著讀。
-  - log 裡有一行讀不懂時，server 只把那一行擱置（記長度與 sha256，不存內容），同一批的其他行照常存入；收集狀態的 `/api/coverage` 看得到被擱置的行。
+  - 只送「收集元件在跑的時候」讀到的紀錄。收集元件重新啟動時，從目前 `audit.log` 的結尾開始讀；停機期間寫進去的紀錄（含停機期間輪替出去的檔）**不會事後補讀**，那段時間在收集狀態頁記成「沒有收集」，原因 `collector-restart`。起點是「停機前最後送出的那筆紀錄」與「最後一次確認已經讀完」兩者中較晚的時間（叢集很安靜時，不會把整段安靜時間算成沒收集；最多高估約 30 秒）。
+  - **第一次安裝**（`collector.file.onFirstStart`）：
+    - `fromNow`（預設）：從目前 `audit.log` 的結尾開始收，並送一筆「開始收集」的標記（`/api/coverage` 的 `starts`，`detail` 為 `fromNow`），表示這個節點從這一刻起才有資料。
+    - `readExisting`：把目前的 `audit.log` 從頭讀進來，標記的 `detail` 為 `readExisting`，`fromMs`～`toMs` 這段的紀錄是**安裝時才讀進來的既有紀錄，不是即時收到的**。開啟前要知道：
+      - 已經輪替出去的舊檔不讀，所以安裝前的紀錄可能不完整。
+      - 第一次啟動會一次讀進最多約 100 MB（RKE2 預設單檔上限），server 與網路會有一段尖峰。
+  - **狀態目錄遺失不等於第一次安裝**：節點上的 `/var/lib/audit-loupe` 被刪掉或遺失時，收集元件會先問 server 有沒有這個節點的紀錄（心跳或缺口）。有的話當成重新啟動：從現在開始讀，從 server 最後一次收到這個節點心跳的時間到現在記成「沒有收集」，原因 `collector-state-lost`。
+  - 收集元件在跑的時候發生輪替，會把輪替出去的檔讀完，再依序讀較新的檔。正在讀的檔一直開著，所以就算它被改名或刪掉（`--audit-log-maxbackup`），也會讀完，不會漏。
+  - 收集元件落後時，還沒開始讀的輪替檔先被刪掉，會立刻記一筆「沒有收集」（`file-removed`），從那個檔輪替的時間到下一個還在的檔的第一筆。被就地改寫的檔記成 `file-replaced`。都不用等心跳中斷 3 分鐘。
+  - 認檔不只看 inode，也比對檔案開頭的雜湊，而且都從同一個開啟的檔讀，所以 inode 被重複使用時不會從舊位置接著讀。
+  - 輪替出去的檔最後一行不完整時，送給 server 擱置，不會無聲丟掉。
+  - log 裡有一行讀不懂時，server 只把那一行擱置（記節點、檔名、位置、長度與 sha256，不存內容），同一批的其他行照常存入。`/api/coverage` 的 `rejectedCounts` 有各收集元件被擱置的行數，`/api/rejected` 列出每一行（不含原文）。重送同一批不會重複記。
+  - 「沒有收集」有兩種，`/api/coverage` 都會回傳、不互相合併：`kind: heartbeat`（server 發現收集元件 3 分鐘以上沒有回報）與 `kind: reported`（收集元件自己回報的）。同一段時間可能兩種都有。
+  - 收集元件回報「沒有收集」失敗時會退避重送，server 收到重複的回報只留一筆。
+  - `AL_HEARTBEAT_SECS`（心跳間隔，預設 60 秒）最大 120 秒：server 把 180 秒沒有心跳當成中斷。
+  - **升級順序**：先升 server，再升收集元件。舊版 server 不認得收集元件的新回報（`gap` 來源與 `/ingest/v1/known`），會一直回 400，收集元件第一次啟動時會一直重試等待。
 
 收集元件一律推送到 server，不需要 server 連回各叢集。
 
@@ -232,4 +243,4 @@ server:
 helm uninstall audit-loupe -n audit-loupe-system
 ```
 
-PVC（`audit-loupe-data`）不會自動刪除，要保留稽核資料請先備份 `/data/audit-loupe.db`。下游叢集節點上的讀取位置記錄在 `/var/lib/audit-loupe`，可以手動刪除。
+PVC（`audit-loupe-data`）不會自動刪除，要保留稽核資料請先備份 `/data/audit-loupe.db`。下游叢集節點上的讀取位置記錄在 `/var/lib/audit-loupe`，可以手動刪除。刪掉後若 server 還留著這個節點的紀錄，收集元件會當成重新啟動，從現在開始讀，並把中間那段記成「沒有收集」（`collector-state-lost`）；要當成全新安裝，server 端也要一起移除。

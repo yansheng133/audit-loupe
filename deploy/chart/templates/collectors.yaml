@@ -287,6 +287,7 @@ spec:
             - name: NODE_NAME
               valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
             - { name: AL_STATE_DIR, value: /state }
+            - { name: AL_ON_FIRST_START, value: {{ $c.file.onFirstStart | default "fromNow" | quote }} }
           # The audit log is root-owned (0600); root without any capability can read
           # its own files. Everything else stays locked down.
           securityContext:
@@ -307,7 +308,8 @@ spec:
         {{- include "al.collectorVolumes" . | nindent 8 }}
         - name: logs
           hostPath: { path: {{ $c.file.logDir | quote }}, type: Directory }
-        # Survives pod restarts, so a restart resumes instead of resending the whole file.
+        # Survives pod restarts: which file was being read and up to when everything was read.
+        # A restart reads from the end of audit.log on and reports the downtime as not collected.
         - name: state
           hostPath: { path: {{ $c.file.stateDir | quote }}, type: DirectoryOrCreate }
 {{- end }}

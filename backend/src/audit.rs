@@ -64,6 +64,7 @@ pub struct Event {
     pub stage_timestamp: Option<DateTime<Utc>>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 pub struct EventList {
     #[serde(default)]
@@ -245,6 +246,7 @@ pub fn is_write(verb: &str) -> bool {
 
 /// Accept either an EventList (what the webhook backend sends) or a single Event
 /// or newline-delimited events (the log file format), so replaying a log file works too.
+#[cfg(test)]
 pub fn parse_body(body: &[u8]) -> anyhow::Result<Vec<Event>> {
     if let Ok(list) = serde_json::from_slice::<EventList>(body) {
         // An EventList, possibly empty. A single Event also parses as an EventList with
@@ -267,21 +269,40 @@ pub fn parse_body(body: &[u8]) -> anyhow::Result<Vec<Event>> {
     Ok(out)
 }
 
-/// Like `parse_body`, but a line that does not parse is set aside (with the reason) instead of
-/// failing the whole batch: one damaged line in the log must not stop everything after it.
-pub fn parse_body_lenient(body: &[u8]) -> (Vec<Event>, Vec<(Vec<u8>, String)>) {
-    if let Ok(evs) = parse_body(body) {
-        return (evs, Vec::new());
-    }
+/// Like `parse_body`, but a record that does not parse is set aside (with the reason and its
+/// byte position in the body) instead of failing the whole batch: one damaged line in the log
+/// must not stop everything after it. A body is an EventList only when its top-level `kind`
+/// says so; anything else is read as JSON lines, so a one-line batch whose record happens to
+/// contain the word "items" is not taken for an empty list.
+/// A line set aside: its bytes, why it could not be read, and its byte position in the body.
+pub type SetAside = (Vec<u8>, String, usize);
+
+pub fn parse_body_lenient(body: &[u8]) -> (Vec<Event>, Vec<SetAside>) {
     let (mut good, mut bad) = (Vec::new(), Vec::new());
-    for line in body.split(|b| *b == b'\n') {
-        let line = line.trim_ascii();
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body)
+        && v.get("kind").and_then(|k| k.as_str()) == Some("EventList")
+    {
+        {
+            for item in v.get("items").and_then(|i| i.as_array()).into_iter().flatten() {
+                match serde_json::from_value::<Event>(item.clone()) {
+                    Ok(ev) => good.push(ev),
+                    Err(e) => bad.push((item.to_string().into_bytes(), e.to_string(), 0)),
+                }
+            }
+            return (good, bad);
+        }
+    }
+    let mut at = 0usize;
+    for raw in body.split(|b| *b == b'\n') {
+        let start = at;
+        at += raw.len() + 1;
+        let line = raw.trim_ascii();
         if line.is_empty() {
             continue;
         }
         match serde_json::from_slice::<Event>(line) {
             Ok(ev) => good.push(ev),
-            Err(e) => bad.push((line.to_vec(), e.to_string())),
+            Err(e) => bad.push((line.to_vec(), e.to_string(), start)),
         }
     }
     (good, bad)

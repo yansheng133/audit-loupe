@@ -22,6 +22,8 @@ struct Seen {
     ids: Vec<String>,
     heartbeats: Vec<serde_json::Value>,
     gaps: Vec<serde_json::Value>,
+    /// What GET /ingest/v1/known answers: None = a node never seen.
+    known: Option<i64>,
 }
 
 struct Stub {
@@ -54,8 +56,12 @@ impl Stub {
     fn bad(&self) -> usize {
         self.seen.lock().unwrap().ids.iter().filter(|i| *i == "<bad>").count()
     }
+    /// Reports of periods not collected (start marks left out).
     fn gaps(&self) -> Vec<serde_json::Value> {
-        self.seen.lock().unwrap().gaps.clone()
+        self.seen.lock().unwrap().gaps.iter().filter(|g| g["reason"] != "collection-start").cloned().collect()
+    }
+    fn starts(&self) -> Vec<serde_json::Value> {
+        self.seen.lock().unwrap().gaps.iter().filter(|g| g["reason"] == "collection-start").cloned().collect()
     }
     fn last_lag(&self) -> Option<u64> {
         self.seen.lock().unwrap().heartbeats.last().and_then(|h| h.pointer("/details/lagBytes")).and_then(|v| v.as_u64())
@@ -68,6 +74,7 @@ fn serve(mut conn: TcpStream, seen: &Arc<Mutex<Seen>>) -> std::io::Result<()> {
     let mut headers: HashMap<String, String> = HashMap::new();
     let mut line = String::new();
     reader.read_line(&mut line)?;
+    let request = line.clone();
     loop {
         line.clear();
         reader.read_line(&mut line)?;
@@ -92,6 +99,11 @@ fn serve(mut conn: TcpStream, seen: &Arc<Mutex<Seen>>) -> std::io::Result<()> {
     let source = headers.get("x-audit-loupe-source").cloned().unwrap_or_default();
     let (status, reply) = {
         let mut s = seen.lock().unwrap();
+        if request.starts_with("GET /ingest/v1/known") {
+            let reply = serde_json::json!({"known": s.known.is_some(), "lastMs": s.known}).to_string();
+            write!(conn, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}", reply.len())?;
+            return conn.flush();
+        }
         match source.as_str() {
             "heartbeat" => {
                 s.heartbeats.push(serde_json::from_slice(&body).unwrap_or_default());
@@ -125,6 +137,10 @@ struct Lab {
     dir: tempfile::TempDir,
     stub: Stub,
     child: Option<Child>,
+    /// AL_ON_FIRST_START; the older tests read the existing file, as before.
+    first_start: &'static str,
+    env: Vec<(&'static str, String)>,
+    names: Mutex<HashMap<u32, String>>,
 }
 
 impl Lab {
@@ -133,13 +149,21 @@ impl Lab {
         fs::create_dir_all(dir.path().join("logs")).unwrap();
         fs::create_dir_all(dir.path().join("state")).unwrap();
         fs::write(dir.path().join("token"), "collector-test-token").unwrap();
-        Lab { dir, stub: Stub::start(), child: None }
+        Lab { dir, stub: Stub::start(), child: None, first_start: "readExisting", env: vec![], names: Default::default() }
     }
     fn log(&self) -> PathBuf {
         self.dir.path().join("logs/audit.log")
     }
+    /// Rotated file number `n`, named like kube-apiserver does with the UTC time it was
+    /// rotated (the time of the first call for `n`).
     fn rotated(&self, n: u32) -> PathBuf {
-        self.dir.path().join(format!("logs/audit-2026-10-20T0{n}-00-00.000.log"))
+        let mut names = self.names.lock().unwrap();
+        let name = names.entry(n).or_insert_with(|| {
+            // Two rotations in the same millisecond would get one name; keep them apart.
+            thread::sleep(Duration::from_millis(2));
+            chrono::Utc::now().format("audit-%Y-%m-%dT%H-%M-%S%.3f.log").to_string()
+        });
+        self.dir.path().join("logs").join(name)
     }
     fn start(&mut self) {
         let out = File::options().create(true).append(true).open(self.dir.path().join("collector.log")).unwrap();
@@ -152,6 +176,8 @@ impl Lab {
             .env("AL_HEARTBEAT_SECS", "1")
             .env("HOSTNAME", "node-test")
             .env("RUST_LOG", "info")
+            .env("AL_ON_FIRST_START", self.first_start)
+            .envs(self.env.iter().map(|(k, v)| (*k, v.as_str())))
             .stdout(Stdio::from(out.try_clone().unwrap()))
             .stderr(Stdio::from(out))
             .spawn()
@@ -248,42 +274,66 @@ fn restart_reads_from_now_and_reports_the_downtime() {
     let gaps = lab.stub.gaps();
     let g = gaps.iter().find(|g| g.get("reason").and_then(|r| r.as_str()) == Some("collector-restart"));
     let g = g.unwrap_or_else(|| panic!("no 'not collected' report for the downtime; got {gaps:?}"));
-    assert_eq!(gap_ms(g, "fromMs"), last_a, "the gap starts at the last record read before the stop");
+    // It had everything up to when it last caught up (just after A), not only up to A.
+    let from = gap_ms(g, "fromMs");
+    assert!(from >= last_a && from < started, "the gap starts where the collector last had everything ({from} vs A {last_a}, start {started})");
     let to = gap_ms(g, "toMs");
     assert!(to >= started - 1000 && to <= started + 5000, "the gap ends when the collector started again ({to} vs {started})");
 }
 
-/// Defect 2: the file being read is removed before it was read to the end. The loss is
-/// reported at once (not after the 180 s heartbeat silence), starting at the last record read.
+/// Defect 2, with the file kept open: the file being read is rotated out and removed before
+/// it was read to the end. The open handle still reads it, so nothing is lost and no gap is
+/// reported; the new file follows.
 #[test]
-fn removed_file_is_reported_at_once() {
+fn removed_file_is_still_read_through_the_open_handle() {
     let mut lab = Lab::new();
-    let last_a = append(&lab.log(), "A", 10, 40);
+    append(&lab.log(), "A", 10, 40);
     lab.start();
     assert!(wait_until(15, || lab.stub.count("A") == 10), "A not collected: {}", lab.collector_log());
 
-    // The server stops taking batches, so B is read but never acknowledged.
+    // The server stops taking batches, so B is read but not yet acknowledged.
     lab.stub.accept(false);
     append(&lab.log(), "B", 10, 40);
     thread::sleep(Duration::from_millis(1500));
     fs::rename(lab.log(), lab.rotated(1)).unwrap();
     append(&lab.log(), "C", 10, 40);
     fs::remove_file(lab.rotated(1)).unwrap();
-    let removed = Instant::now();
     lab.stub.accept(true);
 
-    assert!(
-        wait_until(20, || lab.stub.gaps().iter().any(|g| g.get("reason").and_then(|r| r.as_str()) == Some("file-removed"))),
-        "no 'not collected' report after the file was removed; got {:?}; log: {}",
-        lab.stub.gaps(),
-        lab.collector_log()
-    );
-    assert!(removed.elapsed() < Duration::from_secs(30), "reported only after {:?}", removed.elapsed());
+    assert!(wait_until(20, || lab.stub.count("B") == 10 && lab.stub.count("C") == 10), "B and C: {}", lab.collector_log());
+    thread::sleep(Duration::from_secs(2));
+    assert!(lab.stub.gaps().is_empty(), "nothing was lost: {:?}", lab.stub.gaps());
+}
+
+/// Defect 2, what is still lost: while the collector is behind on A, B is rotated out and
+/// removed before it was ever opened. That is reported at once, from when A was rotated to
+/// the first record of the next file left.
+#[test]
+fn files_removed_before_they_were_read_are_reported() {
+    let mut lab = Lab::new();
+    append(&lab.log(), "A", 10, 40);
+    lab.start();
+    assert!(wait_until(15, || lab.stub.count("A") == 10), "A not collected: {}", lab.collector_log());
+    lab.stub.accept(false);
+    append(&lab.log(), "A2", 10, 40);
+    thread::sleep(Duration::from_millis(2500)); // seen in the directory as audit.log
+    fs::rename(lab.log(), lab.rotated(1)).unwrap();
+    thread::sleep(Duration::from_millis(2500)); // seen again under its rotated name
+    append(&lab.log(), "B", 10, 40);
+    thread::sleep(Duration::from_millis(6000));
+    fs::rename(lab.log(), lab.rotated(2)).unwrap();
+    let c_first = append(&lab.log(), "C", 10, 40);
+    fs::remove_file(lab.rotated(1)).unwrap();
+    fs::remove_file(lab.rotated(2)).unwrap();
+    lab.stub.accept(true);
+
+    assert!(wait_until(25, || lab.stub.count("C") == 10), "C: {}", lab.collector_log());
+    assert_eq!(lab.stub.count("A2"), 10, "the open file is still read to its end");
+    assert_eq!(lab.stub.count("B"), 0);
     let gaps = lab.stub.gaps();
-    let g = gaps.iter().find(|g| g.get("reason").and_then(|r| r.as_str()) == Some("file-removed")).unwrap();
-    assert_eq!(gap_ms(g, "fromMs"), last_a, "the gap starts at the last record acknowledged");
-    assert!(wait_until(20, || lab.stub.count("C") == 10), "C (the new file) not collected: {}", lab.collector_log());
-    assert_eq!(lab.stub.count("B"), 0, "B was never acknowledged and its file is gone");
+    let g = gaps.iter().find(|g| g["reason"] == "file-removed").unwrap_or_else(|| panic!("B's loss not reported: {gaps:?}; {}", lab.collector_log()));
+    assert!(gap_ms(g, "toMs") >= c_first - 1000 && gap_ms(g, "toMs") <= c_first, "{g}");
+    assert!(gap_ms(g, "fromMs") < gap_ms(g, "toMs") - 5000, "{g}");
 }
 
 /// Defect 3 and live rotation: while the collector is behind, lagBytes covers the rest of the
@@ -311,7 +361,7 @@ fn lag_counts_rotated_files_and_live_rotation_loses_nothing() {
     let counts = (lab.stub.count("A"), lab.stub.count("B"), lab.stub.count("C"));
     let caught_up = wait_until(10, || lab.stub.last_lag() == Some(0));
 
-    assert!(lag_ok, "lagBytes while behind should be {total} (rest of the rotated files and audit.log), last heartbeat said {lag_seen:?}");
+    assert!(lag_ok, "lagBytes while behind should be {total} (rest of the rotated files and audit.log), last heartbeat said {lag_seen:?}; {}", lab.collector_log());
     assert!(all && counts == (20, 20, 20), "every line of every rotated file arrives once; got A, B, C = {counts:?}; log: {}", lab.collector_log());
     assert_eq!(lab.stub.bad(), 0);
     assert!(caught_up, "lagBytes back to 0 after catching up, last heartbeat said {:?}", lab.stub.last_lag());
@@ -347,5 +397,157 @@ fn same_inode_with_other_content_is_a_new_file() {
     let gaps = lab.stub.gaps();
     let g = gaps.iter().find(|g| g.get("reason").and_then(|r| r.as_str()) == Some("file-replaced"));
     let g = g.unwrap_or_else(|| panic!("no 'not collected' report for the replaced file; got {gaps:?}"));
-    assert_eq!(gap_ms(g, "fromMs"), last_a);
+    // From when the collector last had everything: after A, before the file was rewritten.
+    assert!(gap_ms(g, "fromMs") >= last_a && gap_ms(g, "fromMs") <= now_ms(), "{g}");
+}
+
+/// Decision 1 (default): a first install starts at the end of audit.log and says so with a
+/// start mark; what was already in the file is not read.
+#[test]
+fn first_start_reads_from_now_and_marks_the_start() {
+    let mut lab = Lab::new();
+    lab.first_start = "fromNow";
+    append(&lab.log(), "OLD", 10, 40);
+    let started = now_ms();
+    lab.start();
+    assert!(wait_until(15, || !lab.stub.starts().is_empty()), "no start mark: {}", lab.collector_log());
+    append(&lab.log(), "NEW", 5, 40);
+    assert!(wait_until(15, || lab.stub.count("NEW") == 5), "NEW not collected: {}", lab.collector_log());
+    assert_eq!(lab.stub.count("OLD"), 0, "lines from before the install were read");
+    let s = &lab.stub.starts()[0];
+    assert_eq!(s["detail"], "fromNow");
+    assert!(gap_ms(s, "fromMs") >= started, "{s}");
+    assert!(lab.stub.gaps().is_empty(), "a first start is not a gap: {:?}", lab.stub.gaps());
+}
+
+/// Decision 1, readExisting: the current audit.log is read from its start, and the start mark
+/// says from when the records were read at install rather than as they were written.
+#[test]
+fn first_start_can_read_the_existing_file() {
+    let mut lab = Lab::new();
+    lab.first_start = "readExisting";
+    let t0 = now_ms() - 3_600_000;
+    fs::write(lab.log(), format!("{}\n{}\n", event("OLD-0", t0, 10), event("OLD-1", t0 + 1, 10))).unwrap();
+    lab.start();
+    assert!(wait_until(15, || lab.stub.count("OLD") == 2), "{}", lab.collector_log());
+    let s = &lab.stub.starts()[0];
+    assert_eq!(s["detail"], "readExisting");
+    assert_eq!(gap_ms(s, "fromMs"), t0, "{s}");
+}
+
+/// Decision 1: the state directory is gone but the server knows this node: that is a restart,
+/// not an install. Read from now on; report the time since the last check-in as not collected.
+#[test]
+fn lost_state_is_a_restart_when_the_server_knows_the_node() {
+    let mut lab = Lab::new();
+    let last_beat = now_ms() - 600_000;
+    lab.stub.seen.lock().unwrap().known = Some(last_beat);
+    append(&lab.log(), "OLD", 10, 40);
+    lab.start();
+    assert!(wait_until(15, || !lab.stub.gaps().is_empty()), "{}", lab.collector_log());
+    append(&lab.log(), "NEW", 3, 40);
+    assert!(wait_until(15, || lab.stub.count("NEW") == 3), "{}", lab.collector_log());
+    assert_eq!(lab.stub.count("OLD"), 0);
+    let g = &lab.stub.gaps()[0];
+    assert_eq!(g["reason"], "collector-state-lost");
+    assert_eq!(gap_ms(g, "fromMs"), last_beat, "{g}");
+    assert!(lab.stub.starts().is_empty(), "not a first start");
+}
+
+/// Review 1: a rotation between listing the directory and checking audit.log made the file
+/// being read look replaced; the rest of the rotated file was skipped. The listing is slowed
+/// down here to widen that window. With the file kept open, nothing is lost and no gap reported.
+#[test]
+fn rotation_during_a_slow_listing_loses_nothing() {
+    let mut lab = Lab::new();
+    lab.env.push(("AL_TEST_LIST_DELAY_MS", "150".into()));
+    append(&lab.log(), "S", 1, 40);
+    lab.start();
+    assert!(wait_until(15, || lab.stub.count("S") == 1), "{}", lab.collector_log());
+    let mut total = 0;
+    for r in 1..=6u32 {
+        append(&lab.log(), &format!("R{r}"), 300, 200);
+        total += 300;
+        thread::sleep(Duration::from_millis(120));
+        fs::rename(lab.log(), lab.rotated(r)).unwrap();
+        thread::sleep(Duration::from_millis(5)); // distinct rotation times
+    }
+    append(&lab.log(), "LIVE", 10, 40);
+    total += 10;
+    let got = || (1..=6).map(|r| lab.stub.count(&format!("R{r}"))).sum::<usize>() + lab.stub.count("LIVE");
+    assert!(wait_until(40, || got() == total), "got {} of {total}: {}", got(), lab.collector_log());
+    assert!(lab.stub.gaps().is_empty(), "nothing was lost: {:?}", lab.stub.gaps());
+}
+
+/// Review 3: records stopped at an old time but the collector kept up until it was stopped;
+/// the downtime starts when it last had everything, not at the last record.
+#[test]
+fn quiet_cluster_restart_does_not_overstate_the_downtime() {
+    let mut lab = Lab::new();
+    let old = now_ms() - 4 * 3_600_000;
+    fs::write(lab.log(), format!("{}\n", event("Q-0", old, 10))).unwrap();
+    lab.start();
+    assert!(wait_until(15, || lab.stub.count("Q") == 1), "{}", lab.collector_log());
+    thread::sleep(Duration::from_secs(4)); // caught up, nothing new
+    let stopped = now_ms();
+    lab.kill();
+    lab.start();
+    assert!(wait_until(15, || !lab.stub.gaps().is_empty()), "{}", lab.collector_log());
+    let g = &lab.stub.gaps()[0];
+    assert_eq!(g["reason"], "collector-restart");
+    assert!(gap_ms(g, "fromMs") > stopped - 35_000, "downtime starts at the last catch-up, not 4 h ago: {g}");
+}
+
+/// Replay with real kube-apiserver lines (a copy; the original is never touched):
+/// AL_TEST_RAW=<copy of an audit log> cargo test --test collector_rotation -- --ignored real
+/// A rotation while running loses nothing; a rotation while stopped is not read afterwards and
+/// is reported; every count must match the lines written.
+#[test]
+#[ignore]
+fn real_audit_lines_replay_with_rotations() {
+    let raw = fs::read_to_string(std::env::var("AL_TEST_RAW").expect("AL_TEST_RAW")).unwrap();
+    let lines: Vec<&str> = raw.lines().filter(|l| !l.is_empty()).collect();
+    let n = lines.len() / 6;
+    let parts: Vec<&[&str]> = (0..6).map(|i| &lines[i * n..(i + 1) * n]).collect();
+    let write = |p: &Path, part: &[&str]| {
+        let mut f = OpenOptions::new().create(true).append(true).open(p).unwrap();
+        f.write_all((part.join("\n") + "\n").as_bytes()).unwrap();
+    };
+    let ids = |part: &[&str]| -> std::collections::HashSet<String> {
+        part.iter().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()?.get("auditID")?.as_str().map(str::to_string)).collect()
+    };
+    let got = |lab: &Lab| -> std::collections::HashSet<String> { lab.stub.seen.lock().unwrap().ids.iter().cloned().collect() };
+    let mut lab = Lab::new();
+    write(&lab.log(), parts[0]);
+    lab.start();
+    let want0 = ids(parts[0]);
+    assert!(wait_until(60, || want0.is_subset(&got(&lab))), "part 0: {}", lab.collector_log());
+    // Running: more lines, a rotation, more lines.
+    write(&lab.log(), parts[1]);
+    fs::rename(lab.log(), lab.rotated(1)).unwrap();
+    write(&lab.log(), parts[2]);
+    let want: std::collections::HashSet<String> = [0, 1, 2].iter().flat_map(|i| ids(parts[*i])).collect();
+    assert!(wait_until(60, || want.is_subset(&got(&lab))), "while running: {} of {}", want.intersection(&got(&lab)).count(), want.len());
+    assert!(lab.stub.gaps().is_empty(), "{:?}", lab.stub.gaps());
+    let sent = lab.stub.seen.lock().unwrap().ids.len();
+    let lines_written = parts[0].len() + parts[1].len() + parts[2].len();
+    println!("running rotation: lines written {lines_written}, lines sent {sent}, distinct audit IDs {} of {}", got(&lab).len(), want.len());
+    assert_eq!(sent, lines_written, "every line sent exactly once");
+    // Stopped: lines, a rotation, lines; then started again and more lines.
+    lab.kill();
+    write(&lab.log(), parts[3]);
+    fs::rename(lab.log(), lab.rotated(2)).unwrap();
+    write(&lab.log(), parts[4]);
+    lab.start();
+    assert!(wait_until(15, || !lab.stub.gaps().is_empty()), "{}", lab.collector_log());
+    write(&lab.log(), parts[5]);
+    let want5 = ids(parts[5]);
+    assert!(wait_until(60, || want5.is_subset(&got(&lab))), "after restart: {}", lab.collector_log());
+    let have = got(&lab);
+    let read_while_down = ids(parts[3]).union(&ids(parts[4])).filter(|i| have.contains(*i) && !want.contains(*i)).count();
+    let sent = lab.stub.seen.lock().unwrap().ids.len();
+    println!("rotation while stopped: lines sent in all {sent} (= {} + {}), read from the downtime {read_while_down}", lines_written, parts[5].len());
+    assert_eq!(read_while_down, 0, "lines written while stopped are not read afterwards");
+    assert_eq!(sent, lines_written + parts[5].len());
+    assert_eq!(lab.stub.gaps()[0]["reason"], "collector-restart");
 }

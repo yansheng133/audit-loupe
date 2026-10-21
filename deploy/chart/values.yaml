@@ -129,6 +129,13 @@ collector:
     logDir: /var/lib/rancher/rke2/server/logs
     logFile: audit.log
     stateDir: /var/lib/audit-loupe
+    # First install on a node (no state, and the server has never heard from the node):
+    #   fromNow       start at the end of audit.log; the server records where collection starts.
+    #   readExisting  read the current audit.log from its start. Those records were read at
+    #                 install, not as they happened; rotated files are not read, so they may be
+    #                 incomplete; and the first start sends up to ~100 MB at once.
+    # A lost state directory on a node the server knows is a restart, not a first install.
+    onFirstStart: fromNow
     nodeSelector:
       node-role.kubernetes.io/control-plane: "true"
     tolerations:

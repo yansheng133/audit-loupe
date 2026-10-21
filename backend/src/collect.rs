@@ -64,16 +64,31 @@ impl Sender {
     }
 
     pub async fn send(&self, lines: &[u8]) -> anyhow::Result<()> {
-        self.send_for_reply(lines).await.map(|_| ())
+        self.send_for_reply(lines, &[]).await.map(|_| ())
     }
 
-    /// Like `send`, and returns the server's answer (for ingest: received/skipped/stored).
-    pub async fn send_for_reply(&self, lines: &[u8]) -> anyhow::Result<String> {
+    /// Ask the server whether it has heard from this collector instance before.
+    pub async fn known(&self, collector: &str, instance: &str) -> anyhow::Result<Option<i64>> {
+        let url = self.url.replace("/ingest/v1/batch", "/ingest/v1/known");
+        let res = self.client.get(&url).bearer_auth(&self.token).query(&[("collector", collector), ("instance", instance)]).send().await?;
+        let status = res.status();
+        if !status.is_success() {
+            anyhow::bail!("server answered {status}");
+        }
+        let v: serde_json::Value = serde_json::from_str(&res.text().await?)?;
+        Ok(v.get("lastMs").and_then(|t| t.as_i64()).or(if v["known"] == true { Some(0) } else { None }))
+    }
+
+    /// Like `send`, with extra headers, and returns the server's answer (for ingest:
+    /// received/skipped/stored).
+    pub async fn send_for_reply(&self, lines: &[u8], extra: &[(&str, String)]) -> anyhow::Result<String> {
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         enc.write_all(lines)?;
-        let res = self
-            .client
-            .post(&self.url)
+        let mut req = self.client.post(&self.url);
+        for (k, v) in extra {
+            req = req.header(*k, v);
+        }
+        let res = req
             .bearer_auth(&self.token)
             .header("x-audit-loupe-source", self.source)
             .header("content-encoding", "gzip")
@@ -106,6 +121,13 @@ pub struct Position {
     pub last_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending: Vec<Gap>,
+    /// When the collector last found nothing left to read: it had everything up to then, even
+    /// if the last record is older (a quiet cluster).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caught_up_ms: Option<i64>,
+    /// The name the file being read was last seen under (after a rotation: `audit-<time>.log`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// SHA-256 of a file's first `len` bytes (up to HEAD_BYTES).
@@ -141,7 +163,20 @@ impl Position {
     }
     /// Start `file` from `offset`, keeping the time of the last record and pending reports.
     fn at(&self, file: &Path, offset: u64) -> anyhow::Result<Position> {
-        Ok(Position { inode: fs::metadata(file)?.ino(), offset, head: Some(head_of(file)?), last_ms: self.last_ms, pending: self.pending.clone() })
+        let mut f = File::open(file)?;
+        Ok(self.on(&mut f, offset)?)
+    }
+    /// Like `at`, for a file already open: inode and first bytes come from the same handle.
+    fn on(&self, f: &mut File, offset: u64) -> std::io::Result<Position> {
+        Ok(Position { inode: f.metadata()?.ino(), offset, head: Some(head_of_file(f)?), name: None, ..self.clone() })
+    }
+    /// Where a "not collected" period starts: the later of the last record acknowledged and
+    /// the last time everything had been read.
+    fn collected_until(&self) -> Option<i64> {
+        match (self.last_ms, self.caught_up_ms) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
     }
 }
 
@@ -150,20 +185,17 @@ fn sha256_hex(b: &[u8]) -> String {
     Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn first_bytes(path: &Path, n: u64) -> std::io::Result<Vec<u8>> {
+/// `head_of` for an open file (leaves the read position at the end of the head).
+fn head_of_file(f: &mut File) -> std::io::Result<Head> {
     let mut buf = Vec::new();
-    File::open(path)?.take(n).read_to_end(&mut buf)?;
-    Ok(buf)
-}
-
-pub fn head_of(path: &Path) -> std::io::Result<Head> {
-    let buf = first_bytes(path, HEAD_BYTES)?;
+    f.seek(SeekFrom::Start(0))?;
+    Read::by_ref(f).take(HEAD_BYTES).read_to_end(&mut buf)?;
     Ok(Head { len: buf.len() as u64, sha256: sha256_hex(&buf) })
 }
 
-/// Whether `path` still starts with the recorded bytes. Shorter than recorded: another file.
-pub fn same_head(path: &Path, head: &Head) -> bool {
-    first_bytes(path, head.len).is_ok_and(|b| b.len() as u64 == head.len && sha256_hex(&b) == head.sha256)
+fn head_matches(f: &mut File, head: &Head) -> bool {
+    let mut buf = Vec::new();
+    f.seek(SeekFrom::Start(0)).is_ok() && Read::by_ref(f).take(head.len).read_to_end(&mut buf).is_ok() && buf.len() as u64 == head.len && sha256_hex(&buf) == head.sha256
 }
 
 /// Files rotated out of `path` (`audit-<UTC time>.log` next to `audit.log`), oldest first;
@@ -186,19 +218,30 @@ pub fn rotated_files(path: &Path) -> Vec<PathBuf> {
 /// Rotated files oldest first, then the live file: the order the records were written in.
 fn in_write_order(path: &Path) -> Vec<PathBuf> {
     let mut v = rotated_files(path);
+    test_delay();
     if path.exists() {
         v.push(path.to_path_buf());
     }
     v
 }
 
+#[cfg(test)]
 /// The file the position refers to: same inode and, when known, the same first bytes.
 pub fn locate(path: &Path, pos: &Position) -> Option<PathBuf> {
-    in_write_order(path).into_iter().find(|p| {
-        fs::metadata(p).is_ok_and(|m| m.ino() == pos.inode) && pos.head.as_ref().is_none_or(|h| same_head(p, h))
+    locate_open(path, pos).map(|(p, _)| p)
+}
+
+/// `locate`, returning the file opened: inode (fstat) and first bytes are checked on that
+/// handle, so a rename between the listing and the check cannot swap the file under it.
+fn locate_open(path: &Path, pos: &Position) -> Option<(PathBuf, File)> {
+    in_write_order(path).into_iter().find_map(|p| {
+        let mut f = File::open(&p).ok()?;
+        let ok = f.metadata().is_ok_and(|m| m.ino() == pos.inode) && pos.head.as_ref().is_none_or(|h| head_matches(&mut f, h));
+        ok.then_some((p, f))
     })
 }
 
+#[cfg(test)]
 /// The files written after `file`, in order.
 fn newer_than(path: &Path, file: &Path) -> Vec<PathBuf> {
     let all = in_write_order(path);
@@ -249,10 +292,14 @@ pub fn end_of_last_line(path: &Path) -> anyhow::Result<u64> {
 /// Returns the bytes and how many were consumed; a trailing partial line is left for later.
 /// A single line longer than `max` is returned whole so it cannot block the file forever.
 pub fn read_lines(path: &Path, offset: u64, max: usize) -> anyhow::Result<(Vec<u8>, u64)> {
-    let mut f = File::open(path)?;
+    read_lines_from(&mut File::open(path)?, offset, max)
+}
+
+/// `read_lines` on an open file.
+pub fn read_lines_from(f: &mut File, offset: u64, max: usize) -> anyhow::Result<(Vec<u8>, u64)> {
     f.seek(SeekFrom::Start(offset))?;
     let mut buf = Vec::new();
-    Read::by_ref(&mut f).take(max as u64).read_to_end(&mut buf)?;
+    Read::by_ref(f).take(max as u64).read_to_end(&mut buf)?;
     match buf.iter().rposition(|b| *b == b'\n') {
         Some(i) => {
             buf.truncate(i + 1);
@@ -299,7 +346,9 @@ pub fn heartbeat(collector: &'static str) -> anyhow::Result<Health> {
     let health: Health = Default::default();
     let h = health.clone();
     let instance = instance_name();
-    let every = env_or("AL_HEARTBEAT_SECS", "60").parse::<u64>().unwrap_or(60).max(1);
+    // The server counts three missed minutes (180 s) as a gap; beats further apart than that
+    // would show gaps that are not there.
+    let every = env_or("AL_HEARTBEAT_SECS", "60").parse::<u64>().unwrap_or(60).clamp(1, 120);
     tokio::spawn(async move {
         // Let the collector fill in its report before the first beat.
         tokio::time::sleep(Duration::from_secs(3.min(every))).await;
@@ -315,126 +364,328 @@ pub fn heartbeat(collector: &'static str) -> anyhow::Result<Health> {
     Ok(health)
 }
 
-/// Bytes not yet acknowledged: the rest of the file being read and every file written after it.
-fn lag_bytes(path: &Path, source: &Path, offset: u64) -> u64 {
-    let len = |p: &Path| fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-    len(source).saturating_sub(offset) + newer_than(path, source).iter().map(|p| len(p)).sum::<u64>()
+/// Where the file with inode `ino` stands now: the name it has, and the bytes of every file
+/// written after it (for lagBytes). None when it is no longer in the directory.
+fn place(path: &Path, ino: u64) -> (Option<String>, u64) {
+    let all = in_write_order(path);
+    match all.iter().position(|p| fs::metadata(p).is_ok_and(|m| m.ino() == ino)) {
+        Some(i) => {
+            let name = all[i].file_name().map(|n| n.to_string_lossy().into_owned());
+            (name, all[i + 1..].iter().map(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(0)).sum())
+        }
+        None => (None, 0),
+    }
 }
 
-/// The file to go on with after a loss: the oldest one whose first record comes after the last
-/// record acknowledged (so newer rotated files still on disk are read), else `audit.log`.
-fn resume_after_loss(path: &Path, last_ms: Option<i64>) -> PathBuf {
-    let after = |p: &PathBuf| match (last_ms, first_record_ms(p)) {
-        (Some(l), Some(f)) => f > l,
-        _ => false,
+/// Bytes not yet acknowledged: the rest of the file being read (`remaining`, from its open
+/// handle) and every file written after it.
+#[cfg(test)]
+fn lag_bytes(path: &Path, ino: u64, remaining: u64) -> u64 {
+    remaining + place(path, ino).1
+}
+
+/// The UTC time in a rotated file's name (`audit-2026-10-20T06-00-00.000.log`): when it was
+/// rotated, which is also when the next file got its first record.
+fn rotated_at_ms(name: &str) -> Option<i64> {
+    let stamp = name.get(name.find('-')? + 1..name.len() - 4)?;
+    let dt = chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%dT%H-%M-%S%.3f").ok()?;
+    Some(dt.and_utc().timestamp_millis())
+}
+
+/// How far the first record of the next file may come after the rotation time and still be
+/// the next file (kube-apiserver rotates on the write that goes into the new file).
+const NEXT_FILE_SLACK_MS: i64 = 5_000;
+
+/// The file written after the one being read (`pos`), opened, and a report when files in
+/// between were removed before they could be read. None while there is no next file yet (or
+/// the listing caught a rename half-way; the caller looks again).
+fn next_after(path: &Path, pos: &Position) -> Option<(PathBuf, File, Option<Gap>)> {
+    let all = in_write_order(path);
+    let ours = all.iter().position(|p| fs::metadata(p).is_ok_and(|m| m.ino() == pos.inode));
+    let (next, lost) = match ours {
+        Some(i) => (all.get(i + 1).cloned()?, None),
+        None => {
+            // Ours left the directory (rotated out past maxbackup) after it was read to the end
+            // through the open handle. Files go oldest first, so the oldest one left newer than
+            // ours comes next; if it does not start where ours was rotated, files in between
+            // went too, unread.
+            let after = |p: &PathBuf| match (&pos.name, p.file_name().and_then(|n| n.to_str())) {
+                (Some(ours), Some(n)) if rotated_at_ms(ours).is_some() => p == path || n > ours.as_str(),
+                _ => last_record_ms_of(p).is_some_and(|t| pos.last_ms.is_none_or(|l| t > l)),
+            };
+            let next = all.iter().find(|p| after(p)).cloned().unwrap_or_else(|| path.to_path_buf());
+            let first = first_record_ms(&next);
+            let rotated = pos.name.as_deref().and_then(rotated_at_ms);
+            let lost = match (rotated, first) {
+                (Some(t), Some(f)) if f > t + NEXT_FILE_SLACK_MS => Some(gap(t, f, "file-removed", "rotated files removed before they were read")),
+                (None, Some(f)) => pos.collected_until().filter(|c| f > c + NEXT_FILE_SLACK_MS).map(|c| gap(c, f, "file-removed", "rotated name not seen; may be overstated")),
+                _ => None,
+            };
+            (next, lost)
+        }
     };
+    let f = File::open(&next).ok()?;
+    (f.metadata().ok()?.ino() != pos.inode).then_some((next, f, lost))
+}
+
+/// Test hook: widen the window between listing the directory and opening a file.
+fn test_delay() {
+    if let Some(ms) = std::env::var("AL_TEST_LIST_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
+/// The file to go on with after a loss: the oldest one holding a record after the last one
+/// acknowledged (audit times are not strictly increasing, so the file's last record decides,
+/// not its first), else `audit.log`. Without a time, `audit.log`.
+fn resume_after_loss(path: &Path, last_ms: Option<i64>) -> PathBuf {
+    let Some(l) = last_ms else { return path.to_path_buf() };
+    let after = |p: &PathBuf| last_record_ms_of(p).is_some_and(|t| t > l);
     in_write_order(path).into_iter().find(after).unwrap_or_else(|| path.to_path_buf())
 }
 
+/// The time of the last record in a file (from its last 64 KiB).
+fn last_record_ms_of(path: &Path) -> Option<i64> {
+    let mut f = File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(64 << 10))).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    last_record_ms(&buf)
+}
+
 fn gap(from_ms: i64, to_ms: i64, reason: &str, detail: &str) -> Gap {
-    Gap { collector: "file".into(), instance: instance_name(), from_ms, to_ms: to_ms.max(from_ms), reason: reason.into(), detail: detail.into() }
+    // A loss always covers some time: never report a zero-length period.
+    let to_ms = if reason == crate::store::START { to_ms.max(from_ms) } else { to_ms.max(from_ms + 1) };
+    Gap { collector: "file".into(), instance: instance_name(), from_ms, to_ms, reason: reason.into(), detail: detail.into() }
+}
+
+/// What `collect-file` does when it has no state at all and the server has never heard from
+/// this node (AL_ON_FIRST_START): "fromNow" (default) starts at the end of `audit.log`;
+/// "readExisting" reads the current `audit.log` from its start (rotated files are not read).
+/// Either way the server is told where collection starts.
+fn read_existing() -> bool {
+    env_or("AL_ON_FIRST_START", "fromNow").eq_ignore_ascii_case("readExisting")
 }
 
 /// Follow the audit log forever.
 pub async fn run_file() -> anyhow::Result<()> {
     let sender = Sender::from_env("k8s-audit")?;
     let gaps = Sender::from_env("gap")?;
-    let health = heartbeat("file")?;
     let path = PathBuf::from(env_or("AL_AUDIT_LOG", "/var/lib/rancher/rke2/server/logs/audit.log"));
     let state_dir = PathBuf::from(env_or("AL_STATE_DIR", "/var/lib/audit-loupe"));
     fs::create_dir_all(&state_dir)?;
     let state = state_dir.join("position.json");
-    let started_ms = Utc::now().timestamp_millis();
-    let mut pos = Position::load(&state);
+    let instance = instance_name();
     let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    if pos.inode != 0 {
-        // A restart: what was written while the collector was down is not read. The last
-        // record acknowledged dates the stop; a state file from before 0.3.2 has no such time,
-        // so its last write (made when the server acknowledged a batch) stands in for it.
-        let from = pos.last_ms.or_else(|| {
+    let mut pos = Position::load(&state);
+    if pos == Position::default() {
+        // No state: a first install, or the state directory was lost. Only the server can tell;
+        // ask before the first heartbeat makes this node known.
+        let known = loop {
+            match gaps.known("file", &instance).await {
+                Ok(k) => break k,
+                Err(e) => {
+                    warn!(error = %e, "cannot ask the server whether this node is new; retrying");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        };
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        let end = end_of_last_line(&path)?;
+        let started_ms = Utc::now().timestamp_millis();
+        let file = name(&path);
+        pos = match known {
+            Some(last) => {
+                let from = Some(last).filter(|t| *t > 0).unwrap_or(started_ms);
+                warn!(from_ms = from, "state lost but the server knows this node: reading from now on; the time since its last check-in is reported as not collected");
+                pos.pending.push(gap(from, started_ms, "collector-state-lost", &file));
+                Position { last_ms: Some(started_ms), ..pos }.at(&path, end)?
+            }
+            None if read_existing() => {
+                let from = first_record_ms(&path).unwrap_or(started_ms);
+                info!("first start: reading the existing audit.log from its start (rotated files are not read)");
+                pos.pending.push(gap(from, started_ms, crate::store::START, "readExisting"));
+                pos.at(&path, 0)?
+            }
+            None => {
+                info!("first start: collecting from now on");
+                pos.pending.push(gap(started_ms, started_ms, crate::store::START, "fromNow"));
+                Position { last_ms: Some(started_ms), ..pos }.at(&path, end)?
+            }
+        };
+        pos.save(&state)?;
+    } else if pos.inode != 0 {
+        // A restart: what was written while the collector was down is not read. It had
+        // everything up to the later of its last record and the last time it was caught up;
+        // a state file from before this has neither, so its last write stands in.
+        let end = if path.exists() { Some(end_of_last_line(&path)?) } else { None };
+        let started_ms = Utc::now().timestamp_millis();
+        let from = pos.collected_until().or_else(|| {
             fs::metadata(&state).ok()?.modified().ok().map(|t| DateTime::<Utc>::from(t).timestamp_millis())
         });
         let from = from.unwrap_or(started_ms);
         pos.pending.push(gap(from, started_ms, "collector-restart", &name(&path)));
         pos.last_ms = Some(started_ms);
-        pos = if path.exists() {
-            let end = end_of_last_line(&path)?;
-            pos.at(&path, end)?
-        } else {
-            // No audit.log yet: the next one to appear is read from its start, as on a first run.
-            Position { last_ms: pos.last_ms, pending: pos.pending, ..Default::default() }
+        pos.caught_up_ms = None;
+        pos = match end {
+            Some(end) => pos.at(&path, end)?,
+            // No audit.log yet: the next one to appear is read from its start.
+            None => Position { last_ms: pos.last_ms, pending: pos.pending, ..Default::default() },
         };
         warn!(from_ms = from, to_ms = started_ms, offset = pos.offset, "restarted: reading from now on; the downtime is reported as not collected");
         pos.save(&state)?;
     }
+    let health = heartbeat("file")?;
     info!(file = %path.display(), offset = pos.offset, "following audit log");
+    // The file being read stays open: a rename (rotation) or removal does not take it away,
+    // and its inode and first bytes are always checked on this same handle.
+    let mut cur: Option<(PathBuf, File)> = None;
     let mut backoff = 1u64;
+    let (mut gap_backoff, mut gap_next) = (1u64, tokio::time::Instant::now());
+    let mut caught_up_saved = 0i64;
     loop {
-        if !pos.pending.is_empty() {
-            match send_gaps(&gaps, &pos.pending).await {
-                Ok(()) => {
-                    pos.pending.clear();
-                    pos.save(&state)?;
-                }
-                Err(e) => warn!(error = %e, "reporting a not-collected period failed; will retry"),
+        if !pos.pending.is_empty() && tokio::time::Instant::now() >= gap_next {
+            let before = pos.pending.len();
+            send_gaps(&gaps, &mut pos.pending).await;
+            if pos.pending.len() < before {
+                save_or_warn(&pos, &state);
+            }
+            if pos.pending.is_empty() {
+                gap_backoff = 1;
+            } else {
+                gap_next = tokio::time::Instant::now() + Duration::from_secs(gap_backoff);
+                gap_backoff = (gap_backoff * 2).min(300);
             }
         }
         set(&health, "auditLog", serde_json::json!(if path.exists() { "present" } else { "missing" }));
-        if !path.exists() && rotated_files(&path).is_empty() {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            continue;
-        }
         if pos.inode == 0 {
-            // First run (read the current file from its start), or a restart that found no file.
-            if !path.exists() {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
+            // A restart that found no file: read the next audit.log from its start.
+            match File::open(&path) {
+                Ok(mut f) => match pos.on(&mut f, 0) {
+                    Ok(p) => {
+                        pos = p;
+                        cur = Some((path.clone(), f));
+                        save_or_warn(&pos, &state);
+                    }
+                    Err(e) => warn!(error = %e, "cannot read the new audit.log yet; will retry"),
+                },
+                Err(_) => tokio::time::sleep(Duration::from_secs(5)).await,
             }
-            pos = pos.at(&path, 0)?;
-            pos.save(&state)?;
             continue;
         }
-        // Shorter than what was already read: truncated or replaced in place, not the same file.
-        let len = |p: &Path| fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-        let Some(source) = locate(&path, &pos).filter(|p| len(p) >= pos.offset) else {
-            // The file being read is gone: removed (rotated out past maxbackup) or replaced under
-            // the same inode. What was left of it is lost; say so now, from the last record.
-            let replaced = in_write_order(&path).iter().any(|p| fs::metadata(p).is_ok_and(|m| m.ino() == pos.inode));
-            let reason = if replaced { "file-replaced" } else { "file-removed" };
-            let next = resume_after_loss(&path, pos.last_ms);
-            let now = Utc::now().timestamp_millis();
-            let from = pos.last_ms.unwrap_or(now);
-            let to = first_record_ms(&next).unwrap_or(now);
-            warn!(reason, from_ms = from, to_ms = to, next = %next.display(), "the file being read is gone before it was read to the end; reporting the loss");
-            pos.pending.push(gap(from, to, reason, ""));
-            pos = pos.at(&next, 0)?;
-            pos.save(&state)?;
+        if cur.is_none() {
+            // Find the file by inode and first bytes; a rotation half-way through the listing
+            // can hide it, so look once more before calling it lost.
+            cur = locate_open(&path, &pos);
+            if cur.is_none() {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                cur = locate_open(&path, &pos);
+            }
+            if cur.is_none() {
+                let replaced = in_write_order(&path).iter().any(|p| fs::metadata(p).is_ok_and(|m| m.ino() == pos.inode));
+                lose(&mut pos, &path, if replaced { "file-replaced" } else { "file-removed" });
+                save_or_warn(&pos, &state);
+                continue;
+            }
+        }
+        let (source, f) = cur.as_mut().expect("set above");
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        if len < pos.offset {
+            // Shorter than what was already read: truncated in place, not the same file.
+            cur = None;
+            lose(&mut pos, &path, "file-replaced");
+            save_or_warn(&pos, &state);
             continue;
-        };
-        set(&health, "lagBytes", serde_json::json!(lag_bytes(&path, &source, pos.offset)));
-        // The first bytes are recorded as the file grows, up to HEAD_BYTES.
+        }
+        if pos.head.as_ref().is_some_and(|h| !head_matches(f, h)) {
+            // Same inode, other first bytes: rewritten in place, not the file that was read.
+            cur = None;
+            lose(&mut pos, &path, "file-replaced");
+            save_or_warn(&pos, &state);
+            continue;
+        }
+        let (seen_as, after) = place(&path, pos.inode);
+        if seen_as.is_some() {
+            pos.name = seen_as;
+        }
+        set(&health, "lagBytes", serde_json::json!(len - pos.offset + after));
         if pos.head.as_ref().is_none_or(|h| h.len < HEAD_BYTES) {
-            pos.head = Some(head_of(&source)?);
+            // The first bytes are recorded as the file grows, up to HEAD_BYTES.
+            if let Ok(h) = head_of_file(f) {
+                pos.head = Some(h);
+            }
         }
-        let (chunk, consumed) = read_lines(&source, pos.offset, MAX_BATCH)?;
-        if chunk.is_empty() {
-            if let Some(next) = newer_than(&path, &source).into_iter().next() {
-                // A rotated file read to its end: go on with the next one written.
-                info!(finished = %source.display(), next = %next.display(), "rotated file read to the end");
-                pos = pos.at(&next, 0)?;
-                pos.save(&state)?;
+        let (chunk, consumed) = match read_lines_from(f, pos.offset, MAX_BATCH) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, file = %source.display(), "reading failed; will find the file again");
+                cur = None;
+                tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+        };
+        let at = |source: &Path, offset: u64| vec![("x-audit-loupe-instance", instance.clone()), ("x-audit-loupe-file", name(source)), ("x-audit-loupe-offset", offset.to_string())];
+        if chunk.is_empty() {
+            let live = fs::metadata(&path).map(|m| m.ino()).ok();
+            if live == Some(pos.inode) {
+                // Caught up with audit.log: everything written until now has been read.
+                let now = Utc::now().timestamp_millis();
+                pos.caught_up_ms = Some(now);
+                if now - caught_up_saved > 30_000 {
+                    save_or_warn(&pos, &state);
+                    caught_up_saved = now;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+            // Rotated out and read to its end. Bytes after the last newline are a record cut
+            // short; the server sets it aside (recorded, never silently dropped).
+            if len > pos.offset {
+                let mut tail = Vec::new();
+                if f.seek(SeekFrom::Start(pos.offset)).is_ok() && Read::by_ref(f).take(len - pos.offset).read_to_end(&mut tail).is_ok() {
+                    tail.push(b'\n');
+                    match sender.send_for_reply(&tail, &at(source, pos.offset)).await {
+                        Ok(_) => warn!(file = %source.display(), bytes = tail.len() - 1, "rotated file ended with an incomplete line; set aside"),
+                        Err(e) => {
+                            warn!(error = %e, "send failed; will retry");
+                            tokio::time::sleep(Duration::from_secs(backoff)).await;
+                            backoff = (backoff * 2).min(60);
+                            continue;
+                        }
+                    }
+                }
+            }
+            match next_after(&path, &pos) {
+                Some((next, mut nf, lost)) => {
+                    info!(finished = %source.display(), next = %next.display(), "rotated file read to the end");
+                    if let Some(g) = lost {
+                        warn!(from_ms = g.from_ms, to_ms = g.to_ms, "rotated files were removed before they were read; reporting the loss");
+                        pos.pending.push(g);
+                    }
+                    match pos.on(&mut nf, 0) {
+                        Ok(p) => {
+                            pos = p;
+                            cur = Some((next, nf));
+                        }
+                        // Gone again before it could be read: look for the next file once more.
+                        Err(e) => warn!(error = %e, next = %next.display(), "cannot read the next file; will look again"),
+                    }
+                    save_or_warn(&pos, &state);
+                }
+                None => tokio::time::sleep(Duration::from_millis(300)).await,
+            }
             continue;
         }
-        match sender.send_for_reply(&chunk).await {
+        match sender.send_for_reply(&chunk, &at(source, pos.offset)).await {
             Ok(reply) => {
                 pos.offset += consumed;
                 if let Some(t) = last_record_ms(&chunk) {
                     pos.last_ms = Some(t);
                 }
-                pos.save(&state)?;
+                save_or_warn(&pos, &state);
                 backoff = 1;
                 set(&health, "lastSentMs", serde_json::json!(Utc::now().timestamp_millis()));
                 let skipped = serde_json::from_str::<serde_json::Value>(&reply).ok().and_then(|v| v.get("skipped")?.as_u64()).unwrap_or(0);
@@ -451,11 +702,52 @@ pub async fn run_file() -> anyhow::Result<()> {
     }
 }
 
-async fn send_gaps(sender: &Sender, gaps: &[Gap]) -> anyhow::Result<()> {
-    for g in gaps {
-        sender.send(serde_json::to_string(g)?.as_bytes()).await?;
+/// The file being read is gone before it was read to the end: removed (rotated out past
+/// maxbackup) or replaced. What was left of it is lost; report it now and go on with the
+/// next file that has newer records.
+fn lose(pos: &mut Position, path: &Path, reason: &str) {
+    let next = resume_after_loss(path, pos.last_ms);
+    let now = Utc::now().timestamp_millis();
+    let from = pos.collected_until().unwrap_or(now);
+    let to = first_record_ms(&next).unwrap_or(now);
+    warn!(reason, from_ms = from, to_ms = to, next = %next.display(), "the file being read is gone before it was read to the end; reporting the loss");
+    pos.pending.push(gap(from, to, reason, ""));
+    pos.caught_up_ms = None;
+    *pos = match pos.at(&next, 0) {
+        Ok(p) => p,
+        // Nothing to open yet: wait for audit.log as after a restart without a file.
+        Err(_) => Position { last_ms: pos.last_ms, pending: std::mem::take(&mut pos.pending), ..Default::default() },
+    };
+}
+
+/// A failed save is retried with the next one; the collector does not stop for it.
+fn save_or_warn(pos: &Position, state: &Path) {
+    if let Err(e) = pos.save(state) {
+        warn!(error = %e, "could not save the read position; will try again");
     }
-    Ok(())
+}
+
+/// Send each report; one the server took is removed at once, so a later failure does not
+/// resend it (the server also ignores a report it already has).
+async fn send_gaps(sender: &Sender, pending: &mut Vec<Gap>) {
+    while let Some(g) = pending.first() {
+        let body = match serde_json::to_string(g) {
+            Ok(b) => b,
+            Err(_) => {
+                pending.remove(0);
+                continue;
+            }
+        };
+        match sender.send(body.as_bytes()).await {
+            Ok(()) => {
+                pending.remove(0);
+            }
+            Err(e) => {
+                warn!(error = %e, "reporting a not-collected period failed; will retry");
+                return;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -703,7 +995,7 @@ mod tests {
         fs::rename(&p, &rotated).unwrap();
         fs::write(&p, "new1\n").unwrap();
         assert_eq!(locate(&p, &pos), Some(rotated.clone()));
-        assert_eq!(lag_bytes(&p, &rotated, pos.offset), 5 + 5);
+        assert_eq!(lag_bytes(&p, pos.inode, 10 - pos.offset), 5 + 5);
         // Same inode, other content: not the file that was being read.
         fs::write(&rotated, "else\nelse\n").unwrap();
         assert_eq!(locate(&p, &pos), None);
@@ -731,7 +1023,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = dir.path().join("position.json");
         assert_eq!(Position::load(&s), Position::default());
-        let p = Position { inode: 42, offset: 1234, head: Some(Head { len: 3, sha256: "ab".into() }), last_ms: Some(7), pending: vec![] };
+        let p = Position { inode: 42, offset: 1234, head: Some(Head { len: 3, sha256: "ab".into() }), last_ms: Some(7), pending: vec![], caught_up_ms: Some(9), name: Some("audit.log".into()) };
         p.save(&s).unwrap();
         assert_eq!(Position::load(&s), p);
         // Written by 0.3.1 and earlier.
