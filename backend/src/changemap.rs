@@ -422,7 +422,10 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
             }
         }
         let key = format!("{cluster}/{api_group}/{resource}/{namespace}/{name}");
-        let verb = if sub.is_empty() || verb != "create" { verb } else { sub.clone() };
+        // Shown as the subresource for entering a container (exec, attach, port-forward) whatever
+        // the verb: current kubectl opens these over a websocket with GET, older ones with POST
+        // (create). Other subresources keep the old rule: only a create is named after them.
+        let verb = if matches!(sub.as_str(), "exec" | "attach" | "portforward") || (!sub.is_empty() && verb == "create") { sub.clone() } else { verb };
         let op = Op { t: r.get(1)?, cluster, key, resource, namespace, name, actor, category, note, via: r.get(4)?, verb, severity, unattributed: false, hashed: r.get(14)? };
         add(op, &api_group, &mut objs, &mut ops);
     }
@@ -964,6 +967,41 @@ mod tests {
         // Nothing that day, and a malformed key.
         assert!(detail(&s, chrono_tz::Asia::Taipei, &Params { key: Some("c1//pods/app/none".into()), ..p.clone() }, T).unwrap().is_null());
         assert!(detail(&s, chrono_tz::Asia::Taipei, &Params { key: Some("c1/pods".into()), ..p }, T).is_err());
+    }
+
+    /// Entering a container is shown as such whatever the verb: current kubectl sends exec as a
+    /// GET (websocket), older kubectl as a POST (create). Both name the SUSE Security setting.
+    #[test]
+    fn exec_by_get_or_create_is_entering_a_container() {
+        let s = store();
+        {
+            let c = s.conn.lock().unwrap();
+            for (id, verb, name) in [(1, "get", "web"), (2, "create", "api")] {
+                c.execute(
+                    "INSERT INTO events (id, cluster, audit_id, ts_ms, ts, actor, principal, human, via, caller, verb, api_group, resource, subresource,
+                                         namespace, name, code, source_ip, user_agent, request_uri, source, hash)
+                     VALUES (?1, 'c1', ?1, ?2, '', 'alice', '', 1, 'rancher', 'alice', ?3, '', 'pods', 'exec', 'app', ?4, 101, '', '', '', 'k8s', 'h')",
+                    params![id, T + id * 1000, verb, name],
+                )
+                .unwrap();
+            }
+            // A plain read of a pod's logs stays a read and is not listed.
+            c.execute(
+                "INSERT INTO events (id, cluster, audit_id, ts_ms, ts, actor, principal, human, via, caller, verb, api_group, resource, subresource,
+                                     namespace, name, code, source_ip, user_agent, request_uri, source, hash)
+                 VALUES (3, 'c1', '3', ?1, '', 'alice', '', 1, 'rancher', 'alice', 'get', '', 'pods', 'log', 'app', 'logs-only', 200, '', '', '', 'k8s', 'h')",
+                params![T + 3000],
+            )
+            .unwrap();
+        }
+        for name in ["web", "api"] {
+            let p = Params { day: Some("2026-10-20".into()), key: Some(format!("c1//pods/app/{name}")), ..Default::default() };
+            let d = detail(&s, chrono_tz::Asia::Taipei, &p, T).unwrap();
+            assert_eq!(d["ops"][0]["verb"], "exec", "{name}");
+            assert_eq!(d["dependsOn"][0]["setting"], "是否啟用 SUSE Security 收集", "{name}");
+        }
+        let v = changemap(&s, chrono_tz::Asia::Taipei, &Params { day: Some("2026-10-20".into()), ..Default::default() }, T).unwrap();
+        assert!(!v["rows"].as_array().unwrap().iter().any(|r| r["name"] == "logs-only"));
     }
 
     /// v0.1 point 5: the note is passed on with the time of the newest record.
