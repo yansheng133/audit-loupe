@@ -130,3 +130,5 @@ v0 是原型：開頁時直接查現有資料表，**不做彙總表、不調效
    - 缺口：`timeline.gaps[]` 加 `collector` 與 `reasonCode: "collector-silent"`。
    - 事件：`reasonCode`：`first-alert`、`first-unattributed`、`collector-stopped`、`collector-resumed`（後兩者帶 `collector`）。
    - 關係圖的身分節點加 `group`（多個身分合併成一類）與 `noActor`（找不到執行者）。
+4. **時間範圍**：`/api/changemap` 與 `/api/changemap/detail` 接受 `from`、`to`（毫秒，當天內）。總覽、件數、稽核狀態、關係、事件與細節只算範圍內的紀錄；時間列照樣是整天，讓人看得到範圍在一天裡的位置。不帶就是整天。
+5. **同時開同一個畫面**：server 算同一個畫面時，其他同時要同一個畫面的人等它算完、共用結果；算完之後才來的請求會重新算，所以重新整理一定看得到新紀錄。

@@ -28,6 +28,11 @@ pub struct Params {
     pub system: Option<String>,
     /// Object key for `/api/changemap/detail`.
     pub key: Option<String>,
+    /// A time range within the day (ms), picked on the timeline (v0.2): the list, counts,
+    /// states, relations, events and detail count only records in it; the timeline still shows
+    /// the whole day.
+    pub from: Option<i64>,
+    pub to: Option<i64>,
 }
 
 /// Parse a query string that may repeat `cluster`.
@@ -46,6 +51,8 @@ pub fn parse_query(q: &str) -> Params {
             "select" => p.select = Some(v),
             "system" => p.system = Some(v),
             "key" => p.key = Some(v),
+            "from" => p.from = v.parse().ok(),
+            "to" => p.to = v.parse().ok(),
             _ => {}
         }
     }
@@ -292,9 +299,40 @@ pub fn shown_query() -> String {
     )
 }
 
+/// Page views being built now, per server and view. People who open the same view at the same
+/// moment share one build instead of queueing for the database one after another (five at
+/// once took about 0.9 s each without this, at 720,000 records a day). A view asked for after
+/// the build finished is built again, so a reload always sees new records.
+type PageSlot = std::sync::Arc<Mutex<Option<(std::time::Instant, Value)>>>;
+static PAGES: Mutex<Option<HashMap<String, PageSlot>>> = Mutex::new(None);
+
 /// One page view. `AL_DATA_NOTE`, when set, is shown as a note on the page (v0.1, point 5).
 /// Work that changes what the page shows while it runs is listed in `meta.progress` (v0.2).
 pub fn changemap(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64) -> anyhow::Result<Value> {
+    let arrived = std::time::Instant::now();
+    let key = format!("{:p}|{p:?}", std::sync::Arc::as_ptr(&store.conn));
+    let slot = {
+        let mut g = PAGES.lock().unwrap();
+        let m = g.get_or_insert_with(HashMap::new);
+        // Slots nobody holds or waits for any more are dropped.
+        m.retain(|_, s| std::sync::Arc::strong_count(s) > 1);
+        m.entry(key).or_default().clone()
+    };
+    // Someone building the same view now is waited for; what they finish after this request
+    // arrived is shared.
+    let mut built = slot.lock().unwrap();
+    if let Some((finished, v)) = built.as_ref()
+        && *finished >= arrived
+    {
+        return Ok(v.clone());
+    }
+    let v = changemap_fresh(store, tz, p, now_ms)?;
+    *built = Some((std::time::Instant::now(), v.clone()));
+    Ok(v)
+}
+
+/// One page view built now, not shared with anyone.
+pub fn changemap_fresh(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64) -> anyhow::Result<Value> {
     let note = std::env::var("AL_DATA_NOTE").ok().filter(|n| !n.is_empty());
     let mut v = build(store, tz, p, now_ms, None, note.as_deref(), true)?;
     // The selected object's detail comes from its own records (with their hash state), the same
@@ -362,10 +400,15 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     };
     let principals: HashMap<String, String> =
         c.prepare("SELECT user_id, principal_ids FROM users")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
-    let idents: HashMap<(String, String), (&'static str, String)> = c
+    // By name, then Rancher user ID, so a row can be looked up without copying its strings.
+    let mut idents: HashMap<String, HashMap<String, (&'static str, String)>> = HashMap::new();
+    for row in c
         .prepare("SELECT actor, user_id, class, reason FROM identities")?
-        .query_map([], |r| Ok(((r.get(0)?, r.get(1)?), (crate::identity::class_name(&r.get::<_, String>(2)?), r.get(3)?))))?
-        .collect::<Result<_, _>>()?;
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, crate::identity::class_name(&r.get::<_, String>(2)?), r.get::<_, String>(3)?)))?
+    {
+        let (actor, uid, class, reason) = row?;
+        idents.entry(actor).or_default().insert(uid, (class, reason));
+    }
     // Which collectors each cluster runs decides why a change has no author.
     let mut collectors: HashMap<String, HashSet<String>> = HashMap::new();
     for row in c.prepare("SELECT cluster, collector FROM heartbeats")?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
@@ -393,7 +436,14 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     let mut hidden_ui = 0i64;
     let mut hidden_request = 0i64;
     let mut objs: HashMap<String, Obj> = HashMap::new();
+    // Every record of the day goes to the timeline; only those in the picked range make objects.
+    let (range_from, range_to) = (p.from.unwrap_or(i64::MIN), p.to.unwrap_or(i64::MAX));
+    let in_range = |t: i64| t >= range_from && t < range_to;
     let add = |op: Op, api_group: &str, objs: &mut HashMap<String, Obj>, ops: &mut Vec<Op>| {
+        if !in_range(op.t) {
+            ops.push(op);
+            return;
+        }
         let o = objs.entry(op.key.clone()).or_insert_with(|| Obj {
             key: op.key.clone(),
             kind: kinds.get(&(op.cluster.clone(), api_group.to_string(), op.resource.clone())).cloned().unwrap_or_else(|| kind_from_resource(&op.resource)),
@@ -433,43 +483,39 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         Some(k) => st.query(params![start, end, ev_max, k.cluster, k.resource, k.namespace, only_name(k)])?,
         None => st.query(params![start, end, ev_max])?,
     };
+    // Rows are looked at through borrowed text first; only rows the page keeps are copied
+    // (most of a busy day's writes are system components the default view leaves out).
+    let text = |r: &rusqlite::Row<'_>, i: usize| -> rusqlite::Result<String> { Ok(r.get_ref(i)?.as_str().unwrap_or_default().to_string()) };
     while let Some(r) = rows.next()? {
-        let cluster: String = r.get(0)?;
-        if !clusters.is_empty() && !clusters.contains(cluster.as_str()) {
+        let s = |i: usize| -> rusqlite::Result<&str> { Ok(r.get_ref(i)?.as_str().unwrap_or_default()) };
+        if !clusters.is_empty() && !clusters.contains(s(0)?) {
             continue;
         }
-        let (verb, sub, source): (String, String, String) = (r.get(5)?, r.get(8)?, r.get(13)?);
         let severity: Option<String> = r.get(15)?;
-        if !is_write(&source, &verb, &sub) && severity.is_none() {
+        if !is_write(s(13)?, s(5)?, s(8)?) && severity.is_none() {
             continue;
         }
-        let (namespace, mut name, resource, api_group): (String, String, String, String) = (r.get(9)?, r.get(10)?, r.get(7)?, r.get(6)?);
-        if ns_filter.is_some_and(|n| n != namespace) || only.is_some_and(|k| k.api_group != api_group) {
+        if ns_filter.is_some_and(|n| n != s(9).unwrap_or_default()) || only.is_some_and(|k| k.api_group != s(6).unwrap_or_default()) {
             continue;
         }
         // A write without a name is a deletecollection or a create the server named. It is
         // listed as one batch row per resource and namespace; requests that leave no object
         // behind are only counted (v0.1, point 1).
-        if name.is_empty() {
-            if REQUEST_ONLY.contains(&resource.as_str()) {
-                hidden_request += 1;
-                continue;
-            }
-            name = BATCH.to_string();
+        let raw_name = s(10)?;
+        if raw_name.is_empty() && REQUEST_ONLY.contains(&s(7)?) {
+            hidden_request += 1;
+            continue;
         }
-        let (actor, human, ua, uid): (String, bool, String, String) = (r.get(2)?, r.get::<_, i64>(3)? == 1, r.get(11)?, r.get(12)?);
+        let name_ref = if raw_name.is_empty() { BATCH } else { raw_name };
+        let (actor_ref, uid_ref) = (s(2)?, s(12)?);
         // The identity table decides the class (whitelist included); records stored without
         // going through ingest (tests) fall back to the built-in rules.
-        let (category, reason) = match idents.get(&(actor.clone(), uid.clone())) {
-            Some((c, n)) => (*c, n.clone()),
-            None => {
-                let (c, n) = crate::identity::builtin(&actor, human, &ua, principals.get(&uid).map(String::as_str));
-                (c, n.to_string())
-            }
+        let (category, reason): (&'static str, &str) = match idents.get(actor_ref).and_then(|m| m.get(uid_ref)) {
+            Some((c, n)) => (*c, n.as_str()),
+            None => crate::identity::builtin(actor_ref, r.get::<_, i64>(3)? == 1, s(11)?, principals.get(uid_ref).map(String::as_str)),
         };
-        let (note, note_code) = (crate::identity::reason_text(&reason).to_string(), crate::identity::reason_code(&reason));
         if !with_system {
-            if ui_maintenance(&resource, &name) {
+            if ui_maintenance(s(7)?, name_ref) {
                 hidden_ui += 1;
                 continue;
             }
@@ -478,6 +524,9 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
                 continue;
             }
         }
+        let (note, note_code) = (crate::identity::reason_text(reason).to_string(), crate::identity::reason_code(reason));
+        let (cluster, actor, verb, sub) = (text(r, 0)?, text(r, 2)?, text(r, 5)?, text(r, 8)?);
+        let (namespace, name, resource, api_group) = (text(r, 9)?, name_ref.to_string(), text(r, 7)?, text(r, 6)?);
         let key = format!("{cluster}/{api_group}/{resource}/{namespace}/{name}");
         // Shown as the subresource for entering a container (exec, attach, port-forward) whatever
         // the verb: current kubectl opens these over a websocket with GET, older ones with POST
@@ -625,7 +674,8 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
 
     let mut list: Vec<&Obj> = objs.values().collect();
     list.sort_by(|a, b| rank(a.state).cmp(&rank(b.state)).then(b.last.cmp(&a.last)).then(a.key.cmp(&b.key)));
-    let mut counts = json!({"objects": list.len(), "ops": ops.len(), "look": 0, "unclear": 0, "blind": 0, "clear": 0});
+    let in_range_ops: usize = list.iter().map(|o| o.ops.len()).sum();
+    let mut counts = json!({"objects": list.len(), "ops": in_range_ops, "look": 0, "unclear": 0, "blind": 0, "clear": 0});
     for o in &list {
         counts[o.state] = json!(counts[o.state].as_i64().unwrap_or(0) + 1);
     }
@@ -648,9 +698,8 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     let mut lines = Vec::new();
     for lk in &line_keys {
         let mut slots: Vec<(usize, i64, i64)> = vec![(9, 0, 0); n_slots]; // (rank, ops, alerts); 9 = none
-        for o in objs.values().filter(|o| lk.as_ref().is_none_or(|c| *c == o.cluster)) {
-            for i in &o.ops {
-                let op = &ops[*i];
+        {
+            for op in ops.iter().filter(|op| lk.as_ref().is_none_or(|c| *c == op.cluster)) {
                 let s = ((op.t - start) / slot_ms) as usize;
                 if s >= n_slots {
                     continue;
@@ -804,8 +853,12 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
             }
         }
         for (cl, f, t, col) in &gaps {
-            evs.push(json!({"t": f, "subject": cl, "from": "ok", "to": "blind", "reasonCode": "collector-stopped", "collector": col, "reason": format!("收集元件 {col} 停止回報"), "source": "heartbeat"}));
-            evs.push(json!({"t": t, "subject": cl, "from": "blind", "to": "ok", "reasonCode": "collector-resumed", "collector": col, "reason": format!("收集元件 {col} 恢復回報"), "source": "heartbeat"}));
+            if in_range(*f) {
+                evs.push(json!({"t": f, "subject": cl, "from": "ok", "to": "blind", "reasonCode": "collector-stopped", "collector": col, "reason": format!("收集元件 {col} 停止回報"), "source": "heartbeat"}));
+            }
+            if in_range(*t) {
+                evs.push(json!({"t": t, "subject": cl, "from": "blind", "to": "ok", "reasonCode": "collector-resumed", "collector": col, "reason": format!("收集元件 {col} 恢復回報"), "source": "heartbeat"}));
+            }
         }
         evs.sort_by_key(|e| std::cmp::Reverse(e["t"].as_i64().unwrap_or(0)));
         evs.truncate(EVENTS);
@@ -932,6 +985,28 @@ mod tests {
         let q = parse_query("day=2026-10-20&cluster=a&cluster=b&select=c%2F%2Fpods%2Fns%2Fx&tab=events");
         assert_eq!(q.cluster, vec!["a", "b"]);
         assert_eq!(q.select.as_deref(), Some("c//pods/ns/x"));
+    }
+
+    /// v0.2: a range picked on the timeline narrows the list, counts and events to it; the
+    /// timeline itself still shows the whole day.
+    #[test]
+    fn a_range_narrows_the_page_but_not_the_timeline() {
+        let s = store();
+        {
+            let c = s.conn.lock().unwrap();
+            ev(&c, 1, "c1", T, "alice", 1, "rancher", "patch", "configmaps", "app", "morning");
+            ev(&c, 2, "c1", T + 3 * 3_600_000, "alice", 1, "rancher", "patch", "configmaps", "app", "afternoon");
+            ev(&c, 3, "c1", T + 3 * 3_600_000 + 60_000, "alice", 1, "rancher", "patch", "configmaps", "app", "afternoon");
+        }
+        let all = Params { day: Some("2026-10-20".into()), ..Default::default() };
+        let v = changemap(&s, chrono_tz::Asia::Taipei, &all, T).unwrap();
+        assert_eq!((v["counts"]["objects"].as_i64(), v["counts"]["ops"].as_i64()), (Some(2), Some(3)));
+        let p = Params { from: Some(T + 2 * 3_600_000), to: Some(T + 4 * 3_600_000), ..all.clone() };
+        let r = changemap(&s, chrono_tz::Asia::Taipei, &p, T).unwrap();
+        assert_eq!((r["counts"]["objects"].as_i64(), r["counts"]["ops"].as_i64()), (Some(1), Some(2)));
+        assert_eq!(r["rows"][0]["name"], "afternoon");
+        assert_eq!(r["timeline"], v["timeline"], "the timeline is the whole day either way");
+        assert_eq!(parse_query("day=2026-10-20&from=5&to=9").from, Some(5));
     }
 
     /// v0.1 point 2: records that arrive between two pages neither repeat rows nor push rows

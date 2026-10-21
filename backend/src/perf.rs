@@ -10,7 +10,7 @@
 //! - `AL_PERF_SCALE=<n>` changes the multiple of the lab day (default 11, about 720,000).
 
 use crate::audit::{Record, Source, Via};
-use crate::changemap::{changemap, changemap_by_scan, detail, Params};
+use crate::changemap::{changemap, changemap_by_scan, changemap_fresh, detail, Params};
 use crate::config::Config;
 use crate::store::Store;
 use chrono::{TimeZone, Utc};
@@ -116,6 +116,29 @@ pub fn records(scale: usize) -> Vec<Record> {
     out
 }
 
+/// Five people open the overview at the same moment, three times; the slowest request (ms).
+fn five_at_once(store: &Store, tz: chrono_tz::Tz, p: &Params, now: i64) -> f64 {
+    let mut worst: f64 = 0.0;
+    for _ in 0..3 {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
+        let handles: Vec<_> = (0..5)
+            .map(|_| {
+                let (store, p, barrier) = (store.clone(), p.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let t = Instant::now();
+                    changemap(&store, tz, &p, now).unwrap();
+                    t.elapsed().as_secs_f64() * 1000.0
+                })
+            })
+            .collect();
+        for h in handles {
+            worst = worst.max(h.join().unwrap());
+        }
+    }
+    worst
+}
+
 struct Row {
     view: &'static str,
     target_ms: Option<f64>,
@@ -151,6 +174,14 @@ fn pct(sorted: &[f64], p: f64) -> f64 {
     sorted[i.min(sorted.len() - 1)]
 }
 
+/// Size of a response as the browser receives it (gzip, as the server sends it when asked).
+fn gzipped(v: &serde_json::Value) -> usize {
+    use std::io::Write;
+    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    e.write_all(&serde_json::to_vec(v).unwrap()).unwrap();
+    e.finish().unwrap().len()
+}
+
 fn time(runs: usize, mut f: impl FnMut() -> serde_json::Value) -> (Vec<f64>, usize) {
     let mut bytes = 0;
     let _ = f(); // first call warms the caches; not counted
@@ -159,7 +190,7 @@ fn time(runs: usize, mut f: impl FnMut() -> serde_json::Value) -> (Vec<f64>, usi
             let t = Instant::now();
             let v = f();
             let ms = t.elapsed().as_secs_f64() * 1000.0;
-            bytes = serde_json::to_vec(&v).map(|b| b.len()).unwrap_or(0);
+            bytes = gzipped(&v);
             ms
         })
         .collect();
@@ -207,13 +238,14 @@ fn perf_gate() {
     let mut rows = Vec::new();
     let mut diffs = Vec::new();
     let mut add = |view, target_ms, p: Params, is_detail: bool| {
-        let (ms, bytes) = time(runs, || if is_detail { detail(&store, tz, &p, now).unwrap() } else { changemap(&store, tz, &p, now).unwrap() });
+        // Each run builds the page (no reuse): the time one person waits.
+        let (ms, bytes) = time(runs, || if is_detail { detail(&store, tz, &p, now).unwrap() } else { changemap_fresh(&store, tz, &p, now).unwrap() });
         let (scan_ms, same) = if is_detail {
             (None, None)
         } else {
             let (mut sm, _) = time(3, || changemap_by_scan(&store, tz, &p, now).unwrap());
             sm.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let (new, old) = (changemap(&store, tz, &p, now).unwrap(), changemap_by_scan(&store, tz, &p, now).unwrap());
+            let (new, old) = (changemap_fresh(&store, tz, &p, now).unwrap(), changemap_by_scan(&store, tz, &p, now).unwrap());
             if let Some(d) = first_diff(&new, &old, "") {
                 diffs.push(format!("{view}: {d}"));
             }
@@ -228,15 +260,21 @@ fn perf_gate() {
     add("事件分頁", Some(300.0), Params { tab: Some("events".into()), ..base.clone() }, false);
     add("單一物件細節", Some(100.0), Params { key: Some(busiest.clone()), ..base.clone() }, true);
     let next = first["next"].as_str().map(str::to_string);
+    let five = five_at_once(&store, tz, &base, now);
     add("總覽第二頁", Some(300.0), Params { cursor: next, ..base.clone() }, false);
     add("總覽只看「要看」", Some(300.0), Params { state: Some("look".into()), ..base.clone() }, false);
     add("總覽單一 Namespace", Some(300.0), Params { namespace: Some("al-sample".into()), ..base.clone() }, false);
+    add("總覽時間範圍（兩小時）", Some(300.0), Params { from: Some(day_start() + 10 * 3_600_000), to: Some(day_start() + 12 * 3_600_000), ..base.clone() }, false);
 
     let mut md = format!(
-        "### 變更地圖效能閘門\n\n一天 {n} 筆（lab 10/20 的 {scale} 倍），寫入 {ingest_s:.1} 秒（每秒 {:.0} 筆）；雜湊鏈完整檢查 {chain_s:.1} 秒（背景，每 10 分鐘一次，不計入下表）。每項 {runs} 次，不含第一次。伺服器端時間，不含網路與瀏覽器。\n\n| 畫面 | p50 (ms) | p95 (ms) | 最慢 (ms) | 回應大小（未壓縮） | 目標 p95 | 結果 | 舊做法 p50 (ms) | 與舊做法相同 |\n|---|---|---|---|---|---|---|---|---|\n",
+        "### 變更地圖效能閘門\n\n一天 {n} 筆（lab 10/20 的 {scale} 倍），寫入 {ingest_s:.1} 秒（每秒 {:.0} 筆）；雜湊鏈完整檢查 {chain_s:.1} 秒（背景，每 10 分鐘一次，不計入下表）。每項 {runs} 次，不含第一次。伺服器端時間，不含網路與瀏覽器。\n\n| 畫面 | p50 (ms) | p95 (ms) | 最慢 (ms) | 回應大小（gzip） | 目標 p95 | 結果 | 舊做法 p50 (ms) | 與舊做法相同 |\n|---|---|---|---|---|---|---|---|---|\n",
         n as f64 / ingest_s
     );
     let mut missed = Vec::new();
+    // The first screen must arrive compressed in 200 KB or less (requirements 3.4).
+    for r in rows.iter().filter(|r| r.bytes > 200 * 1024) {
+        missed.push(format!("{} {} KB gzip > 200 KB", r.view, r.bytes / 1024));
+    }
     for r in &mut rows {
         r.ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let (p50, p95, max) = (pct(&r.ms, 0.5), pct(&r.ms, 0.95), r.ms[r.ms.len() - 1]);
@@ -251,11 +289,22 @@ fn perf_gate() {
         md += &format!(
             "| {} | {p50:.0} | {p95:.0} | {max:.0} | {} KB | {} | {verdict} | {} | {} |\n",
             r.view,
-            r.bytes / 1024,
+            r.bytes.div_ceil(1024),
             r.target_ms.map(|t| format!("≤ {t:.0} ms")).unwrap_or_else(|| "—".into()),
             r.scan_ms.map(|m| format!("{m:.0}")).unwrap_or_else(|| "—".into()),
             match r.same { Some(true) => "相同", Some(false) => "**不同**", None => "—" },
         );
+    }
+    md += &format!(
+        "\n5 個人同時開總覽首頁（3 輪）：每個請求最慢 {:.0} ms（目標 ≤ 1,000 ms）。同一個畫面同時被要求時只算一次，其他人等它算完共用結果。\n",
+        five
+    );
+    if five > 1000.0 {
+        missed.push(format!("5 at once: {five:.0} ms > 1000 ms"));
+    }
+    if !diffs.is_empty() {
+        md += &format!("\n不同的地方：{diffs:?}\n");
+        println!("differences: {diffs:?}");
     }
     println!("{md}");
     if let Ok(p) = std::env::var("AL_PERF_SUMMARY") {
@@ -263,10 +312,6 @@ fn perf_gate() {
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
             let _ = writeln!(f, "{md}");
         }
-    }
-    if !diffs.is_empty() {
-        md += &format!("\n不同的地方：{diffs:?}\n");
-        println!("differences: {diffs:?}");
     }
     assert!(!busiest.is_empty(), "the first page has rows");
     assert!(diffs.is_empty(), "the index must give the same page as reading the whole day: {diffs:?}");
