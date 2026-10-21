@@ -170,5 +170,6 @@
 
 ## 用過、留下的東西
 
-- 修正前比對用的 worktree 與建置目錄，都在 scratchpad（不進 repo），做完已移除 worktree。
-- scratchpad 裡有資料庫副本與 3 萬行 log 副本（權限 600），裡面有稽核資料，對話結束後可刪。
+- 修正前比對用的 worktree 與建置目錄都放在 scratchpad（不進 repo），做完已刪除。
+- 資料庫副本與 3 萬行 log 副本（權限 600）也在 scratchpad，裡面有稽核資料，測完已刪除。`~/audit-loupe-lab/overnight/` 的原檔沒有動。
+- `~/audit-loupe-pr11` 這個 worktree 留著，PR #11 合併後可以 `git worktree remove`。
