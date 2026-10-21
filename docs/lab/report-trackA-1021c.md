@@ -67,8 +67,11 @@
 
 ## CI 結果
 
-- PR #16（`fix/changemap-v01-followup`，`f0e8c24`）：`helm chart` 通過；`backend tests` 執行中（第一次寫報告時）。
-- UI PR #4（`feat/v5`，`d268bcb`）：`Find Extensions to Build` 通過、`Test build audit-loupe` 通過。
+- PR #16（`fix/changemap-v01-followup`）：
+  - `f0e8c24`（只有補丁）：`helm chart` 通過；`backend tests` 還沒跑完就被取消，因為我 push 了報告的 commit，CI 只保留同一個分支最新的那次。
+  - `e1c4691`（補丁＋報告）：`backend tests` 通過（2 分 10 秒）、`helm chart` 通過（12 秒）。
+  - 這次 push 只加了 CI 結果這幾行，會再跑一次 CI；內容只有文件。
+- UI PR #4（`feat/v5`，`d268bcb`）：`Find Extensions to Build` 通過（6 秒）、`Test build audit-loupe` 通過（35 秒）。
 
 ## 在瀏覽器看介面（Sam 自己開）
 
