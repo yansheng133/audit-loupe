@@ -10,7 +10,7 @@
 //! - `AL_PERF_SCALE=<n>` changes the multiple of the lab day (default 11, about 720,000).
 
 use crate::audit::{Record, Source, Via};
-use crate::changemap::{changemap, detail, Params};
+use crate::changemap::{changemap, changemap_by_scan, detail, Params};
 use crate::config::Config;
 use crate::store::Store;
 use chrono::{TimeZone, Utc};
@@ -121,6 +121,29 @@ struct Row {
     target_ms: Option<f64>,
     ms: Vec<f64>,
     bytes: usize,
+    /// The same view read the old way (every record of the day), p50, when measured.
+    scan_ms: Option<f64>,
+    /// Whether the response equals the old way's.
+    same: Option<bool>,
+}
+
+/// The first place two responses differ, for the report.
+fn first_diff(a: &serde_json::Value, b: &serde_json::Value, path: &str) -> Option<String> {
+    use serde_json::Value as V;
+    match (a, b) {
+        (V::Object(x), V::Object(y)) => {
+            let mut keys: Vec<&String> = x.keys().chain(y.keys()).collect();
+            keys.sort();
+            keys.dedup();
+            keys.into_iter().find_map(|k| match (x.get(k), y.get(k)) {
+                (Some(p), Some(q)) => first_diff(p, q, &format!("{path}.{k}")),
+                _ => Some(format!("{path}.{k}")),
+            })
+        }
+        (V::Array(x), V::Array(y)) if x.len() == y.len() => x.iter().zip(y).enumerate().find_map(|(i, (p, q))| first_diff(p, q, &format!("{path}[{i}]"))),
+        _ if a == b => None,
+        _ => Some(path.to_string()),
+    }
 }
 
 fn pct(sorted: &[f64], p: f64) -> f64 {
@@ -165,7 +188,15 @@ fn perf_gate() {
     let base = Params { day: day.clone(), ..Default::default() };
     let runs = 20;
 
+    // The chain check runs in the background every 10 minutes; time it on its own and keep it
+    // out of the page timings below.
+    let t = Instant::now();
+    store.verify_chain(None).unwrap();
+    let chain_s = t.elapsed().as_secs_f64();
     let first = changemap(&store, tz, &base, now).unwrap();
+    while crate::changemap::chain_check_running() {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     let busiest = first["rows"]
         .as_array()
         .and_then(|rows| rows.iter().max_by_key(|r| r["ops"].as_i64().unwrap_or(0)))
@@ -174,9 +205,21 @@ fn perf_gate() {
         .to_string();
 
     let mut rows = Vec::new();
+    let mut diffs = Vec::new();
     let mut add = |view, target_ms, p: Params, is_detail: bool| {
         let (ms, bytes) = time(runs, || if is_detail { detail(&store, tz, &p, now).unwrap() } else { changemap(&store, tz, &p, now).unwrap() });
-        rows.push(Row { view, target_ms, ms, bytes });
+        let (scan_ms, same) = if is_detail {
+            (None, None)
+        } else {
+            let (mut sm, _) = time(3, || changemap_by_scan(&store, tz, &p, now).unwrap());
+            sm.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let (new, old) = (changemap(&store, tz, &p, now).unwrap(), changemap_by_scan(&store, tz, &p, now).unwrap());
+            if let Some(d) = first_diff(&new, &old, "") {
+                diffs.push(format!("{view}: {d}"));
+            }
+            (Some(pct(&sm, 0.5)), Some(new == old))
+        };
+        rows.push(Row { view, target_ms, ms, bytes, scan_ms, same });
     };
     add("總覽首頁（全部叢集）", Some(300.0), base.clone(), false);
     add("總覽首頁（含系統元件）", Some(300.0), Params { system: Some("1".into()), ..base.clone() }, false);
@@ -184,9 +227,13 @@ fn perf_gate() {
     add("關係分頁", Some(300.0), Params { tab: Some("relations".into()), ..base.clone() }, false);
     add("事件分頁", Some(300.0), Params { tab: Some("events".into()), ..base.clone() }, false);
     add("單一物件細節", Some(100.0), Params { key: Some(busiest.clone()), ..base.clone() }, true);
+    let next = first["next"].as_str().map(str::to_string);
+    add("總覽第二頁", Some(300.0), Params { cursor: next, ..base.clone() }, false);
+    add("總覽只看「要看」", Some(300.0), Params { state: Some("look".into()), ..base.clone() }, false);
+    add("總覽單一 Namespace", Some(300.0), Params { namespace: Some("al-sample".into()), ..base.clone() }, false);
 
     let mut md = format!(
-        "### 變更地圖效能閘門（記錄用）\n\n一天 {n} 筆（lab 10/20 的 {scale} 倍），寫入 {ingest_s:.1} 秒（每秒 {:.0} 筆）。每項 {runs} 次，不含第一次。伺服器端時間，不含網路與瀏覽器。\n\n| 畫面 | p50 (ms) | p95 (ms) | 最慢 (ms) | 回應大小（未壓縮） | 目標 p95 | 結果 |\n|---|---|---|---|---|---|---|\n",
+        "### 變更地圖效能閘門\n\n一天 {n} 筆（lab 10/20 的 {scale} 倍），寫入 {ingest_s:.1} 秒（每秒 {:.0} 筆）；雜湊鏈完整檢查 {chain_s:.1} 秒（背景，每 10 分鐘一次，不計入下表）。每項 {runs} 次，不含第一次。伺服器端時間，不含網路與瀏覽器。\n\n| 畫面 | p50 (ms) | p95 (ms) | 最慢 (ms) | 回應大小（未壓縮） | 目標 p95 | 結果 | 舊做法 p50 (ms) | 與舊做法相同 |\n|---|---|---|---|---|---|---|---|---|\n",
         n as f64 / ingest_s
     );
     let mut missed = Vec::new();
@@ -202,10 +249,12 @@ fn perf_gate() {
             None => "—".to_string(),
         };
         md += &format!(
-            "| {} | {p50:.0} | {p95:.0} | {max:.0} | {} KB | {} | {verdict} |\n",
+            "| {} | {p50:.0} | {p95:.0} | {max:.0} | {} KB | {} | {verdict} | {} | {} |\n",
             r.view,
             r.bytes / 1024,
-            r.target_ms.map(|t| format!("≤ {t:.0} ms")).unwrap_or_else(|| "—".into())
+            r.target_ms.map(|t| format!("≤ {t:.0} ms")).unwrap_or_else(|| "—".into()),
+            r.scan_ms.map(|m| format!("{m:.0}")).unwrap_or_else(|| "—".into()),
+            match r.same { Some(true) => "相同", Some(false) => "**不同**", None => "—" },
         );
     }
     println!("{md}");
@@ -215,7 +264,12 @@ fn perf_gate() {
             let _ = writeln!(f, "{md}");
         }
     }
+    if !diffs.is_empty() {
+        md += &format!("\n不同的地方：{diffs:?}\n");
+        println!("differences: {diffs:?}");
+    }
     assert!(!busiest.is_empty(), "the first page has rows");
+    assert!(diffs.is_empty(), "the index must give the same page as reading the whole day: {diffs:?}");
     if std::env::var("AL_PERF_ENFORCE").as_deref() == Ok("1") {
         assert!(missed.is_empty(), "targets missed: {missed:?}");
     }

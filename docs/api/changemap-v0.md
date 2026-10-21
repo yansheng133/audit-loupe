@@ -113,3 +113,13 @@ v0 是原型：開頁時直接查現有資料表，**不做彙總表、不調效
 3. **`/api/changemap/detail` 的 404**：
    - 物件當天沒有紀錄時回 404，內容是 `{"error": "no-records"}`。
    - 沒有這個 JSON 內容的 404，代表後端沒有這支 API（舊版）。介面這時才改打整頁。
+
+## v0.2（2026-10-21 晚）：開頁速度與進度
+
+欄位、參數與 cursor 都不變，回應內容與 v0.1 逐欄位相同（`backend/src/shown.rs` 與 `perf.rs` 的測試會比對）。只多了下面兩點：
+
+1. **`meta.progress`**：有會改變畫面內容的工作正在進行時，回應帶 `meta.progress`，每一項是 `{"what": "index" | "recompute", "startedMs": <開始時間>, "done": <已完成或 null>, "total": <總量或 null>}`。
+   - `index`：升級後第一次啟動，正在建立開頁用的索引。這段期間開頁照舊可用，只是比較慢；`done`、`total` 為 null（SQLite 不回報建索引的進度）。
+   - `recompute`：規則或白名單改了之後的重新判斷；`done`、`total` 是筆數。
+   - 只有 `progress` 沒有 `dataNote` 時，`meta` 裡就沒有 `dataNote` 與 `dataUntilMs`。介面要分別判斷，不能假設 `meta` 一定有 `dataNote`。
+2. **事件分頁**：照 Sam 10/21 的決定，不另外存一張狀態轉變表，從當天的警示、找不到執行者的變化與缺口推出來。需求文件第 5 節 (5) 的「狀態轉變記成事件，直接讀」以此為準。

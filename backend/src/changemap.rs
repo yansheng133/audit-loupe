@@ -248,26 +248,83 @@ fn chain_status(store: &Store, now_ms: i64) -> Option<ChainMap> {
     g.0.as_ref().map(|(_, m)| m.clone())
 }
 
-/// Start the first chain check when the server starts, so the first page view is not `pending`.
-pub fn warm(store: &Store) {
+/// Whether a chain check is running in the background now.
+#[cfg(test)]
+pub fn chain_check_running() -> bool {
+    CHAIN.lock().unwrap().1
+}
+
+/// Start the first chain check when the server starts, so the first page view is not `pending`,
+/// and read today's page once, so the first person to open it after a restart does not wait
+/// for the disk (about 0.7 s of cold reads at 720,000 records a day).
+pub fn warm(store: &Store, tz: chrono_tz::Tz) {
     chain_status(store, Utc::now().timestamp_millis());
+    let store = store.reader();
+    std::thread::spawn(move || {
+        let t0 = std::time::Instant::now();
+        match changemap(&store, tz, &Params::default(), Utc::now().timestamp_millis()) {
+            Ok(_) => tracing::info!(ms = t0.elapsed().as_millis() as u64, "change map warmed"),
+            Err(e) => tracing::warn!(error = %e, "warming the change map failed"),
+        }
+    });
+}
+
+/// The page's query over the records it could list, answered from the `events_shown` index
+/// alone (see `shown.rs`). Same columns as the day scan; the User-Agent and the hash are not
+/// in the index and not needed for the list (the selected object's detail is read separately).
+pub fn shown_query() -> String {
+    format!(
+        "SELECT e.cluster, e.ts_ms, e.actor, e.human, e.via, e.verb, e.api_group, e.resource, e.subresource, e.namespace, e.name,
+                '', e.user_id, e.source, 0,
+                (SELECT CASE WHEN max(a.severity='high') THEN 'high' WHEN max(a.severity='medium') THEN 'medium' END FROM alerts a WHERE a.event_id=e.id)
+         FROM events e INDEXED BY {} WHERE e.ts_ms >= ?1 AND e.ts_ms < ?2 AND e.id <= ?3 AND {} AND {}",
+        crate::shown::NAME,
+        crate::store::SHOWN_PUB,
+        crate::shown::PREDICATE
+    )
 }
 
 /// One page view. `AL_DATA_NOTE`, when set, is shown as a note on the page (v0.1, point 5).
+/// Work that changes what the page shows while it runs is listed in `meta.progress` (v0.2).
 pub fn changemap(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64) -> anyhow::Result<Value> {
     let note = std::env::var("AL_DATA_NOTE").ok().filter(|n| !n.is_empty());
-    build(store, tz, p, now_ms, None, note.as_deref())
+    let mut v = build(store, tz, p, now_ms, None, note.as_deref(), true)?;
+    // The selected object's detail comes from its own records (with their hash state), the same
+    // way a click on a row gets it.
+    if let Some(key) = v["detail"]["key"].as_str().map(str::to_string) {
+        v["detail"] = detail(store, tz, &Params { key: Some(key), ..p.clone() }, now_ms)?;
+    }
+    let mut progress = Vec::new();
+    if let Some(since) = crate::shown::building_since() {
+        progress.push(json!({"what": "index", "startedMs": since, "done": null, "total": null}));
+    }
+    if let Some(j) = store.job.lock().unwrap().as_ref().filter(|j| j.state == "running") {
+        progress.push(json!({"what": "recompute", "startedMs": j.started_ms, "done": j.done, "total": j.total}));
+    }
+    if !progress.is_empty() {
+        if !v["meta"].is_object() {
+            v["meta"] = json!({});
+        }
+        v["meta"]["progress"] = json!(progress);
+    }
+    Ok(v)
+}
+
+/// The same page read the slow way (every record of the day), to check the index against.
+#[cfg(test)]
+pub fn changemap_by_scan(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64) -> anyhow::Result<Value> {
+    build(store, tz, p, now_ms, None, None, false)
 }
 
 /// The detail of one object (v0.1, point 4): what a click on a row needs, without working out
 /// the whole page again. `Null` when the object has nothing that day.
 pub fn detail(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64) -> anyhow::Result<Value> {
     let key = p.key.as_deref().and_then(parse_key).ok_or_else(|| anyhow::anyhow!("key: expected cluster/apiGroup/resource/namespace/name"))?;
-    let v = build(store, tz, p, now_ms, Some(&key), None)?;
+    let v = build(store, tz, p, now_ms, Some(&key), None, false)?;
     Ok(v.get("detail").cloned().unwrap_or(Value::Null))
 }
 
-fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option<&ObjKey>, note: Option<&str>) -> anyhow::Result<Value> {
+fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option<&ObjKey>, note: Option<&str>, use_index: bool) -> anyhow::Result<Value> {
     let day = match p.day.as_deref().filter(|d| !d.is_empty()) {
         Some(d) => NaiveDate::parse_from_str(d, "%Y-%m-%d").map_err(|e| anyhow::anyhow!("day: {e}"))?,
         None => Utc::now().with_timezone(&tz).date_naive(),
@@ -344,14 +401,25 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         ops.push(op);
     };
 
-    let mut st = c.prepare(&format!(
+    let indexed = use_index && only.is_none() && crate::shown::ready(&c);
+    let scan_sql = format!(
         "SELECT e.cluster, e.ts_ms, e.actor, e.human, e.via, e.verb, e.api_group, e.resource, e.subresource, e.namespace, e.name,
                 e.user_agent, e.user_id, e.source, e.hash IS NOT NULL,
                 (SELECT CASE WHEN max(a.severity='high') THEN 'high' WHEN max(a.severity='medium') THEN 'medium' END FROM alerts a WHERE a.event_id=e.id)
          FROM events e WHERE e.ts_ms >= ?1 AND e.ts_ms < ?2 AND e.id <= ?3 AND {} {}",
         crate::store::SHOWN_PUB,
         if only.is_some() { "AND e.cluster = ?4 AND e.resource = ?5 AND e.namespace = ?6 AND e.name = ?7" } else { "" }
-    ))?;
+    );
+    // INDEXED BY makes SQLite refuse the query rather than quietly read the whole table; if it
+    // ever does, the page still works the slow way.
+    let mut st = match indexed.then(|| c.prepare(&shown_query())) {
+        Some(Ok(st)) => st,
+        Some(Err(e)) => {
+            tracing::warn!(error = %e, "change map index not usable; reading the whole day");
+            c.prepare(&scan_sql)?
+        }
+        None => c.prepare(&scan_sql)?,
+    };
     let only_name = |k: &ObjKey| if k.name == BATCH { String::new() } else { k.name.clone() };
     let mut rows = match only {
         Some(k) => st.query(params![start, end, ev_max, k.cluster, k.resource, k.namespace, only_name(k)])?,
@@ -697,7 +765,10 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         // Objects only for the ones worth a look, so the graph stays readable.
         let state_of: HashMap<&str, &Obj> = shown.iter().map(|o| (o.key.as_str(), *o)).collect();
         let mut obj_edges: Vec<_> = e_co.iter().filter(|((_, k), _)| state_of[k.as_str()].state != "clear").collect();
-        obj_edges.sort_by(|a, b| rank(state_of[a.0.1.as_str()].state).cmp(&rank(state_of[b.0.1.as_str()].state)).then(b.1.cmp(a.1)));
+        // Ties go by object key, so the same data always draws the same 50 objects.
+        obj_edges.sort_by(|a, b| {
+            rank(state_of[a.0.1.as_str()].state).cmp(&rank(state_of[b.0.1.as_str()].state)).then(b.1.cmp(a.1)).then(a.0.cmp(b.0))
+        });
         for ((cl, k), n) in obj_edges.into_iter().take(50) {
             let o = state_of[k.as_str()];
             let oid = format!("object:{k}");
@@ -993,9 +1064,9 @@ mod tests {
             ev(&c, 1, "c1", T, "alice", 1, "rancher", "patch", "configmaps", "app", "cfg");
         }
         let p = Params { day: Some("2026-10-20".into()), ..Default::default() };
-        let v = build(&s, chrono_tz::Asia::Taipei, &p, T, None, Some("原型")).unwrap();
+        let v = build(&s, chrono_tz::Asia::Taipei, &p, T, None, Some("原型"), true).unwrap();
         assert_eq!(v["meta"], json!({"dataNote": "原型", "dataUntilMs": T}));
-        let v = build(&s, chrono_tz::Asia::Taipei, &p, T, None, None).unwrap();
+        let v = build(&s, chrono_tz::Asia::Taipei, &p, T, None, None, true).unwrap();
         assert!(v.get("meta").is_none());
     }
 
