@@ -1,6 +1,6 @@
 # 回報：PR #11 合併前的補強
 
-執行：2026-10-21 09:13–09:40（台北）。對應：`docs/lab/pr11-followup-task.md`（`parallel-1021-task.md` 的軌 A）。沒有碰任何叢集，沒有合併、沒有發版，PR #11 的分支沒有 force-push。
+執行：2026-10-21 09:13–09:55（台北）。對應：`docs/lab/pr11-followup-task.md`（`parallel-1021-task.md` 的軌 A）。沒有碰任何叢集，沒有合併、沒有發版，PR #11 的分支沒有 force-push。
 
 ## 一句話結論
 
@@ -59,6 +59,12 @@
    - 只有在需要重新找檔時（啟動、讀取錯誤）才列目錄。找不到時等 300 毫秒再找一次，才宣告遺失。
    - 同 inode、同開頭的檔換了名字，本來就算同一個檔。
    - 附帶好處：正在讀的檔就算被 `maxbackup` 刪掉，也讀得完，不會漏。
+   - **CI 上找到的第二個競爭**（第一次 push 後 CI 的 `backend tests` 失敗，原因如下）：
+     - 「換到下一個檔」時列目錄，是先讀輪替檔清單、再看 `audit.log`。兩步中間又輪替一次的話，剛輪替出去的那個檔兩邊都看不到，會被跳過。
+     - 在 Linux（CI 用的 SUSE BCI Rust 映像檔）上，`rotation_during_a_slow_listing_loses_nothing` 3/3 漏掉一整個檔（R2，300 行）。macOS 上沒有重現。
+     - 修法一：先記下 `audit.log` 的 inode，再讀輪替檔清單；一開始看到的那個 `audit.log` 必須還是 `audit.log`，或已經在清單裡，否則重新列（`in_write_order`）。
+     - 修法二：打開下一個檔之後，再列一次目錄，確認它緊接在目前這個檔後面，才開始讀；不是的話下一輪重找（`next_after`）。
+     - 修正後，在同一個映像檔裡整合測試連跑 5 次都通過，macOS 上也通過。
 2. **缺口回報冪等與退避**
    - 收集元件：每筆被 server 接受就立刻從待送清單移除。失敗時退避，1 秒起加倍，上限 300 秒。
    - server：在 `(cluster, collector, instance, from_ms, reason)` 上建唯一索引，只涵蓋 `reason <> ''` 的列，所以心跳缺口不受影響。寫入改用 `INSERT OR IGNORE`。
@@ -100,7 +106,7 @@
 | `first_start_reads_from_now_and_marks_the_start` | 失敗（從頭讀了既有的行） | 通過 |
 | `first_start_can_read_the_existing_file` | 失敗（沒有開始標記） | 通過 |
 | `lost_state_is_a_restart_when_the_server_knows_the_node` | 失敗（當成首次安裝從頭讀） | 通過 |
-| `rotation_during_a_slow_listing_loses_nothing`（列目錄時加 150 毫秒延遲） | 失敗 3/3：1,810 行收到 1,509 行 | 通過 5/5 |
+| `rotation_during_a_slow_listing_loses_nothing`（列目錄時加 150 毫秒延遲） | 失敗 3/3：1,810 行收到 1,509 行。第一版修正在 Linux 上也失敗 3/3（收到 1,510 行），見第 2 節第 1 項 | 通過：macOS 5/5、Linux（CI 映像檔）5/5 |
 | `quiet_cluster_restart_does_not_overstate_the_downtime` | 失敗（起點是 4 小時前） | 通過 |
 | `removed_file_is_still_read_through_the_open_handle` | 失敗（B 漏掉、記了缺口） | 通過 |
 | `files_removed_before_they_were_read_are_reported` | 失敗 | 通過 |
@@ -109,7 +115,7 @@
 | `same_inode_with_other_content_is_a_new_file`（同上） | 通過 | 通過 |
 
 - **競爭測試的比較方式**：修正前的程式沒有延遲掛鉤，直接跑會通過，因為根本沒有重現到競爭。所以我在 scratchpad 的副本裡加上同一個掛鉤（`AL_TEST_LIST_DELAY_MS`）再跑，結果是上表的 3/3 失敗。這個掛鉤在正式程式裡只有設了環境變數才會生效。
-- 整合測試整組連跑 5 次都通過，每次約 18 秒。
+- 整合測試整組連跑 5 次都通過（macOS 與 CI 用的 Linux 映像檔各 5 次），每次約 18 秒。
 - 中途有一次不穩定的失敗，原因是測試的檔名精度：兩次輪替在同一毫秒內時，輪替檔名相同，第二次就把第一個蓋掉了。測試裡已經讓檔名一定不重複，不是程式的問題。
 
 ### 單元測試

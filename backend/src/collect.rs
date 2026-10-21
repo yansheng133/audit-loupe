@@ -216,11 +216,28 @@ pub fn rotated_files(path: &Path) -> Vec<PathBuf> {
 }
 
 /// Rotated files oldest first, then the live file: the order the records were written in.
+///
+/// Listing the directory and looking at audit.log are separate steps, and a rotation can land
+/// between them; a file rotated out in that moment would be in neither. So audit.log is looked
+/// at first: every file older than it was rotated out before, so the listing has them all.
+/// The audit.log seen first must still be audit.log afterwards or be in the listing; when it
+/// is in neither (rotated after the listing), list again.
 fn in_write_order(path: &Path) -> Vec<PathBuf> {
-    let mut v = rotated_files(path);
-    test_delay();
-    if path.exists() {
-        v.push(path.to_path_buf());
+    let ino = |p: &Path| fs::metadata(p).ok().map(|m| m.ino());
+    let mut v = Vec::new();
+    for _ in 0..10 {
+        let live = ino(path);
+        test_delay();
+        v = rotated_files(path);
+        test_delay();
+        let now = ino(path);
+        let seen = live.is_none() || now == live || v.iter().any(|p| ino(p) == live);
+        if now.is_some() {
+            v.push(path.to_path_buf());
+        }
+        if seen {
+            break;
+        }
     }
     v
 }
@@ -425,7 +442,21 @@ fn next_after(path: &Path, pos: &Position) -> Option<(PathBuf, File, Option<Gap>
         }
     };
     let f = File::open(&next).ok()?;
-    (f.metadata().ok()?.ino() != pos.inode).then_some((next, f, lost))
+    let next_ino = f.metadata().ok()?.ino();
+    if next_ino == pos.inode {
+        return None;
+    }
+    // The path may have been rotated between the listing and the open, so the file opened is
+    // not necessarily the one listed. Accept it only if a fresh listing still puts it right
+    // after ours (or first, when ours is gone); otherwise the caller looks again.
+    let again = in_write_order(path);
+    let at = |ino: u64| again.iter().position(|p| fs::metadata(p).is_ok_and(|m| m.ino() == ino));
+    let in_order = match (at(pos.inode), at(next_ino)) {
+        (Some(o), Some(n)) => n == o + 1,
+        (None, Some(_)) => true,
+        (_, None) => false,
+    };
+    in_order.then_some((next, f, lost))
 }
 
 /// Test hook: widen the window between listing the directory and opening a file.
