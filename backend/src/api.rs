@@ -1,4 +1,4 @@
-use crate::audit::{parse_body, to_record};
+use crate::audit::{parse_body_lenient, to_record};
 use crate::config::Config;
 use crate::store::{ObjKey, Query, Store};
 use axum::body::Bytes;
@@ -38,10 +38,34 @@ async fn ingest(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> R
     };
     let source = headers.get("x-audit-loupe-source").and_then(|v| v.to_str().ok()).unwrap_or("");
     let (records, received, skipped) = match source {
-        "k8s-audit" => match parse_body(&body) {
-            Ok(evs) => (evs.iter().filter_map(to_record).collect::<Vec<_>>(), evs.len(), 0),
-            Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-        },
+        "k8s-audit" => {
+            let (evs, bad) = parse_body_lenient(&body);
+            if !bad.is_empty() {
+                tracing::warn!(cluster = %cluster, lines = bad.len(), "set aside audit lines that could not be read");
+                // collect-file says where the batch was read from, so each line is recorded once
+                // even when the batch is resent.
+                let h = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).map(|v| v.chars().take(256).collect::<String>());
+                let (inst, file) = (h("x-audit-loupe-instance").unwrap_or_default(), h("x-audit-loupe-file").unwrap_or_default());
+                let at = h("x-audit-loupe-offset").and_then(|o| o.parse::<i64>().ok()).map(|o| (inst.as_str(), file.as_str(), o));
+                if let Err(e) = s.store.record_rejected(&cluster, source, Utc::now().timestamp_millis(), at, &bad) {
+                    return err(e);
+                }
+            }
+            (evs.iter().filter_map(to_record).collect::<Vec<_>>(), evs.len() + bad.len(), bad.len())
+        }
+        "gap" => {
+            let g: crate::collect::Gap = match serde_json::from_slice(&body) {
+                Ok(g) => g,
+                Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+            };
+            if g.from_ms > g.to_ms || g.reason.is_empty() || g.reason.len() > 64 || g.collector.len() > 64 || g.instance.len() > 256 || g.detail.len() > 1024 {
+                return (StatusCode::BAD_REQUEST, "a gap needs fromMs <= toMs, a short reason, and collector/instance/detail within 64/256/1024 bytes").into_response();
+            }
+            return match s.store.record_gap(&cluster, &g) {
+                Ok(_) => StatusCode::NO_CONTENT.into_response(),
+                Err(e) => err(e),
+            };
+        }
         "rancher-audit" if cluster == s.cfg.rancher_cluster => {
             let (entries, bad) = crate::rancher::parse_lines(&body);
             (entries.iter().filter_map(crate::rancher::to_record).collect(), entries.len() + bad, bad)
@@ -312,6 +336,40 @@ async fn restore(State(s): State<AppState>, Q(p): Q<RestoreParams>) -> Response 
         .into_response()
 }
 
+#[derive(Deserialize)]
+struct KnownParams {
+    collector: String,
+    instance: String,
+}
+
+/// For a collector without its state: has the server heard from this instance before, and
+/// when last? The cluster comes from the token.
+async fn known(State(s): State<AppState>, headers: HeaderMap, Q(p): Q<KnownParams>) -> Response {
+    let Some(cluster) = bearer(&headers).and_then(|t| s.cfg.cluster_for_token(t)) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    match s.store.known_instance(&cluster, &p.collector, &p.instance) {
+        Ok(last) => Json(json!({"known": last.is_some(), "lastMs": last})).into_response(),
+        Err(e) => err(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct RejectedParams {
+    cluster: Option<String>,
+    limit: Option<i64>,
+}
+
+/// Lines collectors sent that could not be read: when, where (node, file, offset), why, and a
+/// hash of the line. The text itself is never kept.
+async fn rejected(State(s): State<AppState>, Q(r): Q<Range>, Q(p): Q<RejectedParams>) -> Response {
+    let (f, t) = r.bounds();
+    match s.store.rejected(p.cluster.as_deref(), f, t, p.limit.unwrap_or(500).clamp(1, 5000)) {
+        Ok(rows) => Json(json!({"lines": rows})).into_response(),
+        Err(e) => err(e),
+    }
+}
+
 /// Collectors per cluster: last check-in, their own report, and gaps in the range.
 async fn coverage(State(s): State<AppState>, Q(r): Q<Range>) -> Response {
     let (f, t) = r.bounds();
@@ -565,6 +623,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/integrity", get(integrity))
         .route("/api/security", get(security))
         .route("/api/coverage", get(coverage))
+        .route("/api/rejected", get(rejected))
         .route("/api/restore", get(restore))
         .route("/api/gitops", get(gitops))
         .route("/api/forwarding", get(forwarding))
@@ -588,6 +647,7 @@ pub fn ingest_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/ingest/v1/batch", post(ingest))
+        .route("/ingest/v1/known", get(known))
         // Limit applies to the decompressed body.
         .layer(DefaultBodyLimit::max(64 << 20))
         .layer(tower_http::decompression::RequestDecompressionLayer::new())
@@ -713,5 +773,89 @@ mod tests {
         assert!(v["pending"].is_null());
         let res = app.oneshot(Request::post("/api/rules/recompute").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(res.status(), StatusCode::CONFLICT, "nothing to judge again");
+    }
+
+    async fn coverage_json(app: Router) -> serde_json::Value {
+        let res = app.oneshot(Request::get("/api/coverage?hours=9000000").body(Body::empty()).unwrap()).await.unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn one_broken_line_does_not_block_the_batch() {
+        let st = state();
+        let second = LINE.replace(r#""a1""#, r#""a2""#);
+        let body = format!("{LINE}\n{{\"auditID\":\"cut-off\",\"stage\":\"Resp\n{second}\n");
+        let (code, reply) = post(ingest_router(st.clone()), Some("test-token"), "k8s-audit", body.into(), false).await;
+        assert_eq!(code, StatusCode::OK, "{reply}");
+        assert!(reply.contains(r#""stored":2"#) && reply.contains(r#""skipped":1"#), "{reply}");
+        let cov = coverage_json(router(st)).await;
+        let rejected = cov[0]["rejected"].as_array().cloned().unwrap_or_default();
+        assert_eq!(rejected.len(), 1, "the broken line is recorded: {cov}");
+        assert_eq!(rejected[0]["source"], "k8s-audit");
+        assert!(rejected[0]["sha256"].as_str().is_some_and(|h| h.len() == 64), "{cov}");
+    }
+
+    #[tokio::test]
+    async fn collector_reports_what_it_did_not_collect() {
+        let st = state();
+        // Relative to now: /api/coverage looks back at most 400 days.
+        let (from, to) = (Utc::now().timestamp_millis() - 7_200_000, Utc::now().timestamp_millis() - 3_600_000);
+        let body = format!(r#"{{"collector":"file","instance":"node-1","fromMs":{from},"toMs":{to},"reason":"collector-restart","detail":"audit.log"}}"#);
+        let (code, reply) = post(ingest_router(st.clone()), Some("test-token"), "gap", body.into(), false).await;
+        assert_eq!(code, StatusCode::NO_CONTENT, "{reply}");
+        let cov = coverage_json(router(st)).await;
+        let gaps = cov[0]["gaps"].as_array().cloned().unwrap_or_default();
+        assert_eq!(gaps.len(), 1, "{cov}");
+        assert_eq!(cov[0]["cluster"], "test");
+        assert_eq!((gaps[0]["fromMs"].as_i64(), gaps[0]["toMs"].as_i64()), (Some(from), Some(to)));
+        assert_eq!(gaps[0]["kind"], "reported");
+        assert_eq!(gaps[0]["reason"], "collector-restart");
+        assert_eq!(gaps[0]["instance"], "node-1");
+        // A report must have its times in order.
+        let bad = r#"{"collector":"file","instance":"node-1","fromMs":5,"toMs":1,"reason":"collector-restart"}"#;
+        let (code, _) = post(ingest_router(state()), Some("test-token"), "gap", bad.into(), false).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_one_line_batch_mentioning_items_is_not_an_empty_list() {
+        let st = state();
+        let line = LINE.replace(r#""name":"legacy-batch""#, r#""name":"items""#).replace(r#""resource":"namespaces""#, r#""resource":"namespaces","subresource":"\"items\"""#);
+        let (code, reply) = post(ingest_router(st.clone()), Some("test-token"), "k8s-audit", line.into(), false).await;
+        assert_eq!(code, StatusCode::OK, "{reply}");
+        assert!(reply.contains(r#""received":1"#) && reply.contains(r#""stored":1"#), "{reply}");
+        // In an EventList, one broken item no longer drops the good ones.
+        let list = format!(r#"{{"kind":"EventList","items":[{},{{"auditID":5}}]}}"#, LINE.replace(r#""a1""#, r#""a9""#));
+        let (_, reply) = post(ingest_router(st), Some("test-token"), "k8s-audit", list.into(), false).await;
+        assert!(reply.contains(r#""stored":1"#) && reply.contains(r#""skipped":1"#), "{reply}");
+    }
+
+    #[tokio::test]
+    async fn set_aside_lines_are_listed_with_where_they_were_read() {
+        let st = state();
+        let body = format!("{LINE}\n{{\"auditID\":\"cut\",\"requestObject\":{{\"password\":\"x\n");
+        let send = |st: AppState, body: String| async move {
+            let req = Request::post("/ingest/v1/batch")
+                .header("x-audit-loupe-source", "k8s-audit")
+                .header("authorization", "Bearer test-token")
+                .header("x-audit-loupe-instance", "node-1")
+                .header("x-audit-loupe-file", "audit-2026-10-20T06-00-00.000.log")
+                .header("x-audit-loupe-offset", "4096");
+            ingest_router(st).oneshot(req.body(Body::from(body)).unwrap()).await.unwrap().status()
+        };
+        assert_eq!(send(st.clone(), body.clone()).await, StatusCode::OK);
+        assert_eq!(send(st.clone(), body).await, StatusCode::OK); // resent: recorded once
+        let res = router(st.clone()).oneshot(Request::get("/api/rejected?hours=1").body(Body::empty()).unwrap()).await.unwrap();
+        let text = String::from_utf8(axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let lines = v["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 1, "{text}");
+        assert_eq!(lines[0]["instance"], "node-1");
+        assert_eq!(lines[0]["file"], "audit-2026-10-20T06-00-00.000.log");
+        assert_eq!(lines[0]["offset"], 4096 + LINE.len() as i64 + 1);
+        assert!(!text.contains("password"), "the line text is never returned: {text}");
+        let cov = coverage_json(router(st)).await;
+        assert_eq!(cov[0]["rejectedCounts"][0]["count"], 1, "{cov}");
     }
 }

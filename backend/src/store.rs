@@ -105,6 +105,11 @@ CREATE TABLE IF NOT EXISTS security_events (
   UNIQUE (cluster, nv_id)
 );
 CREATE INDEX IF NOT EXISTS security_pod ON security_events(cluster, namespace, ts_ms);
+CREATE TABLE IF NOT EXISTS rejected_lines (
+  id INTEGER PRIMARY KEY, cluster TEXT NOT NULL, source TEXT NOT NULL, received_ms INTEGER NOT NULL,
+  len INTEGER NOT NULL, sha256 TEXT NOT NULL, error TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS rejected_time ON rejected_lines(received_ms);
 CREATE TABLE IF NOT EXISTS listing (
   cluster TEXT NOT NULL, api_group TEXT NOT NULL, resource TEXT NOT NULL, first INTEGER NOT NULL,
   PRIMARY KEY (cluster, api_group, resource)
@@ -290,9 +295,24 @@ const GAP_MS: i64 = 180_000;
 pub struct CoverageRow {
     pub cluster: String,
     pub collectors: Vec<Value>,
-    /// Silences of a collector; toMs null means it is still silent.
+    /// Periods not collected: silences of a collector (toMs null: still silent) and periods a
+    /// collector reported itself, each with a reason.
     pub gaps: Vec<Value>,
+    /// Lines a collector sent that could not be read, set aside so the rest of the batch was stored.
+    pub rejected: Vec<Value>,
+    /// Lines set aside per source and node in the range (the lines: /api/rejected).
+    #[serde(rename = "rejectedCounts")]
+    pub rejected_counts: Vec<Value>,
+    /// Where a collector's collection starts ("collection-start" reports): nothing before it
+    /// was collected by that instance, or, with detail "readExisting", what it read at install.
+    pub starts: Vec<Value>,
 }
+
+/// Reason shown for a gap found from missing heartbeats (stored as '').
+const SILENT: &str = "collector-silent";
+
+/// Reason of a report that marks where a collector's collection starts (not a gap).
+pub const START: &str = "collection-start";
 
 pub struct RestoreSource {
     pub cluster: String,
@@ -575,6 +595,36 @@ impl Store {
         if !beat_cols.iter().any(|h| h == "first_ms") {
             conn.execute_batch("ALTER TABLE heartbeats ADD COLUMN first_ms INTEGER")?;
         }
+        // Gaps reported by a collector say why; '' is a heartbeat silence.
+        let gap_cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('gaps')")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        for col in ["reason", "detail"] {
+            if !gap_cols.iter().any(|h| h == col) {
+                conn.execute_batch(&format!("ALTER TABLE gaps ADD COLUMN {col} TEXT NOT NULL DEFAULT ''"))?;
+            }
+        }
+        // A collector resends a report it got no answer for: one row per report. Heartbeat
+        // silences (reason '') are found by the server once and are not covered.
+        conn.execute_batch(
+            "DELETE FROM gaps WHERE reason <> '' AND id NOT IN
+               (SELECT MIN(id) FROM gaps WHERE reason <> '' GROUP BY cluster, collector, instance, from_ms, reason);
+             CREATE UNIQUE INDEX IF NOT EXISTS gaps_reported ON gaps(cluster, collector, instance, from_ms, reason) WHERE reason <> '';",
+        )?;
+        // Where a set-aside line was read (node, file, offset), so a resent batch records it once.
+        let rej_cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('rejected_lines')")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        for (col, ddl) in [("instance", "TEXT NOT NULL DEFAULT ''"), ("file", "TEXT NOT NULL DEFAULT ''"), ("offset", "INTEGER")] {
+            if !rej_cols.iter().any(|h| h == col) {
+                conn.execute_batch(&format!("ALTER TABLE rejected_lines ADD COLUMN {col} {ddl}"))?;
+            }
+        }
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS rejected_at ON rejected_lines(cluster, instance, file, offset, sha256) WHERE offset IS NOT NULL;",
+        )?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS events_pair ON events(cluster, user_id, source, ts_ms);
              CREATE INDEX IF NOT EXISTS events_link ON events(link_id);",
@@ -1651,6 +1701,69 @@ impl Store {
         Ok(())
     }
 
+    /// A period a collector says it did not collect (it restarted, or a file went away unread),
+    /// or where its collection starts ("collection-start"). A report sent again is ignored.
+    pub fn record_gap(&self, cluster: &str, g: &crate::collect::Gap) -> anyhow::Result<bool> {
+        let c = self.conn.lock().unwrap();
+        let n = c.execute(
+            "INSERT OR IGNORE INTO gaps (cluster, collector, instance, from_ms, to_ms, reason, detail) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![cluster, g.collector, g.instance, g.from_ms, g.to_ms, g.reason, g.detail],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Whether the server has heard from this collector instance before (a check-in, or a
+    /// period recorded for it), and when it last checked in. A collector without its state
+    /// file asks this to tell a first install from a lost state directory.
+    pub fn known_instance(&self, cluster: &str, collector: &str, instance: &str) -> anyhow::Result<Option<i64>> {
+        let c = self.conn.lock().unwrap();
+        let last: Option<i64> = c.query_row(
+            "SELECT MAX(t) FROM (SELECT last_ms AS t FROM heartbeats WHERE cluster=?1 AND collector=?2 AND instance=?3
+                                 UNION ALL SELECT to_ms FROM gaps WHERE cluster=?1 AND collector=?2 AND instance=?3)",
+            params![cluster, collector, instance],
+            |r| r.get(0),
+        )?;
+        Ok(last)
+    }
+
+    /// Lines set aside from a batch: only their length, hash, the parse error and where they
+    /// were read are kept, never the text (it may hold a request body). `at` is (node, file,
+    /// offset of the batch); a line already recorded at the same place is not recorded again.
+    pub fn record_rejected(&self, cluster: &str, source: &str, now_ms: i64, at: Option<(&str, &str, i64)>, lines: &[crate::audit::SetAside]) -> anyhow::Result<()> {
+        use sha2::{Digest, Sha256};
+        let c = self.conn.lock().unwrap();
+        for (line, error, pos) in lines {
+            let hash: String = Sha256::digest(line).iter().map(|b| format!("{b:02x}")).collect();
+            let error: String = error.chars().take(200).collect();
+            let (instance, file, offset) = match at {
+                Some((i, f, o)) => (i, f, Some(o + *pos as i64)),
+                None => ("", "", None),
+            };
+            c.execute(
+                "INSERT OR IGNORE INTO rejected_lines (cluster, source, received_ms, len, sha256, error, instance, file, offset) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![cluster, source, now_ms, line.len() as i64, hash, error, instance, file, offset],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The lines set aside in a range, newest first (no line text).
+    pub fn rejected(&self, cluster: Option<&str>, from_ms: i64, to_ms: i64, limit: i64) -> anyhow::Result<Vec<Value>> {
+        let c = self.conn.lock().unwrap();
+        let rows = c
+            .prepare(
+                "SELECT cluster, source, instance, file, offset, received_ms, len, sha256, error FROM rejected_lines
+                 WHERE received_ms BETWEEN ?1 AND ?2 AND (?3 IS NULL OR cluster = ?3) ORDER BY received_ms DESC, id DESC LIMIT ?4",
+            )?
+            .query_map(params![from_ms, to_ms, cluster, limit], |r| {
+                Ok(json!({"cluster": r.get::<_, String>(0)?, "source": r.get::<_, String>(1)?, "instance": r.get::<_, String>(2)?,
+                          "file": r.get::<_, String>(3)?, "offset": r.get::<_, Option<i64>>(4)?, "receivedMs": r.get::<_, i64>(5)?,
+                          "len": r.get::<_, i64>(6)?, "sha256": r.get::<_, String>(7)?, "reason": r.get::<_, String>(8)?}))
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
     /// Per cluster: each collector's last check-in and report, and gaps in the range
     /// (including a silence still going on).
     pub fn coverage(&self, from_ms: i64, to_ms: i64, now_ms: i64) -> anyhow::Result<Vec<CoverageRow>> {
@@ -1659,16 +1772,21 @@ impl Store {
             .prepare("SELECT cluster, collector, instance, last_ms, details FROM heartbeats ORDER BY cluster, collector, instance")?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
             .collect::<Result<_, _>>()?;
-        let gaps: Vec<(String, String, String, i64, i64)> = c
-            .prepare("SELECT cluster, collector, instance, from_ms, to_ms FROM gaps WHERE to_ms >= ?1 AND from_ms <= ?2 ORDER BY from_ms")?
-            .query_map(params![from_ms, to_ms], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+        type GapRow = (String, String, String, i64, i64, String, String);
+        let gaps: Vec<GapRow> = c
+            .prepare("SELECT cluster, collector, instance, from_ms, to_ms, reason, detail FROM gaps WHERE to_ms >= ?1 AND from_ms <= ?2 ORDER BY from_ms")?
+            .query_map(params![from_ms, to_ms], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?
+            .collect::<Result<_, _>>()?;
+        let rejected: Vec<(String, String, i64, i64, String, String)> = c
+            .prepare("SELECT cluster, source, received_ms, len, sha256, error FROM rejected_lines WHERE received_ms BETWEEN ?1 AND ?2 ORDER BY received_ms")?
+            .query_map(params![from_ms, to_ms], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
             .collect::<Result<_, _>>()?;
         let mut out: Vec<CoverageRow> = Vec::new();
         let row = |out: &mut Vec<CoverageRow>, cl: &str| -> usize {
             match out.iter().position(|r| r.cluster == cl) {
                 Some(i) => i,
                 None => {
-                    out.push(CoverageRow { cluster: cl.to_string(), collectors: vec![], gaps: vec![] });
+                    out.push(CoverageRow { cluster: cl.to_string(), collectors: vec![], gaps: vec![], rejected: vec![], rejected_counts: vec![], starts: vec![] });
                     out.len() - 1
                 }
             }
@@ -1679,12 +1797,33 @@ impl Store {
             out[i].collectors.push(json!({"collector": col, "instance": inst, "lastMs": last, "stale": stale,
                                           "details": serde_json::from_str::<Value>(&details).unwrap_or(Value::Null)}));
             if stale && last <= to_ms {
-                out[i].gaps.push(json!({"collector": col, "instance": inst, "fromMs": last, "toMs": null}));
+                out[i].gaps.push(json!({"kind": "heartbeat", "collector": col, "instance": inst, "fromMs": last, "toMs": null, "reason": SILENT, "detail": ""}));
             }
         }
-        for (cl, col, inst, f, t) in gaps {
+        for (cl, col, inst, f, t, reason, detail) in gaps {
             let i = row(&mut out, &cl);
-            out[i].gaps.push(json!({"collector": col, "instance": inst, "fromMs": f, "toMs": t}));
+            // Both kinds are kept side by side: a silence the server noticed and what the
+            // collector reported about the same time are separate facts.
+            let v = |kind: &str, reason: &str| json!({"kind": kind, "collector": col, "instance": inst, "fromMs": f, "toMs": t, "reason": reason, "detail": detail});
+            if reason == START {
+                out[i].starts.push(v("start", &reason));
+            } else if reason.is_empty() {
+                out[i].gaps.push(v("heartbeat", SILENT));
+            } else {
+                out[i].gaps.push(v("reported", &reason));
+            }
+        }
+        for (cl, source, at, len, sha, error) in rejected {
+            let i = row(&mut out, &cl);
+            out[i].rejected.push(json!({"source": source, "receivedMs": at, "len": len, "sha256": sha, "error": error}));
+        }
+        let counts: Vec<(String, String, String, i64)> = c
+            .prepare("SELECT cluster, source, instance, COUNT(*) FROM rejected_lines WHERE received_ms BETWEEN ?1 AND ?2 GROUP BY cluster, source, instance")?
+            .query_map(params![from_ms, to_ms], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<Result<_, _>>()?;
+        for (cl, source, inst, n) in counts {
+            let i = row(&mut out, &cl);
+            out[i].rejected_counts.push(json!({"source": source, "instance": inst, "count": n}));
         }
         Ok(out)
     }
@@ -2516,5 +2655,70 @@ mod tests {
         assert_eq!(s.link_since(0).unwrap(), 1);
         let h = s.history(&ns).unwrap();
         assert_eq!((h[0].change.as_str(), h[0].actor.as_deref()), ("deleting", Some("system:admin")));
+    }
+
+    #[test]
+    fn a_resent_gap_report_is_kept_once_and_both_kinds_are_returned() {
+        let s = Store::open(":memory:").unwrap();
+        let t0 = 1_800_000_000_000i64;
+        let g = crate::collect::Gap { collector: "file".into(), instance: "node-1".into(), from_ms: t0, to_ms: t0 + 600_000, reason: "collector-restart".into(), detail: "audit.log".into() };
+        assert!(s.record_gap("c1", &g).unwrap());
+        assert!(!s.record_gap("c1", &g).unwrap(), "the same report again is ignored");
+        // The server also saw the node fall silent over the same time.
+        s.heartbeat("c1", "file", "node-1", &json!({}), t0).unwrap();
+        s.heartbeat("c1", "file", "node-1", &json!({}), t0 + 600_000).unwrap();
+        let start = crate::collect::Gap { reason: START.into(), detail: "fromNow".into(), to_ms: t0, ..g.clone() };
+        s.record_gap("c1", &start).unwrap();
+        let cov = s.coverage(t0 - 1, t0 + 700_000, t0 + 600_001).unwrap();
+        let kinds: Vec<(String, String)> = cov[0].gaps.iter().map(|g| (g["kind"].as_str().unwrap().into(), g["reason"].as_str().unwrap().into())).collect();
+        assert_eq!(kinds.len(), 2, "{kinds:?}");
+        assert!(kinds.contains(&("reported".into(), "collector-restart".into())), "{kinds:?}");
+        assert!(kinds.contains(&("heartbeat".into(), SILENT.into())), "{kinds:?}");
+        assert_eq!(cov[0].starts.len(), 1, "the start mark is not a gap");
+        assert_eq!(s.known_instance("c1", "file", "node-1").unwrap(), Some(t0 + 600_000));
+        assert_eq!(s.known_instance("c1", "file", "node-2").unwrap(), None);
+    }
+
+    #[test]
+    fn set_aside_lines_are_listed_without_text_and_once() {
+        let s = Store::open(":memory:").unwrap();
+        let lines = vec![(br#"{"secret":"body"#.to_vec(), "EOF".to_string(), 120usize)];
+        s.record_rejected("c1", "k8s-audit", 5, Some(("node-1", "audit.log", 1000)), &lines).unwrap();
+        s.record_rejected("c1", "k8s-audit", 6, Some(("node-1", "audit.log", 1000)), &lines).unwrap(); // resent batch
+        let rows = s.rejected(None, 0, 10, 100).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["offset"], 1120);
+        assert_eq!(rows[0]["file"], "audit.log");
+        assert_eq!(rows[0]["instance"], "node-1");
+        assert!(!serde_json::to_string(&rows).unwrap().contains("secret"), "no line text");
+        let cov = s.coverage(0, 10, 10).unwrap();
+        assert_eq!(cov[0].rejected_counts[0]["count"], 1);
+    }
+
+    /// Upgrade a copy of a real database (never the original): AL_TEST_DB=<copy> cargo test -- --ignored migrates
+    #[test]
+    #[ignore]
+    fn migrates_a_copy_of_a_real_database() {
+        let path = std::env::var("AL_TEST_DB").expect("AL_TEST_DB: path to a copy");
+        let before: i64 = rusqlite::Connection::open(&path).unwrap().query_row("SELECT COUNT(*) FROM gaps", [], |r| r.get(0)).unwrap();
+        let s = Store::open(&path).unwrap();
+        let after: i64 = s.conn.lock().unwrap().query_row("SELECT COUNT(*) FROM gaps", [], |r| r.get(0)).unwrap();
+        assert_eq!(before, after, "old gaps (heartbeat silences) are all kept");
+        let silent: i64 = s.conn.lock().unwrap().query_row("SELECT COUNT(*) FROM gaps WHERE reason = ''", [], |r| r.get(0)).unwrap();
+        assert_eq!(silent, after, "old rows are heartbeat silences");
+        let g = crate::collect::Gap { collector: "file".into(), instance: "mig-node".into(), from_ms: 1, to_ms: 2, reason: "collector-restart".into(), detail: String::new() };
+        assert!(s.record_gap("mig", &g).unwrap());
+        assert!(!s.record_gap("mig", &g).unwrap(), "the unique key works on the upgraded database");
+        s.record_rejected("mig", "k8s-audit", 1, Some(("mig-node", "audit.log", 10)), &[(b"x".to_vec(), "e".into(), 0)]).unwrap();
+        s.record_rejected("mig", "k8s-audit", 1, Some(("mig-node", "audit.log", 10)), &[(b"x".to_vec(), "e".into(), 0)]).unwrap();
+        assert_eq!(s.rejected(Some("mig"), 0, 10, 10).unwrap().len(), 1);
+        let cov = s.coverage(0, i64::MAX / 2, chrono::Utc::now().timestamp_millis()).unwrap();
+        let kinds: usize = cov.iter().map(|r| r.gaps.iter().filter(|g| g["kind"] == "heartbeat").count()).sum();
+        println!("gaps before={before} after={after} heartbeat-kind in coverage={kinds}");
+        // Opening again changes nothing.
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        let again: i64 = s.conn.lock().unwrap().query_row("SELECT COUNT(*) FROM gaps", [], |r| r.get(0)).unwrap();
+        assert_eq!(again, after + 1);
     }
 }
