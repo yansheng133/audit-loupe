@@ -542,6 +542,18 @@ impl Store {
         Self::open_with(path, Arc::new(crate::config::Config::defaults()))
     }
 
+    /// A second, read-only connection to the same database, for long reads (the change map's
+    /// chain check) that should not hold the main connection. WAL lets it read while the main
+    /// connection writes. An in-memory database has no second connection; the store itself is used.
+    pub fn reader(&self) -> Store {
+        let path = self.conn.lock().unwrap().path().map(str::to_string).filter(|p| !p.is_empty());
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        match path.and_then(|p| Connection::open_with_flags(p, flags).ok()) {
+            Some(c) => Store { conn: Arc::new(Mutex::new(c)), cfg: self.cfg.clone(), job: self.job.clone() },
+            None => self.clone(),
+        }
+    }
+
     pub fn open_with(path: &str, cfg: Arc<crate::config::Config>) -> anyhow::Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;

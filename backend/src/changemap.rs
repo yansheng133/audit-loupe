@@ -179,19 +179,36 @@ struct Obj {
     last: i64,
 }
 
-static CHAIN: Mutex<Option<(i64, HashMap<String, (Option<i64>, i64)>)>> = Mutex::new(None);
+type ChainMap = HashMap<String, (Option<i64>, i64)>;
 
-/// Chain check results, recomputed at most every 10 minutes (walking the chain is slow).
-fn chain_status(store: &Store, now_ms: i64) -> anyhow::Result<HashMap<String, (Option<i64>, i64)>> {
+/// Last chain check (when, result) and whether one is running now.
+static CHAIN: Mutex<(Option<(i64, ChainMap)>, bool)> = Mutex::new((None, false));
+
+/// Chain check results. Walking the whole chain takes about a second, so it runs in the
+/// background: the page gets the last result (or `None` before the first one finishes,
+/// shown as `pending`) and a new check starts when the result is over 10 minutes old.
+fn chain_status(store: &Store, now_ms: i64) -> Option<ChainMap> {
     let mut g = CHAIN.lock().unwrap();
-    if let Some((at, m)) = g.as_ref() {
-        if now_ms - at < 600_000 {
-            return Ok(m.clone());
-        }
+    let stale = g.0.as_ref().is_none_or(|(at, _)| now_ms - at >= 600_000);
+    if stale && !g.1 {
+        g.1 = true;
+        let store = store.reader();
+        std::thread::spawn(move || {
+            let result = store.verify_chain(None);
+            let mut g = CHAIN.lock().unwrap();
+            g.1 = false;
+            match result {
+                Ok(rows) => g.0 = Some((Utc::now().timestamp_millis(), rows.into_iter().map(|r| (r.cluster, (r.first_bad_id, r.head_id))).collect())),
+                Err(e) => tracing::warn!(error = %e, "chain check failed"),
+            }
+        });
     }
-    let m: HashMap<_, _> = store.verify_chain(None)?.into_iter().map(|r| (r.cluster, (r.first_bad_id, r.head_id))).collect();
-    *g = Some((now_ms, m.clone()));
-    Ok(m)
+    g.0.as_ref().map(|(_, m)| m.clone())
+}
+
+/// Start the first chain check when the server starts, so the first page view is not `pending`.
+pub fn warm(store: &Store) {
+    chain_status(store, Utc::now().timestamp_millis());
 }
 
 pub fn changemap(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64) -> anyhow::Result<Value> {
@@ -205,7 +222,7 @@ pub fn changemap(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64) -> a
     let with_system = p.system.as_deref() == Some("1");
     let clusters: HashSet<&str> = p.cluster.iter().map(String::as_str).collect();
     let ns_filter = p.namespace.as_deref().filter(|s| !s.is_empty());
-    let chains = chain_status(store, now_ms)?;
+    let chains = chain_status(store, now_ms);
 
     let c = store.conn.lock().unwrap();
     let principals: HashMap<String, String> =
@@ -573,11 +590,11 @@ pub fn changemap(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64) -> a
                 .collect::<Result<_, _>>()?;
             let has_versions: bool = c
                 .query_row("SELECT EXISTS(SELECT 1 FROM versions WHERE cluster=?1 AND api_group=?2 AND resource=?3)", params![o.cluster, o.api_group, o.resource], |r| r.get(0))?;
-            let hash = match chains.get(&o.cluster) {
-                Some((Some(_), _)) => "broken",
+            let hash = match chains.as_ref().map(|m| m.get(&o.cluster)) {
+                Some(Some((Some(_), _))) => "broken",
                 _ if list.iter().any(|op| !op.unattributed && !op.hashed) => "pending",
-                Some(_) => "ok",
-                None => "pending",
+                Some(Some(_)) => "ok",
+                _ => "pending",
             };
             json!({
                 "key": o.key, "state": o.state, "severity": o.severity, "stateReason": o.reason,
@@ -598,6 +615,7 @@ mod tests {
         Store::open_with(":memory:", Arc::new(Config::test())).unwrap()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn ev(c: &rusqlite::Connection, id: i64, cluster: &str, ts: i64, actor: &str, human: i64, via: &str, verb: &str, res: &str, ns: &str, name: &str) {
         c.execute(
             "INSERT INTO events (id, cluster, audit_id, ts_ms, ts, actor, principal, human, via, caller, verb, api_group, resource, subresource,

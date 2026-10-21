@@ -52,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
     // Bind first so probes pass and audit batches are accepted while discovery runs.
     let state = api::AppState { store: store.clone(), cfg: cfg.clone() };
     let api_listener = tokio::net::TcpListener::bind(&cfg.listen).await?;
+    changemap::warm(&store);
     let ingest_listener = tokio::net::TcpListener::bind(&cfg.ingest_listen).await?;
     info!(api = %cfg.listen, ingest = %cfg.ingest_listen, "serving");
 
