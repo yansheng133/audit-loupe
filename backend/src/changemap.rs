@@ -336,18 +336,19 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         let (cl, col) = row?;
         collectors.entry(cl).or_default().insert(col);
     }
+    // Newest record per cluster and the kind of each resource come from small tables kept at
+    // ingest (cluster_stats, resource_kinds), not from scanning all history on every view.
     let mut as_of: BTreeMap<String, i64> = BTreeMap::new();
-    for row in c.prepare("SELECT cluster, max(ts_ms) FROM events GROUP BY cluster")?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
-        let (cl, t) = row?;
-        as_of.insert(cl, t);
-    }
-    for row in c.prepare("SELECT cluster, max(observed_ms) FROM versions GROUP BY cluster")?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
-        let (cl, t) = row?;
-        let e = as_of.entry(cl).or_insert(t);
-        *e = (*e).max(t);
+    for row in c
+        .prepare("SELECT cluster, max(coalesce(last_event_ms, last_version_ms), coalesce(last_version_ms, last_event_ms)) FROM cluster_stats")?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)))?
+    {
+        if let (cl, Some(t)) = row? {
+            as_of.insert(cl, t);
+        }
     }
     let kinds: HashMap<(String, String, String), String> = c
-        .prepare("SELECT DISTINCT cluster, api_group, resource, kind FROM versions")?
+        .prepare("SELECT cluster, api_group, resource, kind FROM resource_kinds")?
         .query_map([], |r| Ok(((r.get(0)?, r.get(1)?, r.get(2)?), r.get(3)?)))?
         .collect::<Result<_, _>>()?;
 

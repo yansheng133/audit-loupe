@@ -134,12 +134,39 @@ async fn ingest_objects(s: AppState, cluster: String, body: &[u8]) -> Response {
     }
 }
 
+/// `Server-Timing: db;dur=…` for a handler that measured its database work; the middleware
+/// below adds `total`.
+fn with_db_timing(mut res: Response, db: std::time::Duration) -> Response {
+    if let Ok(h) = axum::http::HeaderValue::from_str(&format!("db;dur={:.1}", db.as_secs_f64() * 1000.0)) {
+        res.headers_mut().insert("server-timing", h);
+    }
+    res
+}
+
+/// Adds `total;dur=…` (time spent in the server) to `Server-Timing`, after any `db` part.
+async fn server_timing(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let t0 = std::time::Instant::now();
+    let mut res = next.run(req).await;
+    let total = t0.elapsed().as_secs_f64() * 1000.0;
+    let v = match res.headers().get("server-timing").and_then(|h| h.to_str().ok()) {
+        Some(db) => format!("{db}, total;dur={total:.1}"),
+        None => format!("total;dur={total:.1}"),
+    };
+    if let Ok(h) = axum::http::HeaderValue::from_str(&v) {
+        res.headers_mut().insert("server-timing", h);
+    }
+    res
+}
+
 /// One page view of the change map (v0 prototype). `cluster` may repeat, so the raw query is parsed.
 async fn changemap(State(s): State<AppState>, uri: axum::http::Uri) -> Response {
     let p = crate::changemap::parse_query(uri.query().unwrap_or(""));
     let (store, tz) = (s.store.clone(), s.cfg.tz);
-    match tokio::task::spawn_blocking(move || crate::changemap::changemap(&store, tz, &p, Utc::now().timestamp_millis())).await {
-        Ok(Ok(v)) => Json(v).into_response(),
+    let t0 = std::time::Instant::now();
+    let r = tokio::task::spawn_blocking(move || crate::changemap::changemap(&store, tz, &p, Utc::now().timestamp_millis())).await;
+    let db = t0.elapsed();
+    match r {
+        Ok(Ok(v)) => with_db_timing(Json(v).into_response(), db),
         Ok(Err(e)) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
         Err(e) => err(e.into()),
     }
@@ -150,11 +177,14 @@ async fn changemap(State(s): State<AppState>, uri: axum::http::Uri) -> Response 
 async fn changemap_detail(State(s): State<AppState>, uri: axum::http::Uri) -> Response {
     let p = crate::changemap::parse_query(uri.query().unwrap_or(""));
     let (store, tz) = (s.store.clone(), s.cfg.tz);
-    match tokio::task::spawn_blocking(move || crate::changemap::detail(&store, tz, &p, Utc::now().timestamp_millis())).await {
+    let t0 = std::time::Instant::now();
+    let r = tokio::task::spawn_blocking(move || crate::changemap::detail(&store, tz, &p, Utc::now().timestamp_millis())).await;
+    let db = t0.elapsed();
+    match r {
         // The JSON body tells the page "nothing that day" apart from an older backend, whose
         // unknown route also answers 404 (API contract v0.1, supplement).
         Ok(Ok(serde_json::Value::Null)) => (StatusCode::NOT_FOUND, Json(json!({"error": "no-records"}))).into_response(),
-        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Ok(v)) => with_db_timing(Json(v).into_response(), db),
         Ok(Err(e)) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
         Err(e) => err(e.into()),
     }
@@ -640,6 +670,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/alerts", get(alerts))
         .route("/api/rules", get(rules))
         .route("/api/rules/recompute", post(recompute))
+        .layer(axum::middleware::from_fn(server_timing))
+        // gzip when the browser asks for it (Accept-Encoding), as Rancher's proxy passes it on.
+        .layer(tower_http::compression::CompressionLayer::new())
         .with_state(state)
 }
 
@@ -872,5 +905,33 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         let body = axum::body::to_bytes(res.into_body(), 1 << 16).await.unwrap();
         assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), json!({"error": "no-records"}));
+    }
+
+    /// The read API answers gzip when asked, and says where its time went.
+    #[tokio::test]
+    async fn read_api_compresses_and_reports_timing() {
+        let st = state();
+        {
+            let c = st.store.conn.lock().unwrap();
+            for i in 0..200 {
+                c.execute(
+                    "INSERT INTO events (cluster, audit_id, ts_ms, ts, actor, principal, human, via, caller, verb, api_group, resource, subresource,
+                                         namespace, name, code, source_ip, user_agent, request_uri, source)
+                     VALUES ('c1', ?1, ?2, '', 'alice', '', 1, 'rancher', 'alice', 'patch', '', 'configmaps', '', 'app', ?1, 200, '', '', '', 'k8s')",
+                    rusqlite::params![format!("cm{i}"), 1_792_461_600_000i64 + i],
+                )
+                .unwrap();
+            }
+        }
+        let req = Request::get("/api/changemap?day=2026-10-20").header("accept-encoding", "gzip").body(Body::empty()).unwrap();
+        let res = router(st.clone()).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers().get("content-encoding").and_then(|h| h.to_str().ok()), Some("gzip"));
+        let timing = res.headers().get("server-timing").and_then(|h| h.to_str().ok()).unwrap_or("").to_string();
+        assert!(timing.starts_with("db;dur=") && timing.contains(", total;dur="), "{timing}");
+        // Without Accept-Encoding the body is plain JSON.
+        let res = router(st).oneshot(Request::get("/api/info").body(Body::empty()).unwrap()).await.unwrap();
+        assert!(res.headers().get("content-encoding").is_none());
+        assert!(res.headers().get("server-timing").and_then(|h| h.to_str().ok()).is_some_and(|t| t.starts_with("total;dur=")));
     }
 }

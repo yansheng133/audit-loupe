@@ -555,6 +555,41 @@ fn changes_for(change: &str, prev: Option<&Value>, body: &Value) -> Vec<Change> 
     }
 }
 
+/// Small tables the change map reads instead of scanning all history on every page view:
+/// the newest event and version per cluster, and the kind of each resource. Triggers keep them
+/// current on every insert path; a database from before them is filled once.
+fn prepare_stats(conn: &Connection) -> anyhow::Result<()> {
+    let existed: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='cluster_stats')", [], |r| r.get(0))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS cluster_stats (
+           cluster TEXT PRIMARY KEY, last_event_ms INTEGER, last_version_ms INTEGER
+         ) WITHOUT ROWID;
+         CREATE TABLE IF NOT EXISTS resource_kinds (
+           cluster TEXT NOT NULL, api_group TEXT NOT NULL, resource TEXT NOT NULL, kind TEXT NOT NULL,
+           PRIMARY KEY (cluster, api_group, resource, kind)
+         ) WITHOUT ROWID;
+         CREATE TRIGGER IF NOT EXISTS events_stats AFTER INSERT ON events BEGIN
+           INSERT INTO cluster_stats (cluster, last_event_ms) VALUES (NEW.cluster, NEW.ts_ms)
+           ON CONFLICT (cluster) DO UPDATE SET last_event_ms = max(coalesce(last_event_ms, excluded.last_event_ms), excluded.last_event_ms);
+         END;
+         CREATE TRIGGER IF NOT EXISTS versions_stats AFTER INSERT ON versions BEGIN
+           INSERT INTO cluster_stats (cluster, last_version_ms) VALUES (NEW.cluster, NEW.observed_ms)
+           ON CONFLICT (cluster) DO UPDATE SET last_version_ms = max(coalesce(last_version_ms, excluded.last_version_ms), excluded.last_version_ms);
+           INSERT OR IGNORE INTO resource_kinds (cluster, api_group, resource, kind) VALUES (NEW.cluster, NEW.api_group, NEW.resource, NEW.kind);
+         END;",
+    )?;
+    if !existed {
+        conn.execute_batch(
+            "INSERT INTO cluster_stats (cluster, last_event_ms) SELECT cluster, max(ts_ms) FROM events WHERE true GROUP BY cluster
+               ON CONFLICT (cluster) DO UPDATE SET last_event_ms = excluded.last_event_ms;
+             INSERT INTO cluster_stats (cluster, last_version_ms) SELECT cluster, max(observed_ms) FROM versions WHERE true GROUP BY cluster
+               ON CONFLICT (cluster) DO UPDATE SET last_version_ms = excluded.last_version_ms;
+             INSERT OR IGNORE INTO resource_kinds (cluster, api_group, resource, kind) SELECT DISTINCT cluster, api_group, resource, kind FROM versions;",
+        )?;
+    }
+    Ok(())
+}
+
 impl Store {
     /// Open with the built-in rule settings.
     #[cfg(test)]
@@ -630,6 +665,7 @@ impl Store {
              CREATE INDEX IF NOT EXISTS events_link ON events(link_id);",
         )?;
         crate::rulestate::prepare(&conn)?;
+        prepare_stats(&conn)?;
         let store = Store { conn: Arc::new(Mutex::new(conn)), cfg, job: Arc::new(Mutex::new(None)) };
         store.register_settings(Utc::now().timestamp_millis())?;
         Ok(store)
@@ -2720,5 +2756,78 @@ mod tests {
         let s = Store::open(&path).unwrap();
         let again: i64 = s.conn.lock().unwrap().query_row("SELECT COUNT(*) FROM gaps", [], |r| r.get(0)).unwrap();
         assert_eq!(again, after + 1);
+    }
+
+    /// cluster_stats and resource_kinds always equal what scanning the history would give:
+    /// filled once for a database from before them, and kept by triggers after that.
+    #[test]
+    fn stats_tables_match_the_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.db");
+        let p = path.to_str().unwrap();
+        let ev = |c: &Connection, cl: &str, id: &str, t: i64| {
+            c.execute(
+                "INSERT INTO events (cluster, audit_id, ts_ms, ts, actor, principal, human, via, caller, verb, api_group, resource, subresource,
+                                     namespace, name, code, source_ip, user_agent, request_uri, source)
+                 VALUES (?1, ?2, ?3, '', 'a', '', 1, 'direct', 'a', 'patch', '', 'configmaps', '', 'app', ?2, 200, '', '', '', 'k8s')",
+                params![cl, id, t],
+            )
+            .unwrap();
+        };
+        let ver = |c: &Connection, cl: &str, res: &str, kind: &str, t: i64| {
+            c.execute(
+                "INSERT INTO versions (cluster, api_group, resource, kind, namespace, name, uid, observed_ms, observed, change, body)
+                 VALUES (?1, 'apps', ?2, ?3, 'app', 'x', 'u', ?4, '', 'modified', '{}')",
+                params![cl, res, kind, t],
+            )
+            .unwrap();
+        };
+        let check = |c: &Connection| {
+            let stats: Vec<(String, Option<i64>, Option<i64>)> =
+                c.prepare("SELECT cluster, last_event_ms, last_version_ms FROM cluster_stats ORDER BY cluster").unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(Result::unwrap).collect();
+            let direct: Vec<(String, Option<i64>, Option<i64>)> = c
+                .prepare(
+                    "SELECT cl, (SELECT max(ts_ms) FROM events WHERE cluster = cl), (SELECT max(observed_ms) FROM versions WHERE cluster = cl)
+                     FROM (SELECT cluster AS cl FROM events UNION SELECT cluster FROM versions) ORDER BY cl",
+                )
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(stats, direct);
+            let kinds: Vec<(String, String, String, String)> =
+                c.prepare("SELECT cluster, api_group, resource, kind FROM resource_kinds ORDER BY 1, 2, 3, 4").unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap().map(Result::unwrap).collect();
+            let direct: Vec<(String, String, String, String)> = c
+                .prepare("SELECT DISTINCT cluster, api_group, resource, kind FROM versions ORDER BY 1, 2, 3, 4")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(kinds, direct);
+        };
+        {
+            // A database from before the tables: data, then the tables and triggers removed.
+            let s = Store::open(p).unwrap();
+            let c = s.conn.lock().unwrap();
+            ev(&c, "c1", "a", 10);
+            ev(&c, "c1", "b", 30);
+            ev(&c, "c2", "c", 20);
+            ver(&c, "c1", "deployments", "Deployment", 25);
+            ver(&c, "c3", "statefulsets", "StatefulSet", 5);
+            c.execute_batch("DROP TRIGGER events_stats; DROP TRIGGER versions_stats; DROP TABLE cluster_stats; DROP TABLE resource_kinds;").unwrap();
+        }
+        let s = Store::open(p).unwrap();
+        let c = s.conn.lock().unwrap();
+        check(&c);
+        // After that the triggers keep them current, including an older record arriving late.
+        ev(&c, "c1", "d", 5);
+        ev(&c, "c2", "e", 40);
+        ver(&c, "c2", "daemonsets", "DaemonSet", 50);
+        ver(&c, "c1", "deployments", "Deployment", 1);
+        check(&c);
+        let last: i64 = c.query_row("SELECT last_event_ms FROM cluster_stats WHERE cluster = 'c1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(last, 30);
     }
 }
