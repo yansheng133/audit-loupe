@@ -105,3 +105,11 @@ v0 是原型：開頁時直接查現有資料表，**不做彙總表、不調效
    - 相關物件改放新欄位 `detail.related`：`[{"rel": "mounts", "kind": "ConfigMap", "namespace": "", "name": ""}]`。
 4. **細節單獨一支 API**：`GET /api/changemap/detail?day=&key=`，只回 `detail` 物件。點一列時介面只打這支，不重打 `/api/changemap`。`/api/changemap` 開頁時照舊附預設選取的 `detail`。
 5. **原型標示**：server 設定了環境變數 `AL_DATA_NOTE` 時，回應多一個 `meta`：`{"dataNote": "<原文>", "dataUntilMs": <資料最後一筆的時間>}`。介面看到 `meta` 就在分頁列下方顯示一行提示。
+
+## v0.1 補充（2026-10-21，依軌 1、軌 3 的回報）
+
+1. **進入容器**：子資源是 `exec`、`attach`、`portforward` 時，不論 verb 是 `get`（新版 kubectl 用 websocket 開啟）還是 `create`（舊版），動作一律顯示成子資源名稱，`dependsOn` 也照這個判斷。其他子資源維持原規則：只有 `create` 才用子資源名稱。
+2. **`/api/changemap/detail` 也接受 `system`**：意思和 `/api/changemap` 的 `system` 相同。
+3. **`/api/changemap/detail` 的 404**：
+   - 物件當天沒有紀錄時回 404，內容是 `{"error": "no-records"}`。
+   - 沒有這個 JSON 內容的 404，代表後端沒有這支 API（舊版）。介面這時才改打整頁。

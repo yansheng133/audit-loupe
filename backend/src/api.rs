@@ -151,7 +151,9 @@ async fn changemap_detail(State(s): State<AppState>, uri: axum::http::Uri) -> Re
     let p = crate::changemap::parse_query(uri.query().unwrap_or(""));
     let (store, tz) = (s.store.clone(), s.cfg.tz);
     match tokio::task::spawn_blocking(move || crate::changemap::detail(&store, tz, &p, Utc::now().timestamp_millis())).await {
-        Ok(Ok(serde_json::Value::Null)) => (StatusCode::NOT_FOUND, "no records for this object on that day").into_response(),
+        // The JSON body tells the page "nothing that day" apart from an older backend, whose
+        // unknown route also answers 404 (API contract v0.1, supplement).
+        Ok(Ok(serde_json::Value::Null)) => (StatusCode::NOT_FOUND, Json(json!({"error": "no-records"}))).into_response(),
         Ok(Ok(v)) => Json(v).into_response(),
         Ok(Err(e)) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
         Err(e) => err(e.into()),
@@ -857,5 +859,18 @@ mod tests {
         assert!(!text.contains("password"), "the line text is never returned: {text}");
         let cov = coverage_json(router(st)).await;
         assert_eq!(cov[0]["rejectedCounts"][0]["count"], 1, "{cov}");
+    }
+
+    /// "Nothing that day" answers 404 with a JSON body, so the page can tell it from an older
+    /// backend without the detail call (whose unknown route answers a bare 404).
+    #[tokio::test]
+    async fn detail_without_records_says_so() {
+        let res = router(state())
+            .oneshot(Request::get("/api/changemap/detail?day=2026-10-20&key=c1//pods/app/none").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(res.into_body(), 1 << 16).await.unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), json!({"error": "no-records"}));
     }
 }
