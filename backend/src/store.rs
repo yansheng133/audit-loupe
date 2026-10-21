@@ -666,6 +666,7 @@ impl Store {
         )?;
         crate::rulestate::prepare(&conn)?;
         prepare_stats(&conn)?;
+        crate::identity::prepare(&conn, &cfg.identities)?;
         let store = Store { conn: Arc::new(Mutex::new(conn)), cfg, job: Arc::new(Mutex::new(None)) };
         store.register_settings(Utc::now().timestamp_millis())?;
         Ok(store)
@@ -924,7 +925,8 @@ impl Store {
                     "INSERT INTO chain (cluster, head_id, head_hash) VALUES (?1,?2,?3) ON CONFLICT(cluster) DO UPDATE SET head_id=excluded.head_id, head_hash=excluded.head_hash",
                     params![cl, id, h],
                 )?;
-                let alerts = &judge(r, cl, &self.cfg, &*tx)?;
+                let class = crate::identity::resolve(&tx, &self.cfg.identities, &r.actor, &r.user_id, r.human, &r.user_agent, ms(&r.ts))?;
+                let alerts = &judge(r, crate::identity::is_person(class), cl, &self.cfg, &*tx)?;
                 for a in alerts {
                     al.execute(params![id, a.rule, a.severity])?;
                 }
@@ -1523,6 +1525,8 @@ impl Store {
         }
         if key.api_group == "management.cattle.io" && key.resource == "users" {
             Self::record_user(&c, &key.name, uid, obj, change, at)?;
+            // What the user directory says about this user can change who counts as a person.
+            crate::identity::reclassify(&c, &self.cfg.identities, Some(&key.name))?;
         }
         Ok(Some(id))
     }
@@ -2399,6 +2403,63 @@ mod tests {
             object: json!({"metadata":{"name":"u-1","creationTimestamp":created},"displayName":"Alice Chen","username":"",
                            "principalIds":["openldap_user://uid=alice","local://u-1"]}),
         }
+    }
+
+    /// A night-time patch through Rancher by user `uid` (23:00 in Taipei, a Wednesday).
+    fn night_patch(id: &str, uid: &str) -> Record {
+        let ev = format!(r#"{{"auditID":"{id}","stage":"ResponseComplete","verb":"patch",
+          "user":{{"username":"system:serviceaccount:cattle-impersonation-system:cattle-impersonation-{uid}"}},
+          "impersonatedUser":{{"username":"{uid}","extra":{{"username":["{uid}-name"]}}}},
+          "objectRef":{{"resource":"deployments","namespace":"shop","name":"web","apiGroup":"apps"}},
+          "responseStatus":{{"code":200}},"stageTimestamp":"2026-10-14T15:00:00Z"}}"#);
+        to_record(&parse_body(ev.as_bytes()).unwrap()[0]).unwrap()
+    }
+
+    fn alerts_of(s: &Store, audit_id: &str) -> Vec<String> {
+        let c = s.conn.lock().unwrap();
+        c.prepare("SELECT a.rule FROM alerts a JOIN events e ON a.event_id = e.id WHERE e.audit_id = ?1 ORDER BY 1")
+            .unwrap()
+            .query_map(params![audit_id], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// Rules look at people only, and who is a person comes from the identity table: Rancher's
+    /// own provisioning account and whitelisted names no longer trip "off hours". The record
+    /// itself (and its hash) is not changed.
+    #[test]
+    fn only_people_trip_rules_and_the_identity_table_decides_who_is_one() {
+        let s = Store::open(":memory:").unwrap();
+        let mut provisioning = user_msg("baseline", "uid-1", "2026-10-01T00:00:00Z", 0);
+        if let ObjMsg::Version { object, .. } = &mut provisioning {
+            object["principalIds"] = json!(["system://provisioning/fleet-default/rke2"]);
+        }
+        s.apply_objects("local", &[provisioning]).unwrap();
+        s.insert_event("c1", &night_patch("n1", "u-1")).unwrap();
+        s.insert_event("c1", &night_patch("n2", "u-2")).unwrap();
+        assert_eq!(alerts_of(&s, "n1"), Vec::<String>::new(), "Rancher's provisioning account is not a person");
+        assert_eq!(alerts_of(&s, "n2"), vec!["off_hours".to_string()]);
+        let human: i64 = s.conn.lock().unwrap().query_row("SELECT human FROM events WHERE audit_id='n1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(human, 1, "the stored record keeps its own guess");
+
+        let mut cfg = crate::config::Config::defaults();
+        cfg.identities = crate::identity::Whitelist::parse(r#"[{"names": ["u-2"], "class": "component", "reason": "排程工具"}]"#).unwrap();
+        let w = Store::open_with(":memory:", Arc::new(cfg)).unwrap();
+        w.insert_event("c1", &night_patch("n3", "u-2")).unwrap();
+        assert_eq!(alerts_of(&w, "n3"), Vec::<String>::new(), "a whitelisted name is what the whitelist says");
+        let rows = crate::identity::list(&w.conn.lock().unwrap()).unwrap();
+        assert_eq!((rows[0]["class"].as_str(), rows[0]["source"].as_str()), (Some("component"), Some("whitelist")));
+    }
+
+    /// Changing the whitelist changes the settings fingerprint, so stored judgements are offered
+    /// to be judged again.
+    #[test]
+    fn the_whitelist_is_part_of_the_settings() {
+        let a = crate::config::Config::defaults();
+        let mut b = crate::config::Config::defaults();
+        b.identities = crate::identity::Whitelist::parse(r#"[{"names": ["x"], "class": "component", "reason": "r"}]"#).unwrap();
+        assert_ne!(crate::rules::fingerprint(&a).0, crate::rules::fingerprint(&b).0);
     }
 
     #[test]

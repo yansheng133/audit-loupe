@@ -7,6 +7,7 @@ mod config;
 mod demo;
 mod diff;
 mod forward;
+mod identity;
 mod integrity;
 mod neuvector;
 mod rancher;

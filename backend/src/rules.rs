@@ -197,7 +197,7 @@ impl RuleSet {
 }
 
 /// `*` matches any run of characters; everything else literally.
-fn glob(pattern: &str, text: &str) -> bool {
+pub(crate) fn glob(pattern: &str, text: &str) -> bool {
     let parts: Vec<&str> = pattern.split('*').collect();
     if parts.len() == 1 {
         return pattern == text;
@@ -289,10 +289,11 @@ fn namespace_of(r: &Record) -> &str {
     if r.namespace.is_empty() && r.resource == "namespaces" && r.api_group.is_empty() { &r.name } else { &r.namespace }
 }
 
-/// Which rules a record trips, before the settings are applied.
-fn detect(r: &Record, cluster: &str, cfg: &Config, look: &dyn Lookup) -> anyhow::Result<Vec<&'static str>> {
+/// Which rules a record trips, before the settings are applied. Only people trip rules;
+/// `person` comes from the identity table (`identity::is_person`), not from the record.
+fn detect(r: &Record, person: bool, cluster: &str, cfg: &Config, look: &dyn Lookup) -> anyhow::Result<Vec<&'static str>> {
     let mut out = Vec::new();
-    if !r.human {
+    if !person {
         return Ok(out);
     }
     // 101 is the protocol switch for exec/attach/port-forward sessions.
@@ -356,9 +357,9 @@ fn detect(r: &Record, cluster: &str, cfg: &Config, look: &dyn Lookup) -> anyhow:
 }
 
 /// The alerts for one record under the current settings. `cluster` is the cluster the record
-/// is stored under.
-pub fn judge(r: &Record, cluster: &str, cfg: &Config, look: &dyn Lookup) -> anyhow::Result<Vec<Alert>> {
-    let hits = detect(r, cluster, cfg, look)?;
+/// is stored under; `person` whether its identity is classified as a person.
+pub fn judge(r: &Record, person: bool, cluster: &str, cfg: &Config, look: &dyn Lookup) -> anyhow::Result<Vec<Alert>> {
+    let hits = detect(r, person, cluster, cfg, look)?;
     if hits.is_empty() {
         return Ok(vec![]);
     }
@@ -378,11 +379,13 @@ pub fn judge(r: &Record, cluster: &str, cfg: &Config, look: &dyn Lookup) -> anyh
         .collect())
 }
 
-/// Judge a record without stored data (rules that need it do not fire).
+/// Judge a record without stored data (rules that need it do not fire), classifying its
+/// identity with the built-in rules and the whitelist only.
 #[cfg(test)]
 pub fn evaluate(r: &Record, cfg: &Config) -> Vec<Alert> {
     let cluster = r.cluster.clone().unwrap_or_default();
-    judge(r, &cluster, cfg, &NoLookup).unwrap_or_default()
+    let class = crate::identity::classify(&r.actor, &r.user_id, r.human, &r.user_agent, None, &cfg.identities).class;
+    judge(r, crate::identity::is_person(class), &cluster, cfg, &NoLookup).unwrap_or_default()
 }
 
 /// When the settings that decide alerts were last changed is told apart by this.
@@ -396,6 +399,9 @@ pub fn fingerprint(cfg: &Config) -> (String, Value) {
         "tz": cfg.tz.name(),
         "workDays": cfg.work_days,
         "workHours": [cfg.work_start_hour, cfg.work_end_hour],
+        // Who counts as a person decides which records the rules look at.
+        "identities": cfg.identities.entries,
+        "identityRules": crate::identity::BUILTIN_VERSION,
     });
     let h: String = Sha256::digest(v.to_string().as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect();
     (h, v)

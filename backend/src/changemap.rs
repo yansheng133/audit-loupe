@@ -75,39 +75,6 @@ fn decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Who did it, in the five categories the page shows (report-ui-facts section B).
-pub fn categorize(actor: &str, human: bool, user_agent: &str, principals: Option<&str>) -> (&'static str, &'static str) {
-    if let Some(rest) = actor.strip_prefix("system:serviceaccount:") {
-        let ns = rest.split(':').next().unwrap_or("");
-        return if ns.starts_with("cattle-") {
-            ("rancher", "Rancher 安裝的元件所用的 ServiceAccount")
-        } else if ns == "kube-system" {
-            ("component", "叢集內建元件")
-        } else {
-            ("serviceaccount", "工作負載的 ServiceAccount")
-        };
-    }
-    match actor {
-        "system:admin" => return ("human", "管理者憑證，對不到個人"),
-        "system:cattle:error" => return ("unknown", "Rancher 未通過驗證的請求，看不出是誰"),
-        "" => return ("unknown", "找不到執行者"),
-        _ => {}
-    }
-    if actor.starts_with("system:") || actor.ends_with("cloud-controller-manager") || user_agent.starts_with("cloud-controller-manager/") {
-        return ("component", "叢集內建元件");
-    }
-    if let Some(p) = principals {
-        if p.contains("system://") {
-            return ("rancher", "Rancher 內部帳號（叢集佈建）");
-        }
-        let ids: Vec<String> = serde_json::from_str(p).unwrap_or_default();
-        if human && !ids.is_empty() && ids.iter().all(|i| i.starts_with("local://")) {
-            return ("human", "Rancher 本機帳號，可能多人共用");
-        }
-    }
-    if human { ("human", "") } else { ("unknown", "看不出是人或程式") }
-}
-
 /// Rancher UI housekeeping: temporary RBAC for the kubectl shell and per-user UI settings.
 fn ui_maintenance(resource: &str, name: &str) -> bool {
     name.starts_with("pod-impersonation-shell-")
@@ -230,7 +197,7 @@ struct Op {
     name: String,
     actor: String,
     category: &'static str,
-    note: &'static str,
+    note: String,
     via: String,
     verb: String,
     severity: Option<String>,
@@ -330,6 +297,10 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     };
     let principals: HashMap<String, String> =
         c.prepare("SELECT user_id, principal_ids FROM users")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+    let idents: HashMap<(String, String), (&'static str, String)> = c
+        .prepare("SELECT actor, user_id, class, reason FROM identities")?
+        .query_map([], |r| Ok(((r.get(0)?, r.get(1)?), (crate::identity::class_name(&r.get::<_, String>(2)?), r.get(3)?))))?
+        .collect::<Result<_, _>>()?;
     // Which collectors each cluster runs decides why a change has no author.
     let mut collectors: HashMap<String, HashSet<String>> = HashMap::new();
     for row in c.prepare("SELECT cluster, collector FROM heartbeats")?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
@@ -411,7 +382,15 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
             name = BATCH.to_string();
         }
         let (actor, human, ua, uid): (String, bool, String, String) = (r.get(2)?, r.get::<_, i64>(3)? == 1, r.get(11)?, r.get(12)?);
-        let (category, note) = categorize(&actor, human, &ua, principals.get(&uid).map(String::as_str));
+        // The identity table decides the class (whitelist included); records stored without
+        // going through ingest (tests) fall back to the built-in rules.
+        let (category, note) = match idents.get(&(actor.clone(), uid.clone())) {
+            Some((c, n)) => (*c, n.clone()),
+            None => {
+                let (c, n) = crate::identity::builtin(&actor, human, &ua, principals.get(&uid).map(String::as_str));
+                (c, n.to_string())
+            }
+        };
         if !with_system {
             if ui_maintenance(&resource, &name) {
                 hidden_ui += 1;
@@ -455,7 +434,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         }
         let key = format!("{cluster}/{api_group}/{resource}/{namespace}/{name}");
         let op = Op {
-            t: r.get(1)?, cluster, key, resource, namespace, name, actor: String::new(), category: "unknown", note: "找不到執行者",
+            t: r.get(1)?, cluster, key, resource, namespace, name, actor: String::new(), category: "unknown", note: "找不到執行者".into(),
             via: "unknown".into(), verb: r.get(6)?, severity: None, unattributed: true, hashed: false,
         };
         add(op, &api_group, &mut objs, &mut ops);
@@ -1036,17 +1015,5 @@ mod tests {
         let p = Params { day: Some("2025-03-08".into()), ..Default::default() };
         let v = changemap(&s, tz, &p, T).unwrap();
         assert_eq!(v["timeline"]["lines"][0]["slots"].as_array().unwrap().len(), 144, "the day before ends where that day starts");
-    }
-
-    #[test]
-    fn categories() {
-        assert_eq!(categorize("system:serviceaccount:cattle-system:cattle", false, "", None).0, "rancher");
-        assert_eq!(categorize("system:serviceaccount:kube-system:cilium", false, "", None).0, "component");
-        assert_eq!(categorize("system:serviceaccount:al-sample:ci-runner", false, "", None).0, "serviceaccount");
-        assert_eq!(categorize("system:admin", true, "", None).0, "human");
-        assert_eq!(categorize("system:cattle:error", false, "", None).0, "unknown");
-        assert_eq!(categorize("rke2-cloud-controller-manager", true, "", None).0, "component");
-        assert_eq!(categorize("u-d67", true, "", Some(r#"["system://provisioning/x","local://u-d67"]"#)).0, "rancher");
-        assert_eq!(categorize("admin", true, "", Some(r#"["local://user-kgw7z"]"#)), ("human", "Rancher 本機帳號，可能多人共用"));
     }
 }

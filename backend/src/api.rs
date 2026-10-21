@@ -274,6 +274,16 @@ async fn actors(State(s): State<AppState>, Q(r): Q<Range>) -> Response {
     }
 }
 
+/// Every identity seen and its class (person, component, ServiceAccount, Rancher, unknown),
+/// with the reason and whether the built-in rules or the whitelist decided it.
+async fn identities(State(s): State<AppState>) -> Response {
+    let rows = { crate::identity::list(&s.store.conn.lock().unwrap()) };
+    match rows {
+        Ok(rows) => Json(json!({"identities": rows, "whitelist": s.cfg.identities.entries})).into_response(),
+        Err(e) => err(e),
+    }
+}
+
 /// The user directory: every lifetime of every Rancher user seen, deleted ones included.
 async fn users(State(s): State<AppState>) -> Response {
     match s.store.users() {
@@ -647,6 +657,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/changemap/detail", get(changemap_detail))
         .route("/api/actors", get(actors))
         .route("/api/users", get(users))
+        .route("/api/identities", get(identities))
         .route("/api/timeline", get(timeline))
         .route("/api/objects", get(objects))
         .route("/api/history", get(history))

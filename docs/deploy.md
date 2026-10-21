@@ -237,6 +237,37 @@ server:
 - 已轉送到 SIEM 的警示不會重送。
 - 「規則」頁保留每次設定變更與重新計算的時間。
 
+### 9.1 身分分類與白名單
+
+規則只看「人」做的事。每個身分（名稱加上 Rancher 使用者 ID）在第一次出現時分類一次，存在 server 的身分表，分成五類：人、叢集元件、ServiceAccount、Rancher 內部、未知。內建的判斷：
+
+| 身分 | 分類 |
+|---|---|
+| `kube-system` 的 ServiceAccount、`system:` 開頭的名稱（`system:admin` 除外）、名稱或 User-Agent 是 cloud-controller-manager | 叢集元件 |
+| `cattle-` 開頭 namespace 的 ServiceAccount（含 Fleet、NeuVector） | Rancher 內部 |
+| 其他 namespace 的 ServiceAccount | ServiceAccount |
+| Rancher 使用者的 principal 有 `system://`（叢集佈建用的帳號） | Rancher 內部 |
+| `system:admin`（節點上的管理者憑證） | 人（對不到是誰） |
+| `system:cattle:error`（Rancher 未通過驗證的請求） | 未知 |
+| 其他 | 人 |
+
+內建判斷認不出來的（例如只能靠憑證名稱認的元件），寫在 `server.identities`：
+
+```yaml
+server:
+  identities:
+    - names: ["rke2-cloud-controller-manager"]   # 名稱或 Rancher 使用者 ID，可用 * 
+      class: component                            # human、component、serviceaccount、rancher、unknown
+      reason: 用憑證登入的 RKE2 元件，只能靠名稱認   # 必填，畫面上的「身分說明」
+```
+
+- 精確名稱優先於有 `*` 的名稱；都符合時以寫在前面的為準。有 `*` 的名稱最多 1,000 個；只有 `*` 的名稱不接受。
+- 白名單和規則一樣算進設定代碼：改了之後，之前的紀錄維持原本的判斷，「規則」頁會提示重新計算（第 9 節）。
+- 每個身分目前的分類與依據：`GET /api/identities`。
+- 存下來的紀錄本身不會改（`human` 欄位是雜湊鏈的一部分），改的是身分表。
+
+**從 0.3.x 升級時**：Rancher 叢集佈建用的帳號（例如 `u-xxxxx`，principal 為 `system://`）以前被當成人，現在歸「Rancher 內部」，「非上班時間」「繞過 Rancher」這類警示會變少。升級後到「規則」頁執行一次重新計算，舊紀錄才會照新的分類判斷。
+
 ## 10. 移除
 
 ```bash

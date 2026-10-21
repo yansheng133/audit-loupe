@@ -61,6 +61,7 @@ jobs:
           # The rules example must reach the server as AL_RULES; the downstream one has no server.
           grep -q 'AL_RULES' /tmp/local.out || { echo "AL_RULES missing from the local render"; exit 1; }
           grep -q 'pod_exec' /tmp/local.out || { echo "rules example missing from AL_RULES"; exit 1; }
+          grep -q 'AL_IDENTITIES' /tmp/local.out || { echo "AL_IDENTITIES missing from the local render"; exit 1; }
           if grep -q 'AL_RULES' /tmp/downstream.out; then echo "downstream render must not contain the server"; exit 1; fi
       - name: Versions agree
         run: |
