@@ -9,6 +9,8 @@ mod diff;
 mod forward;
 mod integrity;
 mod neuvector;
+#[cfg(test)]
+mod perf;
 mod rancher;
 mod relations;
 mod replay;
