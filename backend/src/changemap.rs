@@ -604,10 +604,13 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     drop(rows);
     drop(st);
 
-    // Collection gaps overlapping the day.
-    let mut gaps: Vec<(String, i64, i64, String)> = Vec::new();
-    let mut st = c.prepare("SELECT cluster, from_ms, to_ms, collector FROM gaps WHERE to_ms >= ?1 AND from_ms < ?2 ORDER BY from_ms")?;
-    for row in st.query_map(params![start, end], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get::<_, String>(3)?)))? {
+    // Collection gaps overlapping the day, from both sources (spec section 5): an empty reason is
+    // a silence the server noticed (no heartbeat); any other reason was reported by the
+    // collector (restart, file removed or replaced, state lost). Where collection started is a
+    // marker, not a gap.
+    let mut gaps: Vec<(String, i64, i64, String, String)> = Vec::new();
+    let mut st = c.prepare("SELECT cluster, from_ms, to_ms, collector, reason FROM gaps WHERE to_ms >= ?1 AND from_ms < ?2 AND reason <> ?3 ORDER BY from_ms")?;
+    for row in st.query_map(params![start, end, crate::store::START], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?)))? {
         let g = row?;
         if clusters.is_empty() || clusters.contains(g.0.as_str()) {
             gaps.push(g);
@@ -623,7 +626,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
             ("found-on-reconnect", "收集中斷後重新連線比對物件版本才發現的變更，找不到對應的 audit 紀錄".into())
         }
     };
-    let in_gap = |cluster: &str, t: i64| gaps.iter().any(|(cl, f, to, _)| cl == cluster && t >= f - SLOT_GRACE_MS && t <= to + SLOT_GRACE_MS);
+    let in_gap = |cluster: &str, t: i64| gaps.iter().any(|(cl, f, to, _, _)| cl == cluster && t >= f - SLOT_GRACE_MS && t <= to + SLOT_GRACE_MS);
 
     for o in objs.values_mut() {
         let sev = o.ops.iter().filter_map(|i| ops[*i].severity.clone()).min_by_key(|s| if s == "high" { 0 } else { 1 });
@@ -752,7 +755,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
             .enumerate()
             .map(|(i, (r, n, a))| {
                 let t = start + i as i64 * slot_ms;
-                let gap = gaps.iter().any(|(cl, f, to, _)| lk.as_ref().is_none_or(|c| c == cl) && *f < t + slot_ms && *to > t);
+                let gap = gaps.iter().any(|(cl, f, to, _, _)| lk.as_ref().is_none_or(|c| c == cl) && *f < t + slot_ms && *to > t);
                 let state = match r {
                     0 => "look",
                     1 => "unclear",
@@ -770,7 +773,14 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     }
     let gaps_json: Vec<Value> = gaps
         .iter()
-        .map(|(cl, f, t, col)| json!({"cluster": cl, "fromMs": f, "toMs": t, "kind": "heartbeat", "collector": col, "reasonCode": "collector-silent", "reason": format!("收集元件 {col} 沒有回報")}))
+        .map(|(cl, f, t, col, why)| {
+            if why.is_empty() {
+                json!({"cluster": cl, "fromMs": f, "toMs": t, "kind": "heartbeat", "collector": col, "reasonCode": "collector-silent", "reason": format!("收集元件 {col} 沒有回報")})
+            } else {
+                json!({"cluster": cl, "fromMs": f, "toMs": t, "kind": "reported", "collector": col, "cause": why, "reasonCode": "collector-reported",
+                       "reason": format!("收集元件 {col} 回報這段沒有收集（{why}）")})
+            }
+        })
         .collect();
 
     // Prefer the latest op with a known author; fall back to the latest unattributed change.
@@ -891,12 +901,23 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
                 evs.push(json!({"t": t, "subject": o.key, "from": "clear", "to": "unclear", "reasonCode": "first-unattributed", "reason": "當天第一次出現找不到執行者的變更", "source": "state"}));
             }
         }
-        for (cl, f, t, col) in &gaps {
-            if in_range(*f) {
-                evs.push(json!({"t": f, "subject": cl, "from": "ok", "to": "blind", "reasonCode": "collector-stopped", "collector": col, "reason": format!("收集元件 {col} 停止回報"), "source": "heartbeat"}));
-            }
-            if in_range(*t) {
-                evs.push(json!({"t": t, "subject": cl, "from": "blind", "to": "ok", "reasonCode": "collector-resumed", "collector": col, "reason": format!("收集元件 {col} 恢復回報"), "source": "heartbeat"}));
+        for (cl, f, t, col, why) in &gaps {
+            let (stop, resume) = if why.is_empty() {
+                (json!({"reasonCode": "collector-stopped", "reason": format!("收集元件 {col} 停止回報"), "source": "heartbeat"}),
+                 json!({"reasonCode": "collector-resumed", "reason": format!("收集元件 {col} 恢復回報"), "source": "heartbeat"}))
+            } else {
+                (json!({"reasonCode": "reported-gap-start", "reason": format!("收集元件 {col} 回報從這裡開始沒有收集（{why}）"), "source": "reported", "cause": why}),
+                 json!({"reasonCode": "reported-gap-end", "reason": format!("收集元件 {col} 回報的缺口到這裡為止"), "source": "reported", "cause": why}))
+            };
+            for (at, from, to, mut e) in [(*f, "ok", "blind", stop), (*t, "blind", "ok", resume)] {
+                if in_range(at) {
+                    e["t"] = json!(at);
+                    e["subject"] = json!(cl);
+                    e["from"] = json!(from);
+                    e["to"] = json!(to);
+                    e["collector"] = json!(col);
+                    evs.push(e);
+                }
             }
         }
         evs.sort_by_key(|e| std::cmp::Reverse(e["t"].as_i64().unwrap_or(0)));
@@ -1046,6 +1067,37 @@ mod tests {
         assert_eq!(r["rows"][0]["name"], "afternoon");
         assert_eq!(r["timeline"], v["timeline"], "the timeline is the whole day either way");
         assert_eq!(parse_query("day=2026-10-20&from=5&to=9").from, Some(5));
+    }
+
+    /// Spec section 5: a gap the collector reported and a silence the server noticed are both
+    /// shown, kept apart; where collection started is a marker, not a gap.
+    #[test]
+    fn reported_gaps_and_silences_are_both_shown() {
+        let s = store();
+        {
+            let c = s.conn.lock().unwrap();
+            ev(&c, 1, "c1", T, "alice", 1, "rancher", "patch", "configmaps", "app", "cfg");
+            let gap = |f: i64, t: i64, why: &str| {
+                c.execute("INSERT INTO gaps (cluster, collector, instance, from_ms, to_ms, reason) VALUES ('c1', 'file', 'n', ?1, ?2, ?3)", params![f, t, why]).unwrap();
+            };
+            gap(T + 3_600_000, T + 3_700_000, "");
+            gap(T + 7_200_000, T + 7_300_000, "collector-restart");
+            gap(T - 3_600_000, T - 3_000_000, crate::store::START);
+        }
+        let p = Params { day: Some("2026-10-20".into()), tab: Some("events".into()), ..Default::default() };
+        let v = changemap(&s, chrono_tz::Asia::Taipei, &p, T).unwrap();
+        let gaps = v["timeline"]["gaps"].as_array().unwrap();
+        assert_eq!(gaps.len(), 2, "the start marker is not a gap: {gaps:?}");
+        assert_eq!((gaps[0]["kind"].as_str(), gaps[0]["reasonCode"].as_str()), (Some("heartbeat"), Some("collector-silent")));
+        assert_eq!((gaps[1]["kind"].as_str(), gaps[1]["cause"].as_str()), (Some("reported"), Some("collector-restart")));
+        let evs = v["events"].as_array().unwrap();
+        let sources: Vec<(&str, &str)> = evs.iter().filter(|e| e["source"] != "state").map(|e| (e["source"].as_str().unwrap(), e["reasonCode"].as_str().unwrap())).collect();
+        assert_eq!(sources, [("reported", "reported-gap-end"), ("reported", "reported-gap-start"), ("heartbeat", "collector-resumed"), ("heartbeat", "collector-stopped")]);
+        assert!(evs.iter().filter(|e| e["source"] == "reported").all(|e| e["cause"] == "collector-restart" && e["collector"] == "file"));
+        // The slot before the start marker is not blind.
+        let slots = v["timeline"]["lines"][0]["slots"].as_array().unwrap();
+        let before = slots.iter().find(|x| x["t"].as_i64() == Some(T - 3_600_000)).unwrap();
+        assert_ne!(before["state"], "blind", "{before}");
     }
 
     /// Rancher's "who am I" request, user search and logout are requests, not changes: only

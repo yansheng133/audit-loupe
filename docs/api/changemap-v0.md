@@ -135,3 +135,6 @@ v0 是原型：開頁時直接查現有資料表，**不做彙總表、不調效
 6. **列表少掉的兩種列**（第一層計畫 v2 的兩個顯示細節）：
    - 只計入 `hidden.requestOnly`、不列成物件的請求，多了 Rancher 介面取得目前使用者的 `selfuser`、使用者與群組的搜尋（verb `search`）、登出（resource `logout` 或 verb `logout`）。
    - 刪除 namespace 後，namespace controller 對每一種資源各送一次 `deletecollection`（實驗室一次約 110 筆）。這些紀錄併進那個 namespace 本身的列（`kind: Namespace`），不再各自成列；列上的「誰」是刪除 namespace 的人，不是 controller。細節的 `ops[]` 對這些紀錄多一個 `cascade`，值是被清空的資源（例如 `pods`），`raw.resource` 也是它；其他紀錄的 `cascade` 是 null。namespace controller 屬於系統元件，預設畫面本來就不顯示，帶 `system` 才看得到。
+7. **缺口分兩種來源**（介面規格第 5 節）：缺口表裡沒有原因的是 server 沒收到心跳，有原因的是收集元件自己回報的；「開始收集」的標記不是缺口，不再算進來。
+   - `timeline.gaps[]`：心跳中斷是 `kind: "heartbeat"`、`reasonCode: "collector-silent"`；收集元件回報的是 `kind: "reported"`、`reasonCode: "collector-reported"`，多一個 `cause`：`collector-restart`、`collector-state-lost`、`file-removed`、`file-replaced`。
+   - 事件：心跳中斷照舊是 `collector-stopped`、`collector-resumed`，`source: "heartbeat"`；收集元件回報的是 `reported-gap-start`、`reported-gap-end`，`source: "reported"`，帶 `collector` 與 `cause`。
