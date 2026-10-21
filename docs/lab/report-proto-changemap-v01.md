@@ -19,7 +19,7 @@
 | 1-1.2 | 確認主工作目錄的變更 | `git status` 只有 `docs/api/changemap-v0.md`（修改）與 `docs/lab/parallel-1021b-task.md`（新檔），沒有別的變更 | 完成 |
 | 1-1.3 | `git fetch origin`，`git switch -c docs/decisions-1021b origin/main` | 兩個檔的變更跟著帶過去 | 完成 |
 | 1-1.4 | 只 commit 這兩個檔，push，開 PR | commit `4032665`（2 個檔），PR #14，標題照任務書 | 完成 |
-| 1-1.5 | 刪掉已合併的 `docs/decisions-1021` | 被 Claude Code 的自動模式擋下（判定為具破壞性的 git 操作），本機與遠端都**還在** | **卡住**，見下面第 1 點 |
+| 1-1.5 | 刪掉已合併的 `docs/decisions-1021` | 被 Claude Code 的自動模式擋下；之後由 Sam 手動執行，本機（原本在 `4cb27e4`）與遠端都已刪除 | 完成（Sam 執行），見下面第 1 點 |
 | 1-2 | 比對 sha256，`git am` 套用 | sha256 `0c79fb3a…5aa02` 等於 README；套用前分支在 `50ac250`；套用後 commit `bf9a680`，只動 `api.rs`、`changemap.rs` | 完成 |
 | 1-3 | `cargo test --locked`、`cargo clippy --all-targets`，push | 測試 104 通過、0 失敗、1 略過，和 README 一致。clippy 主程式 **19**、測試 **21**，README 是 17、19 → 停下來問 Sam；Sam 認同是 clippy 版本差異後才 push | 完成（有差異，見第 2 點） |
 | 1-3 CI | 確認 PR #13 的 CI | 見下面「CI 結果」 | 見下方 |
@@ -33,7 +33,7 @@
 
 ## 卡住的地方
 
-1. **刪除舊分支被擋（1-1.5）。** `git branch -D docs/decisions-1021` 與 `git push origin --delete docs/decisions-1021` 被 Claude Code 的自動模式擋下，我沒有改用其他方法繞過。PR #12 已合併，所以分支留著不影響內容。**建議**：Sam 自己執行：
+1. **刪除舊分支被擋（1-1.5）。** `git branch -D docs/decisions-1021` 與 `git push origin --delete docs/decisions-1021` 被 Claude Code 的自動模式擋下，我沒有改用其他方法繞過。PR #12 已合併，所以分支留著不影響內容。後來 Sam 自己執行了下面兩個指令，本機與遠端都已刪除：
    ```sh
    git -C ~/audit-loupe branch -D docs/decisions-1021
    git -C ~/audit-loupe push origin --delete docs/decisions-1021
