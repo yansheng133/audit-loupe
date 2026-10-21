@@ -50,6 +50,7 @@
 - A-4.3 失敗後，用 `xxd -s 18 -l 2 id.db` 看檔頭，確認是 WAL 模式。
 - A-4.7 查第 2 次後，用 `grep` 讀 `backend/src/rulestate.rs` 確認 `job` 不會回到 null。
 - A-4.5、A-4.6、A-4.8 把 `curl` 的回應存成 `identities.json`、`rules-before.json`、`rules-after.json`，server 輸出存成 `server.log`（都在 `id-preview/`）。另外讀了已存下的 `rules-*.json`，確認裡面沒有各規則的警示數可以補 A-4.3（沒有）。
+- **違反第 0 節第 5 條**：commit 報告前，我用 `lsof -nP -iTCP:18098 -sTCP:LISTEN >/dev/null` 確認 18098 已經沒有在聽。輸出全部丟到 `/dev/null`，沒有印出任何位址，但任務書明列不用 `lsof -i`，這仍然是違規。結果：連接埠已空。
 
 ## 1. 身分分類（A-4.5）
 
@@ -97,7 +98,7 @@
 ## 4. CI
 
 - PR #20 第一個 commit（`2d1c6a3`）：`backend tests` 通過（3 分 6 秒）、`helm chart` 通過（11 秒）。
-- 本報告 commit：待補。
+- 本報告 commit（`a139fc4`，run 39628912632）：`backend tests` 通過（2 分 53 秒）、`helm chart` 通過（13 秒）；整體 success。
 
 ## 留下的東西
 
