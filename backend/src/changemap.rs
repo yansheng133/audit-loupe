@@ -28,6 +28,11 @@ pub struct Params {
     pub system: Option<String>,
     /// Object key for `/api/changemap/detail`.
     pub key: Option<String>,
+    /// A time range within the day (ms), picked on the timeline (v0.2): the list, counts,
+    /// states, relations, events and detail count only records in it; the timeline still shows
+    /// the whole day.
+    pub from: Option<i64>,
+    pub to: Option<i64>,
 }
 
 /// Parse a query string that may repeat `cluster`.
@@ -46,6 +51,8 @@ pub fn parse_query(q: &str) -> Params {
             "select" => p.select = Some(v),
             "system" => p.system = Some(v),
             "key" => p.key = Some(v),
+            "from" => p.from = v.parse().ok(),
+            "to" => p.to = v.parse().ok(),
             _ => {}
         }
     }
@@ -105,7 +112,22 @@ fn kind_from_resource(resource: &str) -> String {
 
 /// Requests that leave no object behind (API contract v0.1, point 1). They are not changes to
 /// an object, so they are counted in `hidden.requestOnly` instead of listed.
-const REQUEST_ONLY: [&str; 5] = ["tokenreviews", "subjectaccessreviews", "selfsubjectaccessreviews", "selfsubjectreviews", "localsubjectaccessreviews"];
+const REQUEST_ONLY: [&str; 7] = [
+    "tokenreviews", "subjectaccessreviews", "selfsubjectaccessreviews", "selfsubjectreviews", "localsubjectaccessreviews",
+    // Rancher: the "who am I" request its pages send, and logging out.
+    "selfuser", "logout",
+];
+
+/// Rancher actions that are requests, not changes: searching users and groups, logging out.
+const REQUEST_ONLY_ACTIONS: [&str; 2] = ["search", "logout"];
+
+fn request_only(resource: &str, verb: &str, name: &str) -> bool {
+    name.is_empty() && (REQUEST_ONLY.contains(&resource) || REQUEST_ONLY_ACTIONS.contains(&verb))
+}
+
+/// Deleting a namespace makes the namespace controller empty it with one `deletecollection`
+/// per kind, about 110 records. They are listed with the namespace itself, not as rows.
+pub const NAMESPACE_CONTROLLER: &str = "system:serviceaccount:kube-system:namespace-controller";
 
 /// Name shown for a write without a name: `deletecollection`, or a create whose name the
 /// server generated (v0.1, point 1).
@@ -176,6 +198,8 @@ fn parse_key(k: &str) -> Option<ObjKey> {
 }
 
 const STATES: [&str; 4] = ["look", "unclear", "blind", "clear"];
+/// The relations tab's name for records nobody could be found for.
+const NO_ACTOR: &str = "(找不到執行者)";
 fn rank(s: &str) -> usize {
     match s {
         "look" => 0,
@@ -198,8 +222,13 @@ struct Op {
     actor: String,
     category: &'static str,
     note: String,
+    /// The identity's reason as a code the page translates; `None` for a whitelist reason,
+    /// which is shown as the administrator wrote it.
+    note_code: Option<&'static str>,
     via: String,
     verb: String,
+    /// For records listed with their namespace: the kind the namespace controller emptied.
+    cascade: Option<String>,
     severity: Option<String>,
     unattributed: bool,
     hashed: bool,
@@ -218,6 +247,9 @@ struct Obj {
     state: &'static str,
     severity: Option<String>,
     reason: String,
+    /// Why, as a code the page translates (v0.2): alert-high, alert-medium, no-apiserver-audit,
+    /// found-on-reconnect, near-gap.
+    reason_code: &'static str,
     last: i64,
 }
 
@@ -248,26 +280,121 @@ fn chain_status(store: &Store, now_ms: i64) -> Option<ChainMap> {
     g.0.as_ref().map(|(_, m)| m.clone())
 }
 
-/// Start the first chain check when the server starts, so the first page view is not `pending`.
-pub fn warm(store: &Store) {
-    chain_status(store, Utc::now().timestamp_millis());
+/// Whether a chain check is running in the background now.
+#[cfg(test)]
+pub fn chain_check_running() -> bool {
+    CHAIN.lock().unwrap().1
 }
 
+/// Start the first chain check when the server starts, so the first page view is not `pending`,
+/// and read today's page once, so the first person to open it after a restart does not wait
+/// for the disk (about 0.7 s of cold reads at 720,000 records a day).
+pub fn warm(store: &Store, tz: chrono_tz::Tz) {
+    chain_status(store, Utc::now().timestamp_millis());
+    let store = store.reader();
+    std::thread::spawn(move || {
+        let t0 = std::time::Instant::now();
+        match changemap(&store, tz, &Params::default(), Utc::now().timestamp_millis()) {
+            Ok(_) => tracing::info!(ms = t0.elapsed().as_millis() as u64, "change map warmed"),
+            Err(e) => tracing::warn!(error = %e, "warming the change map failed"),
+        }
+    });
+}
+
+/// The page's query over the records it could list, answered from the `events_shown` index
+/// alone (see `shown.rs`). Same columns as the day scan; the User-Agent and the hash are not
+/// in the index and not needed for the list (the selected object's detail is read separately).
+fn only_filter_sql() -> String {
+    format!(
+        "AND e.cluster = ?4 AND ((e.resource = ?5 AND e.namespace = ?6 AND e.name = ?7)
+              OR (?5 = 'namespaces' AND ?6 = '' AND e.verb = 'deletecollection' AND e.actor = '{NAMESPACE_CONTROLLER}' AND e.namespace = ?7))"
+    )
+}
+
+pub fn shown_query() -> String {
+    format!(
+        "SELECT e.cluster, e.ts_ms, e.actor, e.human, e.via, e.verb, e.api_group, e.resource, e.subresource, e.namespace, e.name,
+                '', e.user_id, e.source, 0,
+                (SELECT CASE WHEN max(a.severity='high') THEN 'high' WHEN max(a.severity='medium') THEN 'medium' END FROM alerts a WHERE a.event_id=e.id)
+         FROM events e INDEXED BY {} WHERE e.ts_ms >= ?1 AND e.ts_ms < ?2 AND e.id <= ?3 AND {} AND {}",
+        crate::shown::NAME,
+        crate::store::SHOWN_PUB,
+        crate::shown::PREDICATE
+    )
+}
+
+/// Page views being built now, per server and view. People who open the same view at the same
+/// moment share one build instead of queueing for the database one after another (five at
+/// once took about 0.9 s each without this, at 720,000 records a day). A view asked for after
+/// the build finished is built again, so a reload always sees new records.
+type PageSlot = std::sync::Arc<Mutex<Option<(std::time::Instant, Value)>>>;
+static PAGES: Mutex<Option<HashMap<String, PageSlot>>> = Mutex::new(None);
+
 /// One page view. `AL_DATA_NOTE`, when set, is shown as a note on the page (v0.1, point 5).
+/// Work that changes what the page shows while it runs is listed in `meta.progress` (v0.2).
 pub fn changemap(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64) -> anyhow::Result<Value> {
+    let arrived = std::time::Instant::now();
+    let key = format!("{:p}|{p:?}", std::sync::Arc::as_ptr(&store.conn));
+    let slot = {
+        let mut g = PAGES.lock().unwrap();
+        let m = g.get_or_insert_with(HashMap::new);
+        // Slots nobody holds or waits for any more are dropped.
+        m.retain(|_, s| std::sync::Arc::strong_count(s) > 1);
+        m.entry(key).or_default().clone()
+    };
+    // Someone building the same view now is waited for; what they finish after this request
+    // arrived is shared.
+    let mut built = slot.lock().unwrap();
+    if let Some((finished, v)) = built.as_ref()
+        && *finished >= arrived
+    {
+        return Ok(v.clone());
+    }
+    let v = changemap_fresh(store, tz, p, now_ms)?;
+    *built = Some((std::time::Instant::now(), v.clone()));
+    Ok(v)
+}
+
+/// One page view built now, not shared with anyone.
+pub fn changemap_fresh(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64) -> anyhow::Result<Value> {
     let note = std::env::var("AL_DATA_NOTE").ok().filter(|n| !n.is_empty());
-    build(store, tz, p, now_ms, None, note.as_deref())
+    let mut v = build(store, tz, p, now_ms, None, note.as_deref(), true)?;
+    // The selected object's detail comes from its own records (with their hash state), the same
+    // way a click on a row gets it.
+    if let Some(key) = v["detail"]["key"].as_str().map(str::to_string) {
+        v["detail"] = detail(store, tz, &Params { key: Some(key), ..p.clone() }, now_ms)?;
+    }
+    let mut progress = Vec::new();
+    if let Some(since) = crate::shown::building_since() {
+        progress.push(json!({"what": "index", "startedMs": since, "done": null, "total": null}));
+    }
+    if let Some(j) = store.job.lock().unwrap().as_ref().filter(|j| j.state == "running") {
+        progress.push(json!({"what": "recompute", "startedMs": j.started_ms, "done": j.done, "total": j.total}));
+    }
+    if !progress.is_empty() {
+        if !v["meta"].is_object() {
+            v["meta"] = json!({});
+        }
+        v["meta"]["progress"] = json!(progress);
+    }
+    Ok(v)
+}
+
+/// The same page read the slow way (every record of the day), to check the index against.
+#[cfg(test)]
+pub fn changemap_by_scan(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64) -> anyhow::Result<Value> {
+    build(store, tz, p, now_ms, None, None, false)
 }
 
 /// The detail of one object (v0.1, point 4): what a click on a row needs, without working out
 /// the whole page again. `Null` when the object has nothing that day.
 pub fn detail(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64) -> anyhow::Result<Value> {
     let key = p.key.as_deref().and_then(parse_key).ok_or_else(|| anyhow::anyhow!("key: expected cluster/apiGroup/resource/namespace/name"))?;
-    let v = build(store, tz, p, now_ms, Some(&key), None)?;
+    let v = build(store, tz, p, now_ms, Some(&key), None, false)?;
     Ok(v.get("detail").cloned().unwrap_or(Value::Null))
 }
 
-fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option<&ObjKey>, note: Option<&str>) -> anyhow::Result<Value> {
+fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option<&ObjKey>, note: Option<&str>, use_index: bool) -> anyhow::Result<Value> {
     let day = match p.day.as_deref().filter(|d| !d.is_empty()) {
         Some(d) => NaiveDate::parse_from_str(d, "%Y-%m-%d").map_err(|e| anyhow::anyhow!("day: {e}"))?,
         None => Utc::now().with_timezone(&tz).date_naive(),
@@ -297,10 +424,15 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     };
     let principals: HashMap<String, String> =
         c.prepare("SELECT user_id, principal_ids FROM users")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
-    let idents: HashMap<(String, String), (&'static str, String)> = c
+    // By name, then Rancher user ID, so a row can be looked up without copying its strings.
+    let mut idents: HashMap<String, HashMap<String, (&'static str, String)>> = HashMap::new();
+    for row in c
         .prepare("SELECT actor, user_id, class, reason FROM identities")?
-        .query_map([], |r| Ok(((r.get(0)?, r.get(1)?), (crate::identity::class_name(&r.get::<_, String>(2)?), r.get(3)?))))?
-        .collect::<Result<_, _>>()?;
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, crate::identity::class_name(&r.get::<_, String>(2)?), r.get::<_, String>(3)?)))?
+    {
+        let (actor, uid, class, reason) = row?;
+        idents.entry(actor).or_default().insert(uid, (class, reason));
+    }
     // Which collectors each cluster runs decides why a change has no author.
     let mut collectors: HashMap<String, HashSet<String>> = HashMap::new();
     for row in c.prepare("SELECT cluster, collector FROM heartbeats")?.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
@@ -328,7 +460,14 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     let mut hidden_ui = 0i64;
     let mut hidden_request = 0i64;
     let mut objs: HashMap<String, Obj> = HashMap::new();
+    // Every record of the day goes to the timeline; only those in the picked range make objects.
+    let (range_from, range_to) = (p.from.unwrap_or(i64::MIN), p.to.unwrap_or(i64::MAX));
+    let in_range = |t: i64| t >= range_from && t < range_to;
     let add = |op: Op, api_group: &str, objs: &mut HashMap<String, Obj>, ops: &mut Vec<Op>| {
+        if !in_range(op.t) {
+            ops.push(op);
+            return;
+        }
         let o = objs.entry(op.key.clone()).or_insert_with(|| Obj {
             key: op.key.clone(),
             kind: kinds.get(&(op.cluster.clone(), api_group.to_string(), op.resource.clone())).cloned().unwrap_or_else(|| kind_from_resource(&op.resource)),
@@ -344,55 +483,71 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         ops.push(op);
     };
 
-    let mut st = c.prepare(&format!(
+    let indexed = use_index && only.is_none() && crate::shown::ready(&c);
+    let scan_sql = format!(
         "SELECT e.cluster, e.ts_ms, e.actor, e.human, e.via, e.verb, e.api_group, e.resource, e.subresource, e.namespace, e.name,
                 e.user_agent, e.user_id, e.source, e.hash IS NOT NULL,
                 (SELECT CASE WHEN max(a.severity='high') THEN 'high' WHEN max(a.severity='medium') THEN 'medium' END FROM alerts a WHERE a.event_id=e.id)
          FROM events e WHERE e.ts_ms >= ?1 AND e.ts_ms < ?2 AND e.id <= ?3 AND {} {}",
         crate::store::SHOWN_PUB,
-        if only.is_some() { "AND e.cluster = ?4 AND e.resource = ?5 AND e.namespace = ?6 AND e.name = ?7" } else { "" }
-    ))?;
+        // A namespace's own detail also reads the records that emptied it.
+        if only.is_some() {
+            only_filter_sql()
+        } else {
+            String::new()
+        }
+    );
+    // INDEXED BY makes SQLite refuse the query rather than quietly read the whole table; if it
+    // ever does, the page still works the slow way.
+    let mut st = match indexed.then(|| c.prepare(&shown_query())) {
+        Some(Ok(st)) => st,
+        Some(Err(e)) => {
+            tracing::warn!(error = %e, "change map index not usable; reading the whole day");
+            c.prepare(&scan_sql)?
+        }
+        None => c.prepare(&scan_sql)?,
+    };
     let only_name = |k: &ObjKey| if k.name == BATCH { String::new() } else { k.name.clone() };
     let mut rows = match only {
         Some(k) => st.query(params![start, end, ev_max, k.cluster, k.resource, k.namespace, only_name(k)])?,
         None => st.query(params![start, end, ev_max])?,
     };
+    // Rows are looked at through borrowed text first; only rows the page keeps are copied
+    // (most of a busy day's writes are system components the default view leaves out).
+    let text = |r: &rusqlite::Row<'_>, i: usize| -> rusqlite::Result<String> { Ok(r.get_ref(i)?.as_str().unwrap_or_default().to_string()) };
     while let Some(r) = rows.next()? {
-        let cluster: String = r.get(0)?;
-        if !clusters.is_empty() && !clusters.contains(cluster.as_str()) {
+        let s = |i: usize| -> rusqlite::Result<&str> { Ok(r.get_ref(i)?.as_str().unwrap_or_default()) };
+        if !clusters.is_empty() && !clusters.contains(s(0)?) {
             continue;
         }
-        let (verb, sub, source): (String, String, String) = (r.get(5)?, r.get(8)?, r.get(13)?);
         let severity: Option<String> = r.get(15)?;
-        if !is_write(&source, &verb, &sub) && severity.is_none() {
+        if !is_write(s(13)?, s(5)?, s(8)?) && severity.is_none() {
             continue;
         }
-        let (namespace, mut name, resource, api_group): (String, String, String, String) = (r.get(9)?, r.get(10)?, r.get(7)?, r.get(6)?);
-        if ns_filter.is_some_and(|n| n != namespace) || only.is_some_and(|k| k.api_group != api_group) {
+        // Emptying a deleted namespace is listed with the namespace (cluster-scoped, core group).
+        let cascade = s(5)? == "deletecollection" && s(2)? == NAMESPACE_CONTROLLER && !s(9)?.is_empty();
+        let group_ref = if cascade { "" } else { s(6)? };
+        if ns_filter.is_some_and(|n| n != s(9).unwrap_or_default()) || only.is_some_and(|k| k.api_group != group_ref) {
             continue;
         }
         // A write without a name is a deletecollection or a create the server named. It is
         // listed as one batch row per resource and namespace; requests that leave no object
         // behind are only counted (v0.1, point 1).
-        if name.is_empty() {
-            if REQUEST_ONLY.contains(&resource.as_str()) {
-                hidden_request += 1;
-                continue;
-            }
-            name = BATCH.to_string();
+        let raw_name = s(10)?;
+        if request_only(s(7)?, s(5)?, raw_name) {
+            hidden_request += 1;
+            continue;
         }
-        let (actor, human, ua, uid): (String, bool, String, String) = (r.get(2)?, r.get::<_, i64>(3)? == 1, r.get(11)?, r.get(12)?);
+        let name_ref = if raw_name.is_empty() { BATCH } else { raw_name };
+        let (actor_ref, uid_ref) = (s(2)?, s(12)?);
         // The identity table decides the class (whitelist included); records stored without
         // going through ingest (tests) fall back to the built-in rules.
-        let (category, note) = match idents.get(&(actor.clone(), uid.clone())) {
-            Some((c, n)) => (*c, n.clone()),
-            None => {
-                let (c, n) = crate::identity::builtin(&actor, human, &ua, principals.get(&uid).map(String::as_str));
-                (c, n.to_string())
-            }
+        let (category, reason): (&'static str, &str) = match idents.get(actor_ref).and_then(|m| m.get(uid_ref)) {
+            Some((c, n)) => (*c, n.as_str()),
+            None => crate::identity::builtin(actor_ref, r.get::<_, i64>(3)? == 1, s(11)?, principals.get(uid_ref).map(String::as_str)),
         };
         if !with_system {
-            if ui_maintenance(&resource, &name) {
+            if ui_maintenance(s(7)?, name_ref) {
                 hidden_ui += 1;
                 continue;
             }
@@ -401,12 +556,19 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
                 continue;
             }
         }
+        let (note, note_code) = (crate::identity::reason_text(reason).to_string(), crate::identity::reason_code(reason));
+        let (cluster, actor, verb, sub) = (text(r, 0)?, text(r, 2)?, text(r, 5)?, text(r, 8)?);
+        let (namespace, name, resource, api_group, cascade) = if cascade {
+            (String::new(), text(r, 9)?, "namespaces".to_string(), String::new(), Some(text(r, 7)?))
+        } else {
+            (text(r, 9)?, name_ref.to_string(), text(r, 7)?, text(r, 6)?, None)
+        };
         let key = format!("{cluster}/{api_group}/{resource}/{namespace}/{name}");
         // Shown as the subresource for entering a container (exec, attach, port-forward) whatever
         // the verb: current kubectl opens these over a websocket with GET, older ones with POST
         // (create). Other subresources keep the old rule: only a create is named after them.
         let verb = if matches!(sub.as_str(), "exec" | "attach" | "portforward") || (!sub.is_empty() && verb == "create") { sub.clone() } else { verb };
-        let op = Op { t: r.get(1)?, cluster, key, resource, namespace, name, actor, category, note, via: r.get(4)?, verb, severity, unattributed: false, hashed: r.get(14)? };
+        let op = Op { t: r.get(1)?, cluster, key, resource, namespace, name, actor, category, note, note_code, via: r.get(4)?, verb, cascade, severity, unattributed: false, hashed: r.get(14)? };
         add(op, &api_group, &mut objs, &mut ops);
     }
     drop(rows);
@@ -434,18 +596,21 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         }
         let key = format!("{cluster}/{api_group}/{resource}/{namespace}/{name}");
         let op = Op {
-            t: r.get(1)?, cluster, key, resource, namespace, name, actor: String::new(), category: "unknown", note: "找不到執行者".into(),
-            via: "unknown".into(), verb: r.get(6)?, severity: None, unattributed: true, hashed: false,
+            t: r.get(1)?, cluster, key, resource, namespace, name, actor: String::new(), category: "unknown", note: "找不到執行者".into(), note_code: Some("no-actor"),
+            via: "unknown".into(), verb: r.get(6)?, cascade: None, severity: None, unattributed: true, hashed: false,
         };
         add(op, &api_group, &mut objs, &mut ops);
     }
     drop(rows);
     drop(st);
 
-    // Collection gaps overlapping the day.
-    let mut gaps: Vec<(String, i64, i64, String)> = Vec::new();
-    let mut st = c.prepare("SELECT cluster, from_ms, to_ms, collector FROM gaps WHERE to_ms >= ?1 AND from_ms < ?2 ORDER BY from_ms")?;
-    for row in st.query_map(params![start, end], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get::<_, String>(3)?)))? {
+    // Collection gaps overlapping the day, from both sources (spec section 5): an empty reason is
+    // a silence the server noticed (no heartbeat); any other reason was reported by the
+    // collector (restart, file removed or replaced, state lost). Where collection started is a
+    // marker, not a gap.
+    let mut gaps: Vec<(String, i64, i64, String, String)> = Vec::new();
+    let mut st = c.prepare("SELECT cluster, from_ms, to_ms, collector, reason FROM gaps WHERE to_ms >= ?1 AND from_ms < ?2 AND reason <> ?3 ORDER BY from_ms")?;
+    for row in st.query_map(params![start, end, crate::store::START], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?)))? {
         let g = row?;
         if clusters.is_empty() || clusters.contains(g.0.as_str()) {
             gaps.push(g);
@@ -453,28 +618,28 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     }
     drop(st);
 
-    let unclear_reason = |cluster: &str| -> String {
+    let unclear_reason = |cluster: &str| -> (&'static str, String) {
         let cols = collectors.get(cluster);
         if cols.is_some_and(|c| !c.contains("file")) {
-            "這座叢集沒有收 apiserver audit log：只看得到物件變了，看不到是誰改的".into()
+            ("no-apiserver-audit", "這座叢集沒有收 apiserver audit log：只看得到物件變了，看不到是誰改的".into())
         } else {
-            "收集中斷後重新連線比對物件版本才發現的變更，找不到對應的 audit 紀錄".into()
+            ("found-on-reconnect", "收集中斷後重新連線比對物件版本才發現的變更，找不到對應的 audit 紀錄".into())
         }
     };
-    let in_gap = |cluster: &str, t: i64| gaps.iter().any(|(cl, f, to, _)| cl == cluster && t >= f - SLOT_GRACE_MS && t <= to + SLOT_GRACE_MS);
+    let in_gap = |cluster: &str, t: i64| gaps.iter().any(|(cl, f, to, _, _)| cl == cluster && t >= f - SLOT_GRACE_MS && t <= to + SLOT_GRACE_MS);
 
     for o in objs.values_mut() {
         let sev = o.ops.iter().filter_map(|i| ops[*i].severity.clone()).min_by_key(|s| if s == "high" { 0 } else { 1 });
         if let Some(s) = sev {
             o.state = "look";
-            o.reason = if s == "high" { "當天有高風險警示".into() } else { "當天有中風險警示".into() };
+            (o.reason_code, o.reason) = if s == "high" { ("alert-high", "當天有高風險警示".into()) } else { ("alert-medium", "當天有中風險警示".into()) };
             o.severity = Some(s);
         } else if o.ops.iter().any(|i| ops[*i].unattributed) {
             o.state = "unclear";
-            o.reason = unclear_reason(&o.cluster);
+            (o.reason_code, o.reason) = unclear_reason(&o.cluster);
         } else if o.ops.iter().any(|i| in_gap(&o.cluster, ops[*i].t)) {
             o.state = "blind";
-            o.reason = "有紀錄落在收集中斷前後 10 分鐘內，可能不完整".into();
+            (o.reason_code, o.reason) = ("near-gap", "有紀錄落在收集中斷前後 10 分鐘內，可能不完整".into());
         } else {
             o.state = "clear";
         }
@@ -503,8 +668,9 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         let ops_json: Vec<Value> = list
             .iter()
             .take(DETAIL_OPS)
-            .map(|op| json!({"t": op.t, "who": op.actor, "category": op.category, "note": op.note, "verb": op.verb, "via": op.via,
-                             "raw": {"verb": op.verb, "resource": op.resource, "user": op.actor}}))
+            .map(|op| json!({"t": op.t, "who": op.actor, "category": op.category, "note": op.note, "noteCode": op.note_code, "verb": op.verb, "via": op.via,
+                             "cascade": op.cascade,
+                             "raw": {"verb": op.verb, "resource": op.cascade.as_deref().unwrap_or(&op.resource), "user": op.actor}}))
             .collect();
         // Objects this one refers to (v0.1, point 3); kept apart from the settings below.
         let mut st = c.prepare_cached(
@@ -520,6 +686,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         let mut depends: Vec<Value> = Vec::new();
         if o.kind == "Pod" && list.iter().any(|op| matches!(op.verb.as_str(), "exec" | "attach")) {
             depends.push(json!({
+                "code": "suse-security",
                 "setting": "是否啟用 SUSE Security 收集",
                 "text": "容器裡輸入的指令不在 audit log。有啟用時，這裡會列出 SUSE Security 判定違規的程序。",
             }));
@@ -536,7 +703,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
             _ => "pending",
         };
         Ok(json!({
-            "key": o.key, "batch": o.name == BATCH, "state": o.state, "severity": o.severity, "stateReason": o.reason,
+            "key": o.key, "batch": o.name == BATCH, "state": o.state, "severity": o.severity, "stateReason": o.reason, "stateReasonCode": o.reason_code,
             "strip": ticks(o), "ops": ops_json, "dependsOn": depends, "related": related, "hasVersions": has_versions, "hashChain": hash,
         }))
     };
@@ -547,7 +714,8 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
 
     let mut list: Vec<&Obj> = objs.values().collect();
     list.sort_by(|a, b| rank(a.state).cmp(&rank(b.state)).then(b.last.cmp(&a.last)).then(a.key.cmp(&b.key)));
-    let mut counts = json!({"objects": list.len(), "ops": ops.len(), "look": 0, "unclear": 0, "blind": 0, "clear": 0});
+    let in_range_ops: usize = list.iter().map(|o| o.ops.len()).sum();
+    let mut counts = json!({"objects": list.len(), "ops": in_range_ops, "look": 0, "unclear": 0, "blind": 0, "clear": 0});
     for o in &list {
         counts[o.state] = json!(counts[o.state].as_i64().unwrap_or(0) + 1);
     }
@@ -570,9 +738,8 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     let mut lines = Vec::new();
     for lk in &line_keys {
         let mut slots: Vec<(usize, i64, i64)> = vec![(9, 0, 0); n_slots]; // (rank, ops, alerts); 9 = none
-        for o in objs.values().filter(|o| lk.as_ref().is_none_or(|c| *c == o.cluster)) {
-            for i in &o.ops {
-                let op = &ops[*i];
+        {
+            for op in ops.iter().filter(|op| lk.as_ref().is_none_or(|c| *c == op.cluster)) {
                 let s = ((op.t - start) / slot_ms) as usize;
                 if s >= n_slots {
                     continue;
@@ -588,7 +755,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
             .enumerate()
             .map(|(i, (r, n, a))| {
                 let t = start + i as i64 * slot_ms;
-                let gap = gaps.iter().any(|(cl, f, to, _)| lk.as_ref().is_none_or(|c| c == cl) && *f < t + slot_ms && *to > t);
+                let gap = gaps.iter().any(|(cl, f, to, _, _)| lk.as_ref().is_none_or(|c| c == cl) && *f < t + slot_ms && *to > t);
                 let state = match r {
                     0 => "look",
                     1 => "unclear",
@@ -606,11 +773,20 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     }
     let gaps_json: Vec<Value> = gaps
         .iter()
-        .map(|(cl, f, t, col)| json!({"cluster": cl, "fromMs": f, "toMs": t, "kind": "heartbeat", "reason": format!("收集元件 {col} 沒有回報")}))
+        .map(|(cl, f, t, col, why)| {
+            if why.is_empty() {
+                json!({"cluster": cl, "fromMs": f, "toMs": t, "kind": "heartbeat", "collector": col, "reasonCode": "collector-silent", "reason": format!("收集元件 {col} 沒有回報")})
+            } else {
+                json!({"cluster": cl, "fromMs": f, "toMs": t, "kind": "reported", "collector": col, "cause": why, "reasonCode": "collector-reported",
+                       "reason": format!("收集元件 {col} 回報這段沒有收集（{why}）")})
+            }
+        })
         .collect();
 
     // Prefer the latest op with a known author; fall back to the latest unattributed change.
-    let latest_op = |o: &Obj| -> &Op { o.ops.iter().map(|i| &ops[*i]).max_by_key(|op| (!op.unattributed, op.t)).unwrap() };
+    // Who the row names: the latest attributed record, and for a namespace whoever deleted it
+    // rather than the controller that emptied it afterwards.
+    let latest_op = |o: &Obj| -> &Op { o.ops.iter().map(|i| &ops[*i]).max_by_key(|op| (!op.unattributed, op.cascade.is_none(), op.t)).unwrap() };
 
     let mut resp = json!({
         "day": day.format("%Y-%m-%d").to_string(),
@@ -644,9 +820,9 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
                 let l = latest_op(o);
                 json!({
                     "key": o.key, "kind": o.kind, "name": o.name, "namespace": o.namespace, "cluster": o.cluster, "batch": o.name == BATCH,
-                    "state": o.state, "severity": o.severity, "stateReason": o.reason,
+                    "state": o.state, "severity": o.severity, "stateReason": o.reason, "stateReasonCode": o.reason_code,
                     "ops": o.ops.len(), "lastMs": o.last, "ticks": ticks(o),
-                    "who": {"name": l.actor, "category": l.category, "note": l.note},
+                    "who": {"name": l.actor, "category": l.category, "note": l.note, "noteCode": l.note_code},
                     "via": l.via,
                 })
             })
@@ -663,7 +839,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         for o in &shown {
             for i in &o.ops {
                 let op = &ops[*i];
-                let id = if op.actor.is_empty() { "(找不到執行者)".to_string() } else { op.actor.clone() };
+                let id = if op.actor.is_empty() { NO_ACTOR.to_string() } else { op.actor.clone() };
                 let e = idents.entry(id.clone()).or_insert((op.category, 0));
                 e.1 += 1;
                 let bypass = op.via == "direct" && matches!(op.category, "human" | "unknown");
@@ -679,7 +855,8 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         for (id, (cat, _)) in &idents {
             let nid = ident_node(id);
             let label = if group { format!("{cat}（群組）") } else { id.clone() };
-            nodes.entry(nid.clone()).or_insert(json!({"id": nid, "type": "identity", "label": label, "category": cat}));
+            // `group` and `noActor` let the page word these labels in its own language (v0.2).
+            nodes.entry(nid.clone()).or_insert(json!({"id": nid, "type": "identity", "label": label, "category": cat, "group": group, "noActor": !group && id == NO_ACTOR}));
         }
         let mut edges: BTreeMap<(String, String), (i64, bool)> = BTreeMap::new();
         for ((id, via), (n, b)) in &e_iv {
@@ -697,7 +874,10 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         // Objects only for the ones worth a look, so the graph stays readable.
         let state_of: HashMap<&str, &Obj> = shown.iter().map(|o| (o.key.as_str(), *o)).collect();
         let mut obj_edges: Vec<_> = e_co.iter().filter(|((_, k), _)| state_of[k.as_str()].state != "clear").collect();
-        obj_edges.sort_by(|a, b| rank(state_of[a.0.1.as_str()].state).cmp(&rank(state_of[b.0.1.as_str()].state)).then(b.1.cmp(a.1)));
+        // Ties go by object key, so the same data always draws the same 50 objects.
+        obj_edges.sort_by(|a, b| {
+            rank(state_of[a.0.1.as_str()].state).cmp(&rank(state_of[b.0.1.as_str()].state)).then(b.1.cmp(a.1)).then(a.0.cmp(b.0))
+        });
         for ((cl, k), n) in obj_edges.into_iter().take(50) {
             let o = state_of[k.as_str()];
             let oid = format!("object:{k}");
@@ -715,15 +895,30 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         for o in &shown {
             let first = |pred: &dyn Fn(&Op) -> bool| o.ops.iter().map(|i| &ops[*i]).filter(|op| pred(op)).map(|op| op.t).min();
             if let Some(t) = first(&|op| op.severity.is_some()) {
-                evs.push(json!({"t": t, "subject": o.key, "from": "clear", "to": "look", "reason": "第一次出現中、高風險警示（近似：v0 以此代替物件狀態轉變）", "source": "state"}));
+                evs.push(json!({"t": t, "subject": o.key, "from": "clear", "to": "look", "reasonCode": "first-alert", "reason": "當天第一次出現中、高風險警示", "source": "state"}));
             }
             if let Some(t) = first(&|op| op.unattributed) {
-                evs.push(json!({"t": t, "subject": o.key, "from": "clear", "to": "unclear", "reason": "第一次出現找不到執行者的變更（近似：v0 以此代替物件狀態轉變）", "source": "state"}));
+                evs.push(json!({"t": t, "subject": o.key, "from": "clear", "to": "unclear", "reasonCode": "first-unattributed", "reason": "當天第一次出現找不到執行者的變更", "source": "state"}));
             }
         }
-        for (cl, f, t, col) in &gaps {
-            evs.push(json!({"t": f, "subject": cl, "from": "ok", "to": "blind", "reason": format!("收集元件 {col} 停止回報"), "source": "heartbeat"}));
-            evs.push(json!({"t": t, "subject": cl, "from": "blind", "to": "ok", "reason": format!("收集元件 {col} 恢復回報"), "source": "heartbeat"}));
+        for (cl, f, t, col, why) in &gaps {
+            let (stop, resume) = if why.is_empty() {
+                (json!({"reasonCode": "collector-stopped", "reason": format!("收集元件 {col} 停止回報"), "source": "heartbeat"}),
+                 json!({"reasonCode": "collector-resumed", "reason": format!("收集元件 {col} 恢復回報"), "source": "heartbeat"}))
+            } else {
+                (json!({"reasonCode": "reported-gap-start", "reason": format!("收集元件 {col} 回報從這裡開始沒有收集（{why}）"), "source": "reported", "cause": why}),
+                 json!({"reasonCode": "reported-gap-end", "reason": format!("收集元件 {col} 回報的缺口到這裡為止"), "source": "reported", "cause": why}))
+            };
+            for (at, from, to, mut e) in [(*f, "ok", "blind", stop), (*t, "blind", "ok", resume)] {
+                if in_range(at) {
+                    e["t"] = json!(at);
+                    e["subject"] = json!(cl);
+                    e["from"] = json!(from);
+                    e["to"] = json!(to);
+                    e["collector"] = json!(col);
+                    evs.push(e);
+                }
+            }
         }
         evs.sort_by_key(|e| std::cmp::Reverse(e["t"].as_i64().unwrap_or(0)));
         evs.truncate(EVENTS);
@@ -850,6 +1045,109 @@ mod tests {
         let q = parse_query("day=2026-10-20&cluster=a&cluster=b&select=c%2F%2Fpods%2Fns%2Fx&tab=events");
         assert_eq!(q.cluster, vec!["a", "b"]);
         assert_eq!(q.select.as_deref(), Some("c//pods/ns/x"));
+    }
+
+    /// v0.2: a range picked on the timeline narrows the list, counts and events to it; the
+    /// timeline itself still shows the whole day.
+    #[test]
+    fn a_range_narrows_the_page_but_not_the_timeline() {
+        let s = store();
+        {
+            let c = s.conn.lock().unwrap();
+            ev(&c, 1, "c1", T, "alice", 1, "rancher", "patch", "configmaps", "app", "morning");
+            ev(&c, 2, "c1", T + 3 * 3_600_000, "alice", 1, "rancher", "patch", "configmaps", "app", "afternoon");
+            ev(&c, 3, "c1", T + 3 * 3_600_000 + 60_000, "alice", 1, "rancher", "patch", "configmaps", "app", "afternoon");
+        }
+        let all = Params { day: Some("2026-10-20".into()), ..Default::default() };
+        let v = changemap(&s, chrono_tz::Asia::Taipei, &all, T).unwrap();
+        assert_eq!((v["counts"]["objects"].as_i64(), v["counts"]["ops"].as_i64()), (Some(2), Some(3)));
+        let p = Params { from: Some(T + 2 * 3_600_000), to: Some(T + 4 * 3_600_000), ..all.clone() };
+        let r = changemap(&s, chrono_tz::Asia::Taipei, &p, T).unwrap();
+        assert_eq!((r["counts"]["objects"].as_i64(), r["counts"]["ops"].as_i64()), (Some(1), Some(2)));
+        assert_eq!(r["rows"][0]["name"], "afternoon");
+        assert_eq!(r["timeline"], v["timeline"], "the timeline is the whole day either way");
+        assert_eq!(parse_query("day=2026-10-20&from=5&to=9").from, Some(5));
+    }
+
+    /// Spec section 5: a gap the collector reported and a silence the server noticed are both
+    /// shown, kept apart; where collection started is a marker, not a gap.
+    #[test]
+    fn reported_gaps_and_silences_are_both_shown() {
+        let s = store();
+        {
+            let c = s.conn.lock().unwrap();
+            ev(&c, 1, "c1", T, "alice", 1, "rancher", "patch", "configmaps", "app", "cfg");
+            let gap = |f: i64, t: i64, why: &str| {
+                c.execute("INSERT INTO gaps (cluster, collector, instance, from_ms, to_ms, reason) VALUES ('c1', 'file', 'n', ?1, ?2, ?3)", params![f, t, why]).unwrap();
+            };
+            gap(T + 3_600_000, T + 3_700_000, "");
+            gap(T + 7_200_000, T + 7_300_000, "collector-restart");
+            gap(T - 3_600_000, T - 3_000_000, crate::store::START);
+        }
+        let p = Params { day: Some("2026-10-20".into()), tab: Some("events".into()), ..Default::default() };
+        let v = changemap(&s, chrono_tz::Asia::Taipei, &p, T).unwrap();
+        let gaps = v["timeline"]["gaps"].as_array().unwrap();
+        assert_eq!(gaps.len(), 2, "the start marker is not a gap: {gaps:?}");
+        assert_eq!((gaps[0]["kind"].as_str(), gaps[0]["reasonCode"].as_str()), (Some("heartbeat"), Some("collector-silent")));
+        assert_eq!((gaps[1]["kind"].as_str(), gaps[1]["cause"].as_str()), (Some("reported"), Some("collector-restart")));
+        let evs = v["events"].as_array().unwrap();
+        let sources: Vec<(&str, &str)> = evs.iter().filter(|e| e["source"] != "state").map(|e| (e["source"].as_str().unwrap(), e["reasonCode"].as_str().unwrap())).collect();
+        assert_eq!(sources, [("reported", "reported-gap-end"), ("reported", "reported-gap-start"), ("heartbeat", "collector-resumed"), ("heartbeat", "collector-stopped")]);
+        assert!(evs.iter().filter(|e| e["source"] == "reported").all(|e| e["cause"] == "collector-restart" && e["collector"] == "file"));
+        // The slot before the start marker is not blind.
+        let slots = v["timeline"]["lines"][0]["slots"].as_array().unwrap();
+        let before = slots.iter().find(|x| x["t"].as_i64() == Some(T - 3_600_000)).unwrap();
+        assert_ne!(before["state"], "blind", "{before}");
+    }
+
+    /// Rancher's "who am I" request, user search and logout are requests, not changes: only
+    /// counted, like token reviews.
+    #[test]
+    fn rancher_requests_are_only_counted() {
+        let s = store();
+        {
+            let c = s.conn.lock().unwrap();
+            ev(&c, 1, "c1", T, "alice", 1, "rancher", "create", "selfuser", "", "");
+            ev(&c, 2, "c1", T + 1000, "alice", 1, "rancher", "search", "principals", "", "");
+            ev(&c, 3, "c1", T + 2000, "alice", 1, "rancher", "logout", "tokens", "", "");
+            ev(&c, 4, "c1", T + 3000, "alice", 1, "rancher", "create", "logout", "", "");
+            ev(&c, 5, "c1", T + 4000, "alice", 1, "rancher", "patch", "configmaps", "app", "cfg");
+            c.execute("UPDATE events SET source='rancher' WHERE id < 5", []).unwrap();
+        }
+        let v = changemap(&s, chrono_tz::Asia::Taipei, &Params { day: Some("2026-10-20".into()), ..Default::default() }, T).unwrap();
+        assert_eq!(v["hidden"]["requestOnly"], 4, "{v}");
+        assert_eq!(v["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(v["rows"][0]["name"], "cfg");
+    }
+
+    /// Emptying a deleted namespace (one deletecollection per kind) is listed with the
+    /// namespace, not as a row per kind, and the namespace's detail shows it.
+    #[test]
+    fn emptying_a_namespace_is_one_row() {
+        let s = store();
+        {
+            let c = s.conn.lock().unwrap();
+            ev(&c, 1, "c1", T, "alice", 1, "direct", "delete", "namespaces", "", "gone");
+            for (i, res) in ["pods", "configmaps", "secrets", "roles"].iter().enumerate() {
+                ev(&c, 2 + i as i64, "c1", T + 5000 + i as i64, NAMESPACE_CONTROLLER, 0, "direct", "deletecollection", res, "gone", "");
+            }
+            // Someone else's deletecollection stays a batch row of its own.
+            ev(&c, 10, "c1", T + 9000, "alice", 1, "direct", "deletecollection", "pods", "app", "");
+        }
+        let p = Params { day: Some("2026-10-20".into()), system: Some("1".into()), ..Default::default() };
+        let v = changemap(&s, chrono_tz::Asia::Taipei, &p, T).unwrap();
+        let rows = v["rows"].as_array().unwrap();
+        let names: Vec<(&str, &str)> = rows.iter().map(|r| (r["kind"].as_str().unwrap(), r["name"].as_str().unwrap())).collect();
+        assert_eq!(rows.len(), 2, "{names:?}");
+        let ns = rows.iter().find(|r| r["kind"] == "Namespace").unwrap();
+        assert_eq!((ns["name"].as_str(), ns["ops"].as_i64()), (Some("gone"), Some(5)), "{ns}");
+        assert_eq!(ns["who"]["name"], "alice", "the row names who deleted it");
+        let d = detail(&s, chrono_tz::Asia::Taipei, &Params { key: Some(ns["key"].as_str().unwrap().into()), ..p.clone() }, T).unwrap();
+        let ops = d["ops"].as_array().unwrap();
+        assert_eq!(ops.len(), 5, "{d}");
+        assert!(ops.iter().any(|o| o["cascade"] == "secrets" && o["raw"]["resource"] == "secrets"));
+        // The same by reading every record of the day.
+        assert_eq!(v, changemap_by_scan(&s, chrono_tz::Asia::Taipei, &p, T).unwrap());
     }
 
     /// v0.1 point 2: records that arrive between two pages neither repeat rows nor push rows
@@ -993,9 +1291,9 @@ mod tests {
             ev(&c, 1, "c1", T, "alice", 1, "rancher", "patch", "configmaps", "app", "cfg");
         }
         let p = Params { day: Some("2026-10-20".into()), ..Default::default() };
-        let v = build(&s, chrono_tz::Asia::Taipei, &p, T, None, Some("原型")).unwrap();
+        let v = build(&s, chrono_tz::Asia::Taipei, &p, T, None, Some("原型"), true).unwrap();
         assert_eq!(v["meta"], json!({"dataNote": "原型", "dataUntilMs": T}));
-        let v = build(&s, chrono_tz::Asia::Taipei, &p, T, None, None).unwrap();
+        let v = build(&s, chrono_tz::Asia::Taipei, &p, T, None, None, true).unwrap();
         assert!(v.get("meta").is_none());
     }
 

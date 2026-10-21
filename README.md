@@ -3,8 +3,8 @@
 在 Rancher 裡回答「誰、在什麼時候、透過什麼管道、對哪個物件、改了什麼」。
 Answers *who changed what, when, and how* across Rancher-managed Kubernetes clusters, inside the Rancher UI.
 
-**狀態：M1、M2 的程式完成，尚未在真實叢集跑過。** 後端 72 個測試通過；收集元件以假的 Kubernetes／SUSE Security API 跑過完整流程；介面以示意資料在獨立頁面驗證過，還沒載入 Rancher。實機驗證見 [`docs/lab/m1-m2-lab-task.md`](docs/lab/m1-m2-lab-task.md)。
-**Status: M1 and M2 code complete, not yet run on a real cluster.** 72 backend tests pass; collectors were run end to end against fake Kubernetes and SUSE Security APIs; the UI was checked with demo data in a standalone page, not yet inside Rancher.
+**狀態：在 lab 實際運作中，還沒有正式版。** lab 是 Rancher 加一座 RKE2 下游叢集，收集元件、後端與介面都裝在 Rancher 裡實際使用。每個 PR 都會跑後端測試、Helm chart 檢查，以及每天約 71 萬筆資料的效能閘門。實機驗證的任務書與報告在 [`docs/lab/`](docs/lab/)。
+**Status: running in a lab, no stable release yet.** The lab is Rancher plus one downstream RKE2 cluster, with the collectors, backend and UI installed and in use inside Rancher. Every pull request runs the backend tests, Helm chart checks and a performance gate at about 710,000 records a day. Lab task books and reports are in [`docs/lab/`](docs/lab/).
 
 - 設計：[`docs/design.md`](docs/design.md)
 - 部署：[`docs/deploy.md`](docs/deploy.md)
@@ -55,6 +55,22 @@ Answers *who changed what, when, and how* across Rancher-managed Kubernetes clus
 | `docs/archive/m0/` | 試吃版的 webhook 做法與 lab 任務書，僅供參考 |
 
 UI extension 在另一個 repo：[yansheng133/audit-loupe-ui](https://github.com/yansheng133/audit-loupe-ui)，用 Rancher 官方的 extension workflow 發佈。
+
+## 儲存空間 / Storage
+
+**安裝前先估 PVC 大小，裝好之後不一定能放大。**後端用 SQLite 存在 PVC 上，預設 5Gi、保留 30 天（`server.persistence.size`、`server.retentionDays`）。
+
+- 每筆紀錄連同索引約 750 位元組（lab 實測）。估算：每天筆數 × 750 位元組 × (保留天數 ＋ 1) × 1.3。例如每天 71 萬筆保留 90 天，約 59 GiB；每天 6.4 萬筆保留 90 天，約 5.3 GiB，已經超過預設的 5Gi。
+- **取決於設定**：每天筆數取決於 apiserver audit policy、叢集與工作負載的數量，請用自己環境的量算。
+- PVC 建好之後要放大，StorageClass 必須支援擴充（`allowVolumeExpansion: true`）；不支援的話（例如 local-path），`helm upgrade` 改大 `server.persistence.size` 會失敗，一開始就要給夠。
+- 詳細做法見 [`docs/deploy.md`](docs/deploy.md) 3.1。
+
+**Size the PVC before installing; it may not grow later.** The backend keeps SQLite on a PVC, 5Gi and 30 days by default (`server.persistence.size`, `server.retentionDays`).
+
+- About 750 bytes per record including indexes (measured in the lab). Estimate: records per day × 750 bytes × (retention days + 1) × 1.3. For example, 710,000 records a day kept 90 days needs about 59 GiB; 64,000 a day kept 90 days needs about 5.3 GiB, already more than the 5Gi default.
+- **Depends on settings**: records per day depend on the apiserver audit policy and on how many clusters and workloads there are; use your own numbers.
+- Growing the PVC later needs a StorageClass with `allowVolumeExpansion: true`. Without it (local-path, for example), raising `server.persistence.size` makes `helm upgrade` fail, so give it enough from the start.
+- Details: [`docs/deploy.md`](docs/deploy.md) section 3.1.
 
 ## 發佈 / Release
 

@@ -667,6 +667,9 @@ impl Store {
         crate::rulestate::prepare(&conn)?;
         prepare_stats(&conn)?;
         crate::identity::prepare(&conn, &cfg.identities)?;
+        // Ingest waits briefly instead of failing while a background build holds the write lock.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        crate::shown::prepare(&conn, conn.path().map(str::to_string).filter(|p| !p.is_empty()))?;
         let store = Store { conn: Arc::new(Mutex::new(conn)), cfg, job: Arc::new(Mutex::new(None)) };
         store.register_settings(Utc::now().timestamp_millis())?;
         Ok(store)

@@ -113,3 +113,28 @@ v0 是原型：開頁時直接查現有資料表，**不做彙總表、不調效
 3. **`/api/changemap/detail` 的 404**：
    - 物件當天沒有紀錄時回 404，內容是 `{"error": "no-records"}`。
    - 沒有這個 JSON 內容的 404，代表後端沒有這支 API（舊版）。介面這時才改打整頁。
+
+## v0.2（2026-10-21 晚）：開頁速度與進度
+
+原有的參數、欄位與 cursor 意義都不變；讀索引和讀整天的結果逐欄位相同（`backend/src/shown.rs` 與 `perf.rs` 的測試會比對）。新增的欄位、參數與行為如下：
+
+1. **`meta.progress`**：有會改變畫面內容的工作正在進行時，回應帶 `meta.progress`，每一項是 `{"what": "index" | "recompute", "startedMs": <開始時間>, "done": <已完成或 null>, "total": <總量或 null>}`。
+   - `index`：升級後第一次啟動，正在建立開頁用的索引。這段期間開頁照舊可用，只是比較慢；`done`、`total` 為 null（SQLite 不回報建索引的進度）。
+   - `recompute`：規則或白名單改了之後的重新判斷；`done`、`total` 是筆數。
+   - 只有 `progress` 沒有 `dataNote` 時，`meta` 裡就沒有 `dataNote` 與 `dataUntilMs`。介面要分別判斷，不能假設 `meta` 一定有 `dataNote`。
+2. **事件分頁**：照 Sam 10/21 的決定，不另外存一張狀態轉變表，從當天的警示、找不到執行者的變化與缺口推出來。需求文件第 5 節 (5) 的「狀態轉變記成事件，直接讀」以此為準。
+3. **理由改成代碼**（介面依 Rancher 的語言自己說，不再中英混雜）。原本的中文文字欄位保留，給直接讀 API 的人：
+   - 物件：`stateReasonCode`：`alert-high`、`alert-medium`、`no-apiserver-audit`（**取決於設定**：這座叢集沒有收 apiserver audit log）、`found-on-reconnect`、`near-gap`；清楚的物件是空字串。
+   - 身分：`who.noteCode`、`detail.ops[].noteCode`：`sa-rancher`、`sa-kube-system`、`sa-workload`、`admin-cert`、`rancher-unauthenticated`、`no-actor`、`system-component`、`rancher-provisioning`、`rancher-local-user`、`unclassified`。白名單的理由是管理者自己寫的文字，`noteCode` 為 null，`note` 照原文顯示。
+   - `detail.dependsOn[].code`：`suse-security`。
+   - 缺口：`timeline.gaps[]` 加 `collector` 與 `reasonCode: "collector-silent"`。
+   - 事件：`reasonCode`：`first-alert`、`first-unattributed`、`collector-stopped`、`collector-resumed`（後兩者帶 `collector`）。
+   - 關係圖的身分節點加 `group`（多個身分合併成一類）與 `noActor`（找不到執行者）。
+4. **時間範圍**：`/api/changemap` 與 `/api/changemap/detail` 接受 `from`、`to`（毫秒，當天內）。總覽、件數、稽核狀態、關係、事件與細節只算範圍內的紀錄；時間列照樣是整天，讓人看得到範圍在一天裡的位置。不帶就是整天。
+5. **同時開同一個畫面**：server 算同一個畫面時，其他同時要同一個畫面的人等它算完、共用結果；算完之後才來的請求會重新算，所以重新整理一定看得到新紀錄。
+6. **列表少掉的兩種列**（第一層計畫 v2 的兩個顯示細節）：
+   - 只計入 `hidden.requestOnly`、不列成物件的請求，多了 Rancher 介面取得目前使用者的 `selfuser`、使用者與群組的搜尋（verb `search`）、登出（resource `logout` 或 verb `logout`）。
+   - 刪除 namespace 後，namespace controller 對每一種資源各送一次 `deletecollection`（實驗室一次約 110 筆）。這些紀錄併進那個 namespace 本身的列（`kind: Namespace`），不再各自成列；列上的「誰」是刪除 namespace 的人，不是 controller。細節的 `ops[]` 對這些紀錄多一個 `cascade`，值是被清空的資源（例如 `pods`），`raw.resource` 也是它；其他紀錄的 `cascade` 是 null。namespace controller 屬於系統元件，預設畫面本來就不顯示，帶 `system` 才看得到。
+7. **缺口分兩種來源**（介面規格第 5 節）：缺口表裡沒有原因的是 server 沒收到心跳，有原因的是收集元件自己回報的；「開始收集」的標記不是缺口，不再算進來。
+   - `timeline.gaps[]`：心跳中斷是 `kind: "heartbeat"`、`reasonCode: "collector-silent"`；收集元件回報的是 `kind: "reported"`、`reasonCode: "collector-reported"`，多一個 `cause`：`collector-restart`、`collector-state-lost`、`file-removed`、`file-replaced`。
+   - 事件：心跳中斷照舊是 `collector-stopped`、`collector-resumed`，`source: "heartbeat"`；收集元件回報的是 `reported-gap-start`、`reported-gap-end`，`source: "reported"`，帶 `collector` 與 `cause`。

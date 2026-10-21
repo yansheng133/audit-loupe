@@ -111,6 +111,21 @@ helm install audit-loupe deploy/chart -n audit-loupe-system -f values-local.yaml
 
 server 用 SQLite 存在 PVC 上，預設 5Gi、保留 30 天。RKE2 沒有內建 StorageClass，請先準備一個，或指定 `server.persistence.storageClass`。
 
+### 3.1 PVC 要多大
+
+每筆紀錄連同索引約 750 位元組（lab 資料實測：每筆 736 位元組，加上變更地圖的索引約 752 位元組）。過了保留期的紀錄刪除後，空間給新紀錄用，但檔案不會變小，所以以「保留天數加一天」估：
+
+PVC ≥ 每天筆數 × 750 位元組 × (保留天數 ＋ 1) × 1.3（預留給 WAL 與成長）
+
+| 每天筆數 | 30 天 | 90 天 |
+|---|---|---|
+| 約 6.4 萬（lab：2 座叢集） | 約 1.8 GiB | 約 5.3 GiB |
+| 約 71 萬（lab 的 11 倍，效能測試的量） | 約 20 GiB | 約 59 GiB |
+
+**取決於設定**：每天筆數取決於 apiserver audit policy 記哪些層級、叢集與工作負載的數量，請用自己環境的量重新算。server 已在跑的話，`GET /api/info` 的 `retentionDays` 是目前的保留天數，PVC 用量可以用 `kubectl exec` 看 `/data` 的大小。
+
+PVC 建好後要放大，StorageClass 必須支援擴充（`allowVolumeExpansion: true`）；不支援的話（例如 local-path），一開始就要給夠。
+
 ## 4. 安裝下游 RKE2 叢集（只裝收集元件）
 
 `values-downstream.yaml`：
@@ -275,3 +290,13 @@ helm uninstall audit-loupe -n audit-loupe-system
 ```
 
 PVC（`audit-loupe-data`）不會自動刪除，要保留稽核資料請先備份 `/data/audit-loupe.db`。下游叢集節點上的讀取位置記錄在 `/var/lib/audit-loupe`，可以手動刪除。刪掉後若 server 還留著這個節點的紀錄，收集元件會當成重新啟動，從現在開始讀，並把中間那段記成「沒有收集」（`collector-state-lost`）；要當成全新安裝，server 端也要一起移除。
+
+## 11. 升級注意事項
+
+### 從 0.4.0 升級
+
+- **第一次啟動會建立變更地圖用的索引。**紀錄在 20 萬筆以內時當場建，啟動多花幾秒；超過時在背景建，期間變更地圖照常可用，只是比較慢，畫面上方會註明「索引建立中」。建索引的時間：lab 的 83 萬筆實測約 1 秒；每天約 71 萬筆、保留 30 天（約 2,100 萬筆）依比例估約半分鐘，實際取決於磁碟速度。
+- **第一次啟動會從既有紀錄回填身分表**（每個名稱加 Rancher 使用者 ID 一筆），並依內建判斷分類。存下來的紀錄本身不改，雜湊鏈不受影響。
+- **介面要一起升級。**新介面接舊後端時，時間範圍只把範圍外的列調暗、件數不變，理由顯示後端原文；舊介面接新後端可以正常使用，只是看不到新欄位。
+- 設定白名單（`server.identities`）會改變設定代碼，「規則」頁會提示重新計算，見 9.1。
+- values 沒有必須改的項目。

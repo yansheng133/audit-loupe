@@ -34,10 +34,11 @@ jobs:
         run: cargo test --locked
 
   # The change map's 5-second baseline (about 720,000 records a day, backend/src/perf.rs).
-  # Records the times in the job summary; it does not fail on them yet, and is not a required
-  # check. Layer 1 turns enforcement on (AL_PERF_ENFORCE=1).
+  # Writes the times to the job summary and fails when a target is missed (page p95 300 ms,
+  # detail 100 ms) or the page differs from reading the whole day. Not a required check: a
+  # red mark here is a regression to look at, not a merge block.
   perf:
-    name: perf (record only)
+    name: perf (720k records a day)
     runs-on: ubuntu-24.04
     container: registry.suse.com/bci/rust:1.98.1-1.2.21@sha256:af8218cc18c6d1c81d21e38b2655507455d63ee4df94675dd8a284aba038dc4d
     defaults:
@@ -48,7 +49,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Change map at about 720,000 records a day
-        run: AL_PERF_SUMMARY="$GITHUB_STEP_SUMMARY" cargo test --release --locked perf_gate -- --ignored --nocapture
+        run: AL_PERF_ENFORCE=1 AL_PERF_SUMMARY="$GITHUB_STEP_SUMMARY" cargo test --release --locked perf_gate -- --ignored --nocapture
 
   chart:
     name: helm chart
