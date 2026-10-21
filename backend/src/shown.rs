@@ -114,6 +114,55 @@ mod tests {
         }
     }
 
+    /// The timeline adds up: its slots hold every operation the page counts, a slot with an
+    /// alert is "look", the clusters' lines add up to the merged line, and a picked range counts
+    /// exactly the slots it covers.
+    #[test]
+    fn the_timeline_adds_up() {
+        let cfg = crate::config::Config::test();
+        let s = crate::store::Store::open(":memory:").unwrap();
+        crate::demo::seed(&s, &cfg).unwrap();
+        let (day, clusters) = {
+            let c = s.conn.lock().unwrap();
+            let t: i64 = c.query_row("SELECT max(ts_ms) FROM events", [], |r| r.get(0)).unwrap();
+            let day = chrono::DateTime::from_timestamp_millis(t).unwrap().with_timezone(&cfg.tz).format("%Y-%m-%d").to_string();
+            let cl: Vec<String> = c.prepare("SELECT DISTINCT cluster FROM events ORDER BY 1").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+            (day, cl)
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        let slots = |v: &serde_json::Value, i: usize| v["timeline"]["lines"][i]["slots"].as_array().unwrap().clone();
+        let sum = |sl: &[serde_json::Value]| sl.iter().map(|x| x["ops"].as_i64().unwrap()).sum::<i64>();
+        for system in [None, Some("1".to_string())] {
+            let base = Params { day: Some(day.clone()), system: system.clone(), ..Default::default() };
+            let v = changemap(&s, cfg.tz, &base, now).unwrap();
+            let merged = slots(&v, 0);
+            assert!(sum(&merged) > 0);
+            assert!(merged.iter().any(|x| x["state"] == "look"), "the demo day has alerts, so the check below checks something");
+            assert_eq!(sum(&merged), v["counts"]["ops"].as_i64().unwrap(), "every counted operation is on the timeline ({system:?})");
+            for x in &merged {
+                if x["alerts"].as_i64().unwrap() > 0 {
+                    assert_eq!(x["state"], "look", "{x}");
+                }
+                if x["state"] == "look" {
+                    assert!(x["alerts"].as_i64().unwrap() > 0, "{x}");
+                }
+            }
+            // One line per picked cluster, at one-minute slots; together they hold what the
+            // merged ten-minute line holds (the demo has one cluster, so this checks the binning).
+            let per = changemap(&s, cfg.tz, &Params { cluster: clusters.clone(), ..base.clone() }, now).unwrap();
+            let total: i64 = (0..clusters.len()).map(|i| sum(&slots(&per, i))).sum();
+            assert_eq!(total, sum(&merged));
+            // A range of whole slots counts exactly the operations of those slots, and the
+            // timeline stays the whole day.
+            let busy = merged.iter().position(|x| x["ops"].as_i64().unwrap() > 0).unwrap();
+            let (a, b) = (merged[busy]["t"].as_i64().unwrap(), merged[(busy + 6).min(merged.len() - 1)]["t"].as_i64().unwrap());
+            let r = changemap(&s, cfg.tz, &Params { from: Some(a), to: Some(b), ..base.clone() }, now).unwrap();
+            let inside: i64 = merged.iter().filter(|x| (a..b).contains(&x["t"].as_i64().unwrap())).map(|x| x["ops"].as_i64().unwrap()).sum();
+            assert_eq!(r["counts"]["ops"].as_i64().unwrap(), inside, "{system:?}");
+            assert_eq!(r["timeline"], v["timeline"]);
+        }
+    }
+
     /// Every reason on the page also comes as a code the page can say in its own language,
     /// and nothing on it is worded for developers (v0.2).
     #[test]
