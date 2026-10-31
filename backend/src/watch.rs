@@ -147,14 +147,34 @@ fn line(m: &ObjMsg) -> Line {
     Line { mark: None, text: serde_json::to_string(m).expect("serializable") }
 }
 
-async fn watch_one(client: Client, ar: ApiResource, tx: tokio::sync::mpsc::Sender<Line>) -> anyhow::Result<()> {
+/// What the coverage page shows for a watch that keeps failing: a refused request (403) is
+/// almost always the chart's ClusterRole not covering a type added to `resources`.
+fn failure(e: &watcher::Error) -> &'static str {
+    let api = match e {
+        watcher::Error::InitialListFailed(kube::Error::Api(a)) | watcher::Error::WatchStartFailed(kube::Error::Api(a)) | watcher::Error::WatchFailed(kube::Error::Api(a)) => Some(a.code),
+        watcher::Error::WatchError(a) => Some(a.code),
+        _ => None,
+    };
+    match api {
+        Some(403) => "forbidden",
+        _ => "failing",
+    }
+}
+
+async fn watch_one(client: Client, ar: ApiResource, tx: tokio::sync::mpsc::Sender<Line>, health: crate::collect::Health, spec: &str) -> anyhow::Result<()> {
     let api: Api<DynamicObject> = Api::all_with(client, &ar);
     let (group, resource) = (ar.group.clone(), ar.plural.clone());
     // Last digest sent per object, to skip updates that change nothing a person sets.
     let mut sent: HashMap<(String, String), [u8; 32]> = HashMap::new();
     let mut listed: Vec<(String, String)> = Vec::new();
     let mut stream = watcher::watcher(api, watcher::Config::default()).default_backoff().boxed();
+    // Health says "watching" only while the stream works; a failure is shown until it recovers.
+    let mut failing = false;
     while let Some(item) = stream.next().await {
+        if failing && item.is_ok() {
+            failing = false;
+            crate::collect::set(&health, spec, serde_json::json!("watching"));
+        }
         let (mut obj, seen) = match item {
             Ok(Event::Init) => {
                 listed.clear();
@@ -172,6 +192,10 @@ async fn watch_one(client: Client, ar: ApiResource, tx: tokio::sync::mpsc::Sende
             Err(e) => {
                 // default_backoff() spaces out retries; the watcher re-lists by itself.
                 warn!(resource = %resource, error = %e, "watch error");
+                if !failing {
+                    failing = true;
+                    crate::collect::set(&health, spec, serde_json::json!(failure(&e)));
+                }
                 continue;
             }
         };
@@ -232,7 +256,7 @@ pub async fn run() -> anyhow::Result<()> {
                     Ok(Some(ar)) => {
                         info!(resource = %spec, "watching");
                         crate::collect::set(&health, &spec, serde_json::json!("watching"));
-                        if let Err(e) = watch_one(client.clone(), ar, tx.clone()).await {
+                        if let Err(e) = watch_one(client.clone(), ar, tx.clone(), health.clone(), &spec).await {
                             warn!(resource = %spec, error = %e, "watch stopped");
                         }
                         return;
@@ -268,6 +292,14 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use serde_json::json;
+
+    /// A refused watch shows as "forbidden" on the coverage page, anything else as "failing".
+    #[test]
+    fn a_failing_watch_says_why() {
+        let status = |code: u16| -> kube::core::Status { serde_json::from_value(json!({"status": "Failure", "code": code})).unwrap() };
+        assert_eq!(failure(&watcher::Error::InitialListFailed(kube::Error::Api(status(403).into()))), "forbidden");
+        assert_eq!(failure(&watcher::Error::WatchError(status(410).into())), "failing");
+    }
 
     #[test]
     fn specs() {

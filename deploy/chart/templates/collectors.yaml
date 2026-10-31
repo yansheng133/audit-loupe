@@ -50,6 +50,18 @@ rules:
   - apiGroups: [gateway.networking.k8s.io]
     resources: [httproutes]
     verbs: [get, list, watch]
+  {{- /* Types added in watch.resources ("group/version/resource", or "v1/resource" for the
+         core group) get read access too; without it they are refused (403) forever.
+         Secrets and tokens are never watched, so they are never granted. */}}
+  {{- range (splitList "," $c.watch.resources) }}
+  {{- $p := splitList "/" (trim .) }}
+  {{- $res := last $p }}
+  {{- if and (ge (len $p) 2) (not (has $res (list "secrets" "tokens"))) }}
+  - apiGroups: [{{ if eq (len $p) 2 }}""{{ else }}{{ first $p | quote }}{{ end }}]
+    resources: [{{ $res | quote }}]
+    verbs: [get, list, watch]
+  {{- end }}
+  {{- end }}
   {{- if $c.watch.rancherTypes }}
   - apiGroups: [management.cattle.io]
     resources: [globalroles, globalrolebindings, roletemplates, clusterroletemplatebindings, projectroletemplatebindings, projects, users, userattributes]
