@@ -617,13 +617,25 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     // Collection gaps overlapping the day, from both sources (spec section 5): an empty reason is
     // a silence the server noticed (no heartbeat); any other reason was reported by the
     // collector (restart, file removed or replaced, state lost). Where collection started is a
-    // marker, not a gap.
-    let mut gaps: Vec<(String, i64, i64, String, String)> = Vec::new();
+    // marker, not a gap. A silence still going on is in no table yet (it is written when the
+    // collector checks in again), so it comes from the heartbeats and runs to now; the last
+    // field says it is still open.
+    let mut gaps: Vec<(String, i64, i64, String, String, bool)> = Vec::new();
     let mut st = c.prepare("SELECT cluster, from_ms, to_ms, collector, reason FROM gaps WHERE to_ms >= ?1 AND from_ms < ?2 AND reason <> ?3 ORDER BY from_ms")?;
-    for row in st.query_map(params![start, end, crate::store::START], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?)))? {
+    for row in st.query_map(params![start, end, crate::store::START], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?, false)))? {
         let g = row?;
         if clusters.is_empty() || clusters.contains(g.0.as_str()) {
             gaps.push(g);
+        }
+    }
+    drop(st);
+    let mut st = c.prepare(
+        "SELECT cluster, last_ms, collector FROM heartbeats WHERE ?1 - last_ms > ?2 AND last_ms < ?3 AND (collector <> 'file' OR ?1 - last_ms <= ?4)",
+    )?;
+    for row in st.query_map(params![now_ms, crate::store::GAP_MS, end, crate::store::RETIRED_MS], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get::<_, String>(2)?)))? {
+        let (cl, last, col) = row?;
+        if clusters.is_empty() || clusters.contains(cl.as_str()) {
+            gaps.push((cl, last, now_ms.max(last), col, String::new(), true));
         }
     }
     drop(st);
@@ -636,7 +648,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
             ("found-on-reconnect", "收集中斷後重新連線比對物件版本才發現的變更，找不到對應的 audit 紀錄".into())
         }
     };
-    let in_gap = |cluster: &str, t: i64| gaps.iter().any(|(cl, f, to, _, _)| cl == cluster && t >= f - SLOT_GRACE_MS && t <= to + SLOT_GRACE_MS);
+    let in_gap = |cluster: &str, t: i64| gaps.iter().any(|(cl, f, to, _, _, _)| cl == cluster && t >= f - SLOT_GRACE_MS && t <= to + SLOT_GRACE_MS);
 
     for o in objs.values_mut() {
         let sev = o.ops.iter().filter_map(|i| ops[*i].severity.clone()).min_by_key(|s| if s == "high" { 0 } else { 1 });
@@ -765,7 +777,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
             .enumerate()
             .map(|(i, (r, n, a))| {
                 let t = start + i as i64 * slot_ms;
-                let gap = gaps.iter().any(|(cl, f, to, _, _)| lk.as_ref().is_none_or(|c| c == cl) && *f < t + slot_ms && *to > t);
+                let gap = gaps.iter().any(|(cl, f, to, _, _, _)| lk.as_ref().is_none_or(|c| c == cl) && *f < t + slot_ms && *to > t);
                 let state = match r {
                     0 => "look",
                     1 => "unclear",
@@ -783,9 +795,9 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     }
     let gaps_json: Vec<Value> = gaps
         .iter()
-        .map(|(cl, f, t, col, why)| {
+        .map(|(cl, f, t, col, why, open)| {
             if why.is_empty() {
-                json!({"cluster": cl, "fromMs": f, "toMs": t, "kind": "heartbeat", "collector": col, "reasonCode": "collector-silent", "reason": format!("收集元件 {col} 沒有回報")})
+                json!({"cluster": cl, "fromMs": f, "toMs": t, "open": open, "kind": "heartbeat", "collector": col, "reasonCode": "collector-silent", "reason": format!("收集元件 {col} 沒有回報")})
             } else {
                 json!({"cluster": cl, "fromMs": f, "toMs": t, "kind": "reported", "collector": col, "cause": why, "reasonCode": "collector-reported",
                        "reason": format!("收集元件 {col} 回報這段沒有收集（{why}）")})
@@ -911,7 +923,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
                 evs.push(json!({"t": t, "subject": o.key, "from": "clear", "to": "unclear", "reasonCode": "first-unattributed", "reason": "當天第一次出現找不到執行者的變更", "source": "state"}));
             }
         }
-        for (cl, f, t, col, why) in &gaps {
+        for (cl, f, t, col, why, open) in &gaps {
             let (stop, resume) = if why.is_empty() {
                 (json!({"reasonCode": "collector-stopped", "reason": format!("收集元件 {col} 停止回報"), "source": "heartbeat"}),
                  json!({"reasonCode": "collector-resumed", "reason": format!("收集元件 {col} 恢復回報"), "source": "heartbeat"}))
@@ -920,7 +932,8 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
                  json!({"reasonCode": "reported-gap-end", "reason": format!("收集元件 {col} 回報的缺口到這裡為止"), "source": "reported", "cause": why}))
             };
             for (at, from, to, mut e) in [(*f, "ok", "blind", stop), (*t, "blind", "ok", resume)] {
-                if in_range(at) {
+                // A silence still going on has not ended: no "resumed" at now.
+                if in_range(at) && !(*open && from == "blind") {
                     e["t"] = json!(at);
                     e["subject"] = json!(cl);
                     e["from"] = json!(from);
@@ -967,6 +980,36 @@ mod tests {
 
     // 2026-10-20 10:00 Asia/Taipei
     const T: i64 = 1_792_461_600_000;
+
+    /// A collector that stopped and has not checked in again has no gap row yet; the page
+    /// still shows the silence from its last check-in to now, and does not say it resumed.
+    /// A node collector silent for over a day is taken as a removed node and left out.
+    #[test]
+    fn a_silence_still_going_on_is_shown() {
+        let s = store();
+        let now = T + 5 * 3_600_000;
+        {
+            let c = s.conn.lock().unwrap();
+            ev(&c, 1, "c1", T + 3 * 3_600_000 - 60_000, "alice", 1, "direct", "patch", "deployments", "shop", "web");
+            ev(&c, 2, "c1", T, "alice", 1, "direct", "patch", "deployments", "shop", "api");
+            c.execute("INSERT INTO heartbeats (cluster, collector, instance, last_ms, details) VALUES ('c1', 'file', 'n1', ?1, '{}')", params![T + 3 * 3_600_000]).unwrap();
+            c.execute("INSERT INTO heartbeats (cluster, collector, instance, last_ms, details) VALUES ('c1', 'file', 'gone', ?1, '{}')", params![T - 2 * 86_400_000]).unwrap();
+            c.execute("INSERT INTO heartbeats (cluster, collector, instance, last_ms, details) VALUES ('c1', 'watch', 'w', ?1, '{}')", params![now - 60_000]).unwrap();
+        }
+        let p = Params { day: Some("2026-10-20".into()), ..Default::default() };
+        let v = changemap(&s, chrono_tz::Asia::Taipei, &p, now).unwrap();
+        let gaps = v["timeline"]["gaps"].as_array().unwrap();
+        assert_eq!(gaps.len(), 1, "only n1: the watch collector reported a minute ago, 'gone' is retired: {gaps:?}");
+        assert_eq!((gaps[0]["fromMs"].as_i64(), gaps[0]["toMs"].as_i64(), gaps[0]["open"].as_bool()), (Some(T + 3 * 3_600_000), Some(now), Some(true)));
+        let state = |k: &str| v["rows"].as_array().unwrap().iter().find(|r| r["key"] == k).unwrap()["state"].clone();
+        assert_eq!(state("c1//deployments/shop/web"), "blind", "changed a minute before the silence");
+        assert_eq!(state("c1//deployments/shop/api"), "clear");
+        let slot = v["timeline"]["lines"][0]["slots"].as_array().unwrap().iter().find(|x| x["t"].as_i64() == Some(T + 4 * 3_600_000)).unwrap().clone();
+        assert_eq!(slot["state"], "blind", "{slot}");
+        let v = changemap(&s, chrono_tz::Asia::Taipei, &Params { tab: Some("events".into()), ..p.clone() }, now).unwrap();
+        let codes: Vec<&str> = v["events"].as_array().unwrap().iter().filter_map(|e| e["reasonCode"].as_str()).collect();
+        assert!(codes.contains(&"collector-stopped") && !codes.contains(&"collector-resumed"), "{codes:?}");
+    }
 
     #[test]
     fn rancher_writes_in_an_application_namespace_are_shown() {
