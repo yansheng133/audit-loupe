@@ -305,11 +305,26 @@ pub struct RoleChange {
 /// Three missed heartbeats (one a minute) count as a gap.
 pub const GAP_MS: i64 = 180_000;
 
-/// A collector silent this long is taken as removed (a node replaced, a collector turned off in
-/// the chart), not as down: the change map stops marking the time after it as unseen, and the
-/// coverage page lists it as retired. If it checks in again, the whole silence is recorded as
-/// a gap as usual. Its row is dropped once it is older than retention.
+/// A collector silent this long while another instance of the same collector in its cluster is
+/// reporting is taken as removed (in practice a replaced node: one-per-cluster collectors lose
+/// their old row as soon as a new pod reports): the change map stops marking the time after it
+/// as unseen, and the coverage page lists it as retired. With no other instance reporting it
+/// is never retired, however long the silence: the cluster is not being collected, and that
+/// stays on the page until it is fixed. If it checks in again, the whole silence is recorded
+/// as a gap as usual. A retired row is dropped once it is older than retention.
 pub const RETIRED_MS: i64 = 86_400_000;
+const _: () = assert!(RETIRED_MS == 86_400_000, "RETIRED_END spells this out in SQL");
+
+/// SQL for where a retired silence of heartbeat row `h` ends: where the first other instance
+/// that started after it began (the replacement, however late it came), and at least a day
+/// after it began. Coverage, the change map and prune all use this, so they agree.
+pub const RETIRED_END: &str = "max(h.last_ms + 86400000, coalesce((SELECT min(n.first_ms) FROM heartbeats n
+     WHERE n.cluster=h.cluster AND n.collector=h.collector AND n.instance<>h.instance AND n.first_ms > h.last_ms), 0))";
+
+/// SQL: another instance of `h`'s collector in its cluster reported within GAP_MS of ?NOW.
+fn others_reporting(now: &str) -> String {
+    format!("EXISTS (SELECT 1 FROM heartbeats o WHERE o.cluster=h.cluster AND o.collector=h.collector AND o.instance<>h.instance AND {now} - o.last_ms <= {GAP_MS})")
+}
 
 #[derive(Debug, Serialize)]
 pub struct CoverageRow {
@@ -1888,9 +1903,12 @@ impl Store {
     /// (including a silence still going on).
     pub fn coverage(&self, from_ms: i64, to_ms: i64, now_ms: i64) -> anyhow::Result<Vec<CoverageRow>> {
         let c = self.conn.lock().unwrap();
-        let beats: Vec<(String, String, String, i64, String)> = c
-            .prepare("SELECT cluster, collector, instance, last_ms, details FROM heartbeats ORDER BY cluster, collector, instance")?
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+        let beats: Vec<(String, String, String, i64, String, bool, i64)> = c
+            .prepare(&format!(
+                "SELECT h.cluster, h.collector, h.instance, h.last_ms, h.details, {}, {RETIRED_END} FROM heartbeats h ORDER BY 1, 2, 3",
+                others_reporting("?1")
+            ))?
+            .query_map(params![now_ms], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?
             .collect::<Result<_, _>>()?;
         type GapRow = (String, String, String, i64, i64, String, String);
         let gaps: Vec<GapRow> = c
@@ -1911,14 +1929,17 @@ impl Store {
                 }
             }
         };
-        for (cl, col, inst, last, details) in beats {
+        for (cl, col, inst, last, details, others, retired_end) in beats {
             let i = row(&mut out, &cl);
             let stale = now_ms - last > GAP_MS;
-            let retired = now_ms - last > RETIRED_MS;
+            // Retired: silent over a day next to another instance that reports (RETIRED_MS).
+            let retired = now_ms - last > RETIRED_MS && others;
             out[i].collectors.push(json!({"collector": col, "instance": inst, "lastMs": last, "stale": stale, "retired": retired,
                                           "details": serde_json::from_str::<Value>(&details).unwrap_or(Value::Null)}));
-            if stale && last <= to_ms {
-                out[i].gaps.push(json!({"kind": "heartbeat", "collector": col, "instance": inst, "fromMs": last, "toMs": null, "reason": SILENT, "detail": ""}));
+            // A retired silence ends (RETIRED_END); one that ended before the range is not listed.
+            let end = retired.then(|| retired_end.min(now_ms));
+            if stale && last <= to_ms && end.is_none_or(|e| e >= from_ms) {
+                out[i].gaps.push(json!({"kind": "heartbeat", "collector": col, "instance": inst, "fromMs": last, "toMs": end, "reason": SILENT, "detail": "", "retired": retired}));
             }
         }
         for (cl, col, inst, f, t, reason, detail) in gaps {
@@ -2213,8 +2234,22 @@ impl Store {
         c.execute("DELETE FROM hourly WHERE hour_ms < ?1", params![cutoff])?;
         c.execute("DELETE FROM stories WHERE last_ms < ?1", params![cutoff])?;
         c.execute("DELETE FROM rejected_lines WHERE received_ms < ?1", params![cutoff])?;
-        // A collector silent since before retention is long gone (RETIRED_MS).
-        c.execute("DELETE FROM heartbeats WHERE last_ms < ?1", params![cutoff])?;
+        // A retired collector (RETIRED_MS) silent since before retention is long gone. One with
+        // no other instance reporting stays: dropping it would hide that nothing is collected.
+        // Its silence is kept as a gap first, so the outage is still on record until the gap
+        // itself ages out.
+        // In one transaction, so a crash in between cannot leave the gap written twice.
+        let retired = format!("FROM heartbeats h WHERE h.last_ms < ?1 AND {}", others_reporting("?2"));
+        let tx = c.unchecked_transaction()?;
+        tx.execute(
+            &format!("INSERT INTO gaps (cluster, collector, instance, from_ms, to_ms) SELECT h.cluster, h.collector, h.instance, h.last_ms, min({RETIRED_END}, ?2) {retired}"),
+            params![cutoff, ms(&now)],
+        )?;
+        tx.execute(
+            &format!("DELETE FROM heartbeats WHERE (cluster, collector, instance) IN (SELECT h.cluster, h.collector, h.instance {retired})"),
+            params![cutoff, ms(&now)],
+        )?;
+        tx.commit()?;
         Ok(n + m)
     }
 }
@@ -2725,8 +2760,8 @@ mod tests {
         {
             let c = s.conn.lock().unwrap();
             c.execute("INSERT INTO rejected_lines (cluster, source, received_ms, len, sha256, error) VALUES ('c1', 'k8s', ?1, 1, 'x', 'bad')", params![ms(&now) - 40 * 86_400_000]).unwrap();
-            c.execute("INSERT INTO heartbeats (cluster, collector, instance, last_ms, details) VALUES ('c1', 'file', 'gone', ?1, '{}'), ('c1', 'file', 'down', ?2, '{}'), ('c1', 'neuvector', 'off', ?1, '{}'), ('c1', 'watch', 'w', ?2, '{}')",
-                      params![ms(&now) - 40 * 86_400_000, ms(&now) - 2 * 86_400_000]).unwrap();
+            c.execute("INSERT INTO heartbeats (cluster, collector, instance, last_ms, details) VALUES ('c1', 'file', 'gone', ?1, '{}'), ('c1', 'file', 'down', ?2, '{}'), ('c1', 'file', 'up', ?3, '{}'), ('c1', 'neuvector', 'off', ?1, '{}'), ('c1', 'watch', 'w', ?2, '{}')",
+                      params![ms(&now) - 40 * 86_400_000, ms(&now) - 2 * 86_400_000, ms(&now) - 60_000]).unwrap();
         }
         s.prune(30, now).unwrap();
         {
@@ -2734,7 +2769,7 @@ mod tests {
             let rejected: i64 = c.query_row("SELECT count(*) FROM rejected_lines", [], |r| r.get(0)).unwrap();
             assert_eq!(rejected, 0);
             let left: Vec<String> = c.prepare("SELECT instance FROM heartbeats ORDER BY instance").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
-            assert_eq!(left, ["down", "w"], "silent two days stays listed; silent past retention goes");
+            assert_eq!(left, ["down", "off", "up", "w"], "a replaced node silent past retention goes; the only neuvector stays, however long");
         }
 
         // Someone edits a stored record directly.
@@ -2899,6 +2934,58 @@ mod tests {
 
     /// Two watch pods stale at once (the second took over within GAP_MS, then stopped too):
     /// the first had no gap, the second's runs to the third pod, whichever way names sort.
+    /// The coverage page calls a silent collector retired only next to another instance of it
+    /// that reports (a replaced node); a cluster where nothing of a collector reports stays red.
+    #[test]
+    fn retired_only_next_to_a_reporting_instance() {
+        let s = Store::open(":memory:").unwrap();
+        let now = 10 * 86_400_000;
+        {
+            let c = s.conn.lock().unwrap();
+            c.execute(
+                "INSERT INTO heartbeats (cluster, collector, instance, last_ms, details) VALUES
+                 ('c1', 'file', 'old-node', ?1, '{}'), ('c1', 'file', 'new-node', ?2, '{}'), ('c2', 'file', 'only-node', ?1, '{}')",
+                params![now - 2 * 86_400_000, now - 30_000],
+            )
+            .unwrap();
+        }
+        let cov = s.coverage(now - 7 * 86_400_000, now, now).unwrap();
+        let of = |cl: &str, inst: &str| {
+            let r = cov.iter().find(|r| r.cluster == cl).unwrap();
+            let c = r.collectors.iter().find(|c| c["instance"] == inst).unwrap().clone();
+            let g = r.gaps.iter().find(|g| g["instance"] == inst).cloned();
+            (c["stale"].as_bool(), c["retired"].as_bool(), g.and_then(|g| g["retired"].as_bool()))
+        };
+        assert_eq!(of("c1", "old-node"), (Some(true), Some(true), Some(true)));
+        assert_eq!(of("c2", "only-node"), (Some(true), Some(false), Some(false)));
+    }
+
+    /// A replacement that came three days late: the old node's silence runs to where the new
+    /// node started, on the coverage page, and in the gap prune keeps when it drops the row.
+    #[test]
+    fn a_late_replacement_keeps_the_whole_outage() {
+        let s = Store::open(":memory:").unwrap();
+        let d = 86_400_000;
+        let (stop, start, now) = (40 * d, 43 * d, 43 * d + 3_600_000);
+        s.conn.lock().unwrap().execute(
+            "INSERT INTO heartbeats (cluster, collector, instance, last_ms, details, first_ms) VALUES ('c1', 'file', 'old', ?1, '{}', 0), ('c1', 'file', 'new', ?2, '{}', ?3)",
+            params![stop, now - 30_000, start],
+        ).unwrap();
+        let cov = s.coverage(0, now, now).unwrap();
+        let g = cov[0].gaps.iter().find(|g| g["instance"] == "old").unwrap();
+        assert_eq!((g["fromMs"].as_i64(), g["toMs"].as_i64(), g["retired"].as_bool()), (Some(stop), Some(start), Some(true)));
+        let recent = s.coverage(start + 600_000, now, now).unwrap();
+        assert!(recent[0].gaps.iter().all(|g| g["instance"] != "old"), "ended before the range: not listed");
+        // Retention passes the old row: it goes, its silence stays as a gap.
+        let later = chrono::DateTime::from_timestamp_millis(stop + 31 * d).unwrap();
+        s.heartbeat("c1", "file", "new", &json!({}), stop + 31 * d - 30_000).unwrap();
+        s.prune(30, later).unwrap();
+        let c = s.conn.lock().unwrap();
+        let left: i64 = c.query_row("SELECT count(*) FROM heartbeats WHERE instance='old'", [], |r| r.get(0)).unwrap();
+        let kept: (i64, i64) = c.query_row("SELECT from_ms, to_ms FROM gaps WHERE instance='old'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((left, kept), (0, (stop, start)));
+    }
+
     #[test]
     fn several_replaced_pods_each_get_their_own_gap() {
         let m = 60_000;

@@ -629,30 +629,35 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         }
     }
     drop(st);
-    // A silence ends a day after it began (RETIRED_MS: taken as removed), or now. watch, rancher
-    // and neuvector run one pod per cluster, so for them another instance reporting after it
-    // ends it where that instance started, by the same rule as heartbeat() (an overlap or a
-    // handover within GAP_MS is no gap; a row from before 0.2.1 has no start time and is not
-    // taken as a takeover, where heartbeat() can use the time it reports). collect-file runs one per node: another node
-    // reporting proves nothing, so its silence is not ended that way.
-    let mut st = c.prepare(
+    // A silence runs to now. watch, rancher and neuvector run one pod per cluster, so for them
+    // another instance reporting after it ends it where that instance started, by the same rule
+    // as heartbeat() (an overlap or a handover within GAP_MS is no gap; a row from before 0.2.1
+    // has no start time and is not taken as a takeover). collect-file runs one per node:
+    // another node reporting proves nothing, but a node silent over a day while another node
+    // reports is taken as replaced (RETIRED_MS): its silence ends where the replacement started
+    // (however late), and at least a day after it began (store::RETIRED_END).
+    let mut st = c.prepare(&format!(
         "SELECT h.cluster, h.last_ms, h.collector,
                 CASE WHEN h.collector <> 'file' THEN
                   (SELECT min(n.first_ms) FROM heartbeats n WHERE n.cluster=h.cluster AND n.collector=h.collector AND n.instance<>h.instance AND n.last_ms > h.last_ms)
-                END
-         FROM heartbeats h WHERE ?1 - h.last_ms > ?2 AND h.last_ms < ?3 AND h.last_ms + ?4 >= ?5",
-    )?;
-    let silences = st.query_map(params![now_ms, crate::store::GAP_MS, end, crate::store::RETIRED_MS, start], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<i64>>(3)?))
+                END,
+                EXISTS (SELECT 1 FROM heartbeats o WHERE o.cluster=h.cluster AND o.collector=h.collector AND o.instance<>h.instance AND ?1 - o.last_ms <= ?2),
+                {}
+         FROM heartbeats h WHERE ?1 - h.last_ms > ?2 AND h.last_ms < ?3",
+        crate::store::RETIRED_END
+    ))?;
+    let silences = st.query_map(params![now_ms, crate::store::GAP_MS, end], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<i64>>(3)?, r.get::<_, bool>(4)?, r.get::<_, i64>(5)?))
     })?;
     for row in silences {
-        let (cl, last, col, next) = row?;
+        let (cl, last, col, next, others, retired_end) = row?;
         if !clusters.is_empty() && !clusters.contains(cl.as_str()) {
             continue;
         }
-        let to = next.unwrap_or(i64::MAX).min(last + crate::store::RETIRED_MS).min(now_ms);
+        let cap = if others { retired_end } else { i64::MAX };
+        let to = next.unwrap_or(i64::MAX).min(cap).min(now_ms);
         // Still "open" (no "resumed") unless another instance took over: running to now, or cut
-        // off a day after it began.
+        // off as retired.
         if to - last > crate::store::GAP_MS && to >= start {
             gaps.push((cl, last, to, col, String::new(), next.is_none_or(|n| n > to)));
         }
@@ -1002,7 +1007,8 @@ mod tests {
 
     /// A collector that stopped and has not checked in again has no gap row yet; the page
     /// still shows the silence from its last check-in to now, and does not say it resumed.
-    /// A collector silent for over a day is taken as removed and left out.
+    /// A node silent for over a day while another node reports is taken as replaced; a
+    /// collector with no instance reporting stays marked, however long.
     #[test]
     fn a_silence_still_going_on_is_shown() {
         let s = store();
@@ -1012,13 +1018,18 @@ mod tests {
             ev(&c, 1, "c1", T + 3 * 3_600_000 - 60_000, "alice", 1, "direct", "patch", "deployments", "shop", "web");
             ev(&c, 2, "c1", T, "alice", 1, "direct", "patch", "deployments", "shop", "api");
             c.execute("INSERT INTO heartbeats (cluster, collector, instance, last_ms, details) VALUES ('c1', 'file', 'n1', ?1, '{}')", params![T + 3 * 3_600_000]).unwrap();
-            c.execute("INSERT INTO heartbeats (cluster, collector, instance, last_ms, details) VALUES ('c1', 'file', 'gone', ?1, '{}'), ('c1', 'neuvector', 'off', ?1, '{}')", params![T - 2 * 86_400_000]).unwrap();
+            c.execute("INSERT INTO heartbeats (cluster, collector, instance, last_ms, details) VALUES ('c1', 'file', 'gone', ?1, '{}'), ('c2', 'neuvector', 'off', ?1, '{}')", params![T - 2 * 86_400_000]).unwrap();
+            c.execute("INSERT INTO heartbeats (cluster, collector, instance, last_ms, details) VALUES ('c1', 'file', 'n2', ?1, '{}')", params![now - 60_000]).unwrap();
             c.execute("INSERT INTO heartbeats (cluster, collector, instance, last_ms, details) VALUES ('c1', 'watch', 'w', ?1, '{}')", params![now - 60_000]).unwrap();
         }
         let p = Params { day: Some("2026-10-20".into()), ..Default::default() };
         let v = changemap(&s, chrono_tz::Asia::Taipei, &p, now).unwrap();
         let gaps = v["timeline"]["gaps"].as_array().unwrap();
-        assert_eq!(gaps.len(), 1, "only n1: the watch collector reported a minute ago, 'gone' and 'off' are retired: {gaps:?}");
+        // n1 silent since 13:00; 'gone' replaced (n2 reports) so its day ended before this one;
+        // 'off' is c2's only neuvector and stays silent to now; the watch reported a minute ago.
+        let seen: Vec<(&str, Option<i64>, Option<i64>)> = gaps.iter().map(|g| (g["collector"].as_str().unwrap(), g["fromMs"].as_i64(), g["toMs"].as_i64())).collect();
+        assert_eq!(seen, [("file", Some(T + 3 * 3_600_000), Some(now)), ("neuvector", Some(T - 2 * 86_400_000), Some(now))], "{gaps:?}");
+        let gaps: Vec<&Value> = gaps.iter().filter(|g| g["collector"] == "file").collect();
         assert_eq!((gaps[0]["fromMs"].as_i64(), gaps[0]["toMs"].as_i64(), gaps[0]["open"].as_bool()), (Some(T + 3 * 3_600_000), Some(now), Some(true)));
         let state = |k: &str| v["rows"].as_array().unwrap().iter().find(|r| r["key"] == k).unwrap()["state"].clone();
         assert_eq!(state("c1//deployments/shop/web"), "blind", "changed a minute before the silence");
@@ -1045,13 +1056,18 @@ mod tests {
         };
         let gap = |v: &Value, i: usize| (v["timeline"]["gaps"][i]["fromMs"].as_i64(), v["timeline"]["gaps"][i]["toMs"].as_i64(), v["timeline"]["gaps"][i]["open"].as_bool());
 
-        // Silent 25 hours: the first day stays marked, nothing "resumed".
+        // The only node silent 25 hours: nothing is collected, so it stays marked to now.
         let s = store();
         ev(&s.conn.lock().unwrap(), 1, "c1", T - 60_000, "alice", 1, "direct", "patch", "deployments", "shop", "web");
         beats(&s, &[("file", "n1", T, None)]);
         let v = changemap(&s, tz, &day, T + 25 * 3_600_000).unwrap();
-        assert_eq!(gap(&v, 0), (Some(T), Some(T + 86_400_000), Some(true)), "{v}");
+        assert_eq!(gap(&v, 0), (Some(T), Some(T + 25 * 3_600_000), Some(true)), "{v}");
         assert_eq!(v["rows"][0]["state"], "blind");
+        // A new node reporting: the old one is taken as replaced, its silence ends a day after
+        // it began, and nothing "resumed".
+        beats(&s, &[("file", "n2", T + 30 * 3_600_000 - 60_000, Some(T + 20 * 3_600_000))]);
+        let v = changemap(&s, tz, &day, T + 30 * 3_600_000).unwrap();
+        assert_eq!(gap(&v, 0), (Some(T), Some(T + 86_400_000), Some(true)), "{v}");
         let next = Params { day: Some("2026-10-21".into()), tab: Some("events".into()), ..Default::default() };
         let v = changemap(&s, tz, &next, T + 30 * 3_600_000).unwrap();
         assert!(!v["events"].to_string().contains("collector-resumed"), "{v}");
@@ -1079,6 +1095,14 @@ mod tests {
         beats(&s, &[("watch", "w-x", T, Some(0)), ("watch", "w-y", T + 120_000, None)]);
         let v = changemap(&s, tz, &day, now).unwrap();
         assert_eq!(gap(&v, 0), (Some(T), Some(now), Some(true)), "{v}");
+
+        // The only node stops; a new node joins three days later. The whole time between is
+        // unseen, not just the first day.
+        let s = store();
+        beats(&s, &[("file", "n1", T, Some(0)), ("file", "n2", T + 3 * 86_400_000 + 3_570_000, Some(T + 3 * 86_400_000))]);
+        let late = Params { day: Some("2026-10-22".into()), ..Default::default() };
+        let v = changemap(&s, tz, &late, T + 3 * 86_400_000 + 3_600_000).unwrap();
+        assert_eq!((gap(&v, 0).0, gap(&v, 0).1), (Some(T), Some(T + 3 * 86_400_000)), "{v}");
 
         // A silence that ended before the day is not on it.
         let s = store();

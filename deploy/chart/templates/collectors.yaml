@@ -52,8 +52,12 @@ rules:
     verbs: [get, list, watch]
   {{- /* Types added in watch.resources ("group/version/resource", or "v1/resource" for the
          core group) get read access too; without it they are refused (403) forever.
-         Secrets and tokens are never watched, so they are never granted. */}}
+         Secrets and tokens are never watched, so they are never granted; a wildcard would grant
+         them, so it stops the install. */}}
   {{- range (splitList "," $c.watch.resources) }}
+  {{- if contains "*" . }}
+  {{- fail (printf "collector.watch.resources: %q: wildcards are not allowed (they would grant reading secrets); list each type" (trim .)) }}
+  {{- end }}
   {{- $p := splitList "/" (trim .) }}
   {{- $res := last $p }}
   {{- if and (ge (len $p) 2) (not (has $res (list "secrets" "tokens"))) }}
