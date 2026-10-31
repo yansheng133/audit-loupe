@@ -35,21 +35,6 @@ pub struct Window {
     pub ranges: Vec<Range>,
 }
 
-fn days_of(spec: &str) -> Vec<u32> {
-    let mut out = Vec::new();
-    for part in spec.split(',').map(str::trim) {
-        match part.split_once('-') {
-            Some((a, b)) => {
-                if let (Ok(a), Ok(b)) = (a.trim().parse::<u32>(), b.trim().parse::<u32>()) {
-                    out.extend(a..=b);
-                }
-            }
-            None => out.extend(part.parse::<u32>().ok()),
-        }
-    }
-    out
-}
-
 impl Window {
     /// Whether this window governs an object in this cluster and namespace (labels of the
     /// namespace as last seen; None for cluster-scoped objects).
@@ -69,15 +54,23 @@ impl Window {
             return self.ranges.iter().any(|r| t >= r.from && t < r.to);
         }
         let local = t.with_timezone(tz);
-        let day_ok = self.days.as_deref().is_none_or(|d| days_of(d).contains(&local.weekday().number_from_monday()));
-        let hour_ok = match self.hours.as_deref().and_then(|h| h.split_once('-')) {
-            Some((a, b)) => {
-                let (a, b) = (a.trim().parse::<u32>().unwrap_or(0), b.trim().parse::<u32>().unwrap_or(24));
+        let mut day = local.weekday();
+        let hour_ok = match self.hours.as_deref().map(crate::config::hours) {
+            Some(Ok((a, b))) => {
                 let h = local.hour();
-                if a <= b { h >= a && h < b } else { h >= a || h < b }
+                // Hours past midnight belong to the window that opened the day before, so
+                // Saturday 01:00 in "1-5" "22-2" is still Friday's window.
+                if a > b && h < b {
+                    day = day.pred();
+                }
+                if a < b { h >= a && h < b } else { h >= a || h < b }
             }
-            None => true,
+            _ => true,
         };
+        let day_ok = self
+            .days
+            .as_deref()
+            .is_none_or(|d| crate::config::days(d).unwrap_or_default().contains(&day.number_from_monday()));
         day_ok && hour_ok
     }
 }
@@ -86,7 +79,18 @@ pub fn parse(json: &str) -> anyhow::Result<Vec<Window>> {
     if json.trim().is_empty() {
         return Ok(vec![]);
     }
-    Ok(serde_json::from_str(json)?)
+    let windows: Vec<Window> = serde_json::from_str(json)?;
+    // Checked here, once, so a typo fails the config check instead of making a window
+    // silently open on no day or at every hour.
+    for w in &windows {
+        if let Some(d) = &w.days {
+            crate::config::days(d).map_err(|e| anyhow::anyhow!("window {}: days {e}", w.name))?;
+        }
+        if let Some(h) = &w.hours {
+            crate::config::hours(h).map_err(|e| anyhow::anyhow!("window {}: hours {e}", w.name))?;
+        }
+    }
+    Ok(windows)
 }
 
 /// None when no window covers the object (no opinion); Some(true) when one is open.
@@ -127,5 +131,27 @@ mod tests {
         assert_eq!(allowed(&ws, "c-m-1", json!({"env":"dev"}).as_object(), wed_15, &tz), None);
         assert_eq!(allowed(&ws, "c-m-1", None, wed_15, &tz), None);
         assert!(parse("").unwrap().is_empty());
+    }
+
+    /// Hours past midnight count for the day the window opened (the values.yaml example,
+    /// "1-5" "22-2"): Saturday 01:00 is still Friday's window, Monday 01:00 is outside
+    /// (no window opened on Sunday), Friday 01:00 is Thursday's.
+    #[test]
+    fn hours_past_midnight_belong_to_the_day_before() {
+        let ws = parse(r#"[{"name":"nightly","days":"1-5","hours":"22-2"}]"#).unwrap();
+        let tz = chrono_tz::Asia::Taipei;
+        let at = |d, h| allowed(&ws, "c", None, tz.with_ymd_and_hms(2026, 10, d, h, 0, 0).unwrap().with_timezone(&Utc), &tz);
+        assert_eq!(at(17, 1), Some(true), "Saturday 01:00");
+        assert_eq!(at(19, 1), Some(false), "Monday 01:00");
+        assert_eq!(at(16, 1), Some(true), "Friday 01:00");
+        assert_eq!(at(17, 23), Some(false), "Saturday 23:00");
+        assert_eq!(at(16, 23), Some(true), "Friday 23:00");
+    }
+
+    #[test]
+    fn a_window_with_unreadable_days_or_hours_is_refused() {
+        for bad in [r#"[{"name":"w","days":"Mon-Fri"}]"#, r#"[{"name":"w","hours":"22:00-02:00"}]"#, r#"[{"name":"w","days":"0-8"}]"#] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
     }
 }

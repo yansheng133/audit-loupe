@@ -32,20 +32,37 @@ fn var(name: &str, default: &str) -> String {
     env::var(name).ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| default.to_string())
 }
 
-fn range(spec: &str) -> Vec<u32> {
-    // "1-5" or "1,2,3"
+/// ISO weekdays from "1-5" or "1,3,5" (Monday = 1). Anything else is an error, so a setting
+/// like "Mon-Fri" stops the config check instead of meaning "no working days".
+pub fn days(spec: &str) -> anyhow::Result<Vec<u32>> {
+    let day = |v: &str| match v.trim().parse::<u32>() {
+        Ok(d @ 1..=7) => Ok(d),
+        _ => Err(anyhow::anyhow!("\"{spec}\": days are numbers 1 (Monday) to 7 (Sunday), as \"1-5\" or \"1,3,5\"")),
+    };
     let mut out = Vec::new();
     for part in spec.split(',') {
-        let part = part.trim();
-        if let Some((a, b)) = part.split_once('-') {
-            if let (Ok(a), Ok(b)) = (a.trim().parse::<u32>(), b.trim().parse::<u32>()) {
+        match part.split_once('-') {
+            Some((a, b)) => {
+                let (a, b) = (day(a)?, day(b)?);
+                if a > b {
+                    anyhow::bail!("\"{spec}\": {a}-{b} runs backwards");
+                }
                 out.extend(a..=b);
             }
-        } else if let Ok(v) = part.parse::<u32>() {
-            out.push(v);
+            None => out.push(day(part)?),
         }
     }
-    out
+    Ok(out)
+}
+
+/// Start and end hour from "9-18" (0 to 24). The end may be before the start ("22-2"): the
+/// hours then run past midnight.
+pub fn hours(spec: &str) -> anyhow::Result<(u32, u32)> {
+    let hour = |v: &str| v.trim().parse::<u32>().ok().filter(|h| *h <= 24);
+    match spec.split_once('-').map(|(a, b)| (hour(a), hour(b))) {
+        Some((Some(a), Some(b))) if a != b => Ok((a, b)),
+        _ => anyhow::bail!("\"{spec}\": hours are whole hours 0 to 24, as \"9-18\""),
+    }
 }
 
 pub fn hash_token(token: &str) -> [u8; 32] {
@@ -102,11 +119,9 @@ impl Config {
     }
 
     pub fn from_env() -> anyhow::Result<Self> {
-        let hours = var("AL_WORK_HOURS", "9-18");
-        let (start, end) = hours
-            .split_once('-')
-            .and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().parse().ok()?)))
-            .unwrap_or((9, 18));
+        let (start, end) = hours(&var("AL_WORK_HOURS", "9-18"))
+            .and_then(|(a, b)| if a < b { Ok((a, b)) } else { anyhow::bail!("working hours cannot run past midnight") })
+            .map_err(|e| anyhow::anyhow!("AL_WORK_HOURS: {e}"))?;
         let tz: chrono_tz::Tz = var("AL_TZ", "Asia/Taipei")
             .parse()
             .map_err(|e| anyhow::anyhow!("AL_TZ: {e}"))?;
@@ -117,8 +132,11 @@ impl Config {
             cluster: var("AL_CLUSTER", "local"),
             work_start_hour: start,
             work_end_hour: end,
-            work_days: range(&var("AL_WORK_DAYS", "1-5")),
-            retention_days: var("AL_RETENTION_DAYS", "30").parse().unwrap_or(30),
+            work_days: days(&var("AL_WORK_DAYS", "1-5")).map_err(|e| anyhow::anyhow!("AL_WORK_DAYS: {e}"))?,
+            retention_days: match var("AL_RETENTION_DAYS", "30").trim().parse::<i64>() {
+                Ok(d) if d > 0 => d,
+                _ => anyhow::bail!("AL_RETENTION_DAYS: a whole number of days greater than 0, as \"30\""),
+            },
             ingest_tokens: load_tokens(&var("AL_INGEST_TOKENS_FILE", "/etc/audit-loupe/tokens/tokens"))?,
             rancher_cluster: var("AL_RANCHER_CLUSTER", "local"),
             change_windows: crate::windows::parse(&env::var("AL_CHANGE_WINDOWS").unwrap_or_default()).map_err(|e| anyhow::anyhow!("AL_CHANGE_WINDOWS: {e}"))?,
@@ -189,8 +207,22 @@ mod tests {
         assert!(parse_tokens("a aaaaaaaaaaaaaaaaaaaa extra").is_err());
     }
     #[test]
-    fn parses_ranges() {
-        assert_eq!(range("1-5"), vec![1, 2, 3, 4, 5]);
-        assert_eq!(range("1,3, 6"), vec![1, 3, 6]);
+    fn parses_days_and_hours() {
+        assert_eq!(days("1-5").unwrap(), vec![1, 2, 3, 4, 5]);
+        assert_eq!(days("1,3, 6").unwrap(), vec![1, 3, 6]);
+        assert_eq!(hours("9-18").unwrap(), (9, 18));
+        assert_eq!(hours("22-2").unwrap(), (22, 2));
+    }
+
+    /// A setting the server cannot read stops the config check; it used to fall back
+    /// quietly ("Mon-Fri" meant no working days, "90d" meant 30 days kept).
+    #[test]
+    fn unreadable_settings_are_refused() {
+        for bad in ["Mon-Fri", "0-5", "1-8", "5-1", "1,,2", ""] {
+            assert!(days(bad).is_err(), "{bad}");
+        }
+        for bad in ["9:00-18:00", "9", "9-25", "9-9", "a-b"] {
+            assert!(hours(bad).is_err(), "{bad}");
+        }
     }
 }
