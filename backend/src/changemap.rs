@@ -90,6 +90,12 @@ fn ui_maintenance(resource: &str, name: &str) -> bool {
         || matches!(resource, "userpreferences" | "userattributes")
 }
 
+/// A namespace an application lives in: not cluster-scoped, and not one of Kubernetes',
+/// Rancher's or an add-on's own (`kube-*`, `cattle-*`, `fleet-*`, `*-system`).
+fn application_namespace(ns: &str) -> bool {
+    !ns.is_empty() && !ns.starts_with("kube-") && !ns.starts_with("cattle-") && !ns.starts_with("fleet-") && !ns.ends_with("-system")
+}
+
 fn is_write(source: &str, verb: &str, sub: &str) -> bool {
     if source == "rancher" {
         return !matches!(verb, "get" | "list" | "watch");
@@ -551,7 +557,11 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
                 hidden_ui += 1;
                 continue;
             }
-            if matches!(category, "component" | "rancher") {
+            // Rancher's own accounts (Fleet, NeuVector, the cluster agent) are hidden only where
+            // they keep themselves running. In an application's namespace they deploy and grant:
+            // Fleet patches its Deployments, the agent writes its RoleBindings. Those are changes
+            // to look at when the service misbehaves, so they stay on the page.
+            if category == "component" || (category == "rancher" && !application_namespace(s(9)?)) {
                 hidden_system += 1;
                 continue;
             }
@@ -957,6 +967,38 @@ mod tests {
 
     // 2026-10-20 10:00 Asia/Taipei
     const T: i64 = 1_792_461_600_000;
+
+    #[test]
+    fn rancher_writes_in_an_application_namespace_are_shown() {
+        let s = store();
+        {
+            let c = s.conn.lock().unwrap();
+            ev(&c, 1, "c1", T, "system:serviceaccount:cattle-fleet-system:fleet-agent", 0, "direct", "patch", "deployments", "shop", "web");
+            ev(&c, 2, "c1", T + 1000, "system:serviceaccount:cattle-system:cattle", 0, "direct", "create", "rolebindings", "shop", "rb");
+            ev(&c, 3, "c1", T + 2000, "system:serviceaccount:cattle-fleet-system:fleet-agent", 0, "direct", "patch", "configmaps", "cattle-fleet-system", "x");
+            ev(&c, 4, "c1", T + 3000, "system:serviceaccount:cattle-system:cattle", 0, "direct", "update", "clusterroles", "", "cr");
+            ev(&c, 5, "c1", T + 4000, "system:serviceaccount:cattle-neuvector-system:neuvector", 0, "direct", "update", "configmaps", "longhorn-system", "y");
+            ev(&c, 6, "c1", T + 5000, "system:kube-scheduler", 0, "direct", "create", "bindings", "shop", "p1");
+        }
+        let p = Params { day: Some("2026-10-20".into()), ..Default::default() };
+        let v = changemap(&s, chrono_tz::Asia::Taipei, &p, T).unwrap();
+        let mut keys: Vec<&str> = v["rows"].as_array().unwrap().iter().map(|r| r["key"].as_str().unwrap()).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["c1//deployments/shop/web", "c1//rolebindings/shop/rb"], "{v}");
+        assert!(v["rows"].as_array().unwrap().iter().all(|r| r["who"]["category"] == "rancher"));
+        // Their own namespaces, cluster-scoped objects, add-on namespaces and components stay hidden.
+        assert_eq!(v["hidden"]["system"], 4);
+    }
+
+    #[test]
+    fn application_namespaces() {
+        for ns in ["shop", "default", "laoban-dev", "argocd"] {
+            assert!(application_namespace(ns), "{ns}");
+        }
+        for ns in ["", "kube-system", "kube-public", "cattle-system", "cattle-fleet-system", "fleet-default", "longhorn-system", "audit-loupe-system"] {
+            assert!(!application_namespace(ns), "{ns}");
+        }
+    }
 
     #[test]
     fn states_follow_the_order_and_system_is_hidden() {
