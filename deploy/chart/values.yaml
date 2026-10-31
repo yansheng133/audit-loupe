@@ -69,6 +69,9 @@ server:
   configCheck:
     enabled: true
     timeoutSeconds: 120
+  # Scratch space for SQLite's temporary files (/tmp, an emptyDir). Building the change map
+  # index sorts the records the page can list.
+  tmpSize: 1Gi
   persistence:
     # SQLite on a volume. Empty storageClass uses the cluster default; RKE2 ships none.
     storageClass: ""

@@ -99,6 +99,9 @@ spec:
           volumeMounts:
             - { name: data, mountPath: /data }
             - { name: tokens, mountPath: /etc/audit-loupe/tokens, readOnly: true }
+            # SQLite sorts in temporary files (building an index, large reads on the second
+            # connection); the root filesystem is read-only.
+            - { name: tmp, mountPath: /tmp }
             {{- if .Values.server.forward.secret }}
             - { name: forward, mountPath: /etc/audit-loupe/forward, readOnly: true }
             {{- end }}
@@ -114,6 +117,8 @@ spec:
         - name: forward-ca
           secret: { secretName: {{ .Values.server.forward.caSecret }}, items: [{ key: ca.crt, path: ca.crt }] }
         {{- end }}
+        - name: tmp
+          emptyDir: { sizeLimit: {{ .Values.server.tmpSize }} }
         - name: data
           persistentVolumeClaim:
             claimName: audit-loupe-data

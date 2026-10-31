@@ -22,6 +22,15 @@ pub struct Store {
     pub(crate) job: Arc<Mutex<Option<crate::rulestate::Job>>>,
 }
 
+/// One cluster's chained records in order. `events_chain` (cluster, then rowid) hands them over
+/// already in id order. Without it SQLite sorted the whole cluster first in a temporary table:
+/// in memory on the main connection (about 200 MB at 500,000 records, which ended in the pod
+/// being killed at its 512 MiB limit) and in a temporary file on the reader, which fails where
+/// the root filesystem is read-only.
+const CHAIN_SQL: &str = "SELECT id, audit_id, source, ts, actor, principal, user_id, human, via, caller, verb, api_group, resource, subresource,
+        namespace, name, code, source_ip, user_agent, request_uri, request_object, hash
+ FROM events INDEXED BY events_chain WHERE cluster=?1 AND id > ?2 AND hash IS NOT NULL ORDER BY id";
+
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
@@ -662,7 +671,8 @@ impl Store {
         )?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS events_pair ON events(cluster, user_id, source, ts_ms);
-             CREATE INDEX IF NOT EXISTS events_link ON events(link_id);",
+             CREATE INDEX IF NOT EXISTS events_link ON events(link_id);
+             CREATE INDEX IF NOT EXISTS events_chain ON events(cluster);",
         )?;
         crate::rulestate::prepare(&conn)?;
         prepare_stats(&conn)?;
@@ -1196,11 +1206,7 @@ impl Store {
         for cl in clusters {
             let (base_id, mut prev): (i64, String) =
                 c.query_row("SELECT base_id, base_hash FROM chain_base WHERE cluster=?1", params![cl], |r| Ok((r.get(0)?, r.get(1)?))).optional()?.unwrap_or((0, String::new()));
-            let mut st = c.prepare_cached(
-                "SELECT id, audit_id, source, ts, actor, principal, user_id, human, via, caller, verb, api_group, resource, subresource,
-                        namespace, name, code, source_ip, user_agent, request_uri, request_object, hash
-                 FROM events WHERE cluster=?1 AND id > ?2 AND hash IS NOT NULL ORDER BY id",
-            )?;
+            let mut st = c.prepare_cached(CHAIN_SQL)?;
             let mut rows = st.query(params![cl, base_id])?;
             let (mut verified, mut first_bad, mut head) = (0i64, None, (base_id, prev.clone()));
             while let Some(r) = rows.next()? {
@@ -2160,6 +2166,22 @@ mod tests {
 
     fn obj(n: i64) -> Value {
         json!({"metadata":{"name":"web","namespace":"shop","resourceVersion": n.to_string()},"spec":{"replicas":n}})
+    }
+
+    #[test]
+    fn the_chain_check_reads_in_order_without_sorting() {
+        // A temporary sort here held a whole cluster in memory (or needed a writable /tmp).
+        let s = Store::open(":memory:").unwrap();
+        let c = s.conn.lock().unwrap();
+        let plan: Vec<String> = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {CHAIN_SQL}"))
+            .unwrap()
+            .query_map(params!["c1", 0], |r| r.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(plan.iter().all(|l| !l.contains("TEMP B-TREE")), "{plan:?}");
+        assert!(plan.iter().any(|l| l.contains("events_chain")), "{plan:?}");
     }
 
     #[test]
