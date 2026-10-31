@@ -320,6 +320,13 @@ PVC（`audit-loupe-data`）不會自動刪除，要保留稽核資料請先備�
 
 ## 11. 升級注意事項
 
+### 從 0.6.0 升級
+
+- **升級後第一次啟動會在背景建行為表**（`behaviors`、`behavior_ops`）。建好之前變更地圖照常可用，`/api/behaviors` 回 `meta.progress`、段落是空的，過一會兒重新開頁就有。lab 約 50 萬筆約 1.5 秒。`server.behaviors` 的切法設定（格寬、斷開門檻、是否列入失敗請求）改了之後也會重建一次。
+- **介面要一起升級到 0.7.0**：0.7.0 介面的變更地圖讀 `/api/behaviors`，舊 server 沒有這支 API，畫面會提示要升級 server；0.6.0 介面配 0.7.0 server 照常可用。
+- 既有的 `/api/changemap` 內容不變（仍然不過濾失敗的請求）；新的行為預設不列失敗的請求（`server.behaviors.dropFailed`）。
+- values 沒有必須改的項目。若用 `helm upgrade --reuse-values`，新的 `server.behaviors` 預設值不會帶進來（helm 的行為），請改用 `--reset-then-reuse-values` 或直接給 values 檔。
+
 ### 從 0.5.1 升級
 
 - **讀不懂的設定會讓升級失敗。**`workDays`、`workHours`、`retentionDays` 與變更時段的 `days`／`hours` 以前讀不懂時會改用預設值，而且不會說：`workDays: "Mon-Fri"` 等於沒有工作日（每一筆人的操作都變成「非上班時間」），`retentionDays: "90d"` 等於只保留 30 天（多出來的資料會被刪掉）。現在升級前的設定檢查會擋下來，並指出是哪一個設定。寫法：星期幾用 1（週一）到 7（週日），例如 `"1-5"` 或 `"1,3,5"`；時間用整點，例如 `"9-18"`；保留天數用大於 0 的整數。工作時間不能跨過午夜；變更時段可以（例如 `"22-2"`）。
