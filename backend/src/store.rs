@@ -22,14 +22,15 @@ pub struct Store {
     pub(crate) job: Arc<Mutex<Option<crate::rulestate::Job>>>,
 }
 
-/// One cluster's chained records in order. `events_chain` (cluster, then rowid) hands them over
-/// already in id order. Without it SQLite sorted the whole cluster first in a temporary table:
-/// in memory on the main connection (about 200 MB at 500,000 records, which ended in the pod
-/// being killed at its 512 MiB limit) and in a temporary file on the reader, which fails where
-/// the root filesystem is read-only.
+/// Every chained record after `?1`, in id order, all clusters in one pass. Reading by id (the
+/// table's own order) needs no sort. Asking per cluster did: SQLite sorted a whole cluster in a
+/// temporary table first, in memory on the main connection (about 200 MB at 500,000 records,
+/// which ended in the pod being killed at its 512 MiB limit) and in a temporary file on the
+/// reader, which fails where the root filesystem is read-only. An index on the cluster would
+/// avoid the sort too, but SQLite then picked it for the object detail as well (4 ms to 167 ms).
 const CHAIN_SQL: &str = "SELECT id, audit_id, source, ts, actor, principal, user_id, human, via, caller, verb, api_group, resource, subresource,
-        namespace, name, code, source_ip, user_agent, request_uri, request_object, hash
- FROM events INDEXED BY events_chain WHERE cluster=?1 AND id > ?2 AND hash IS NOT NULL ORDER BY id";
+        namespace, name, code, source_ip, user_agent, request_uri, request_object, hash, cluster
+ FROM events NOT INDEXED WHERE id > ?1 AND hash IS NOT NULL ORDER BY id";
 
 const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
@@ -671,8 +672,7 @@ impl Store {
         )?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS events_pair ON events(cluster, user_id, source, ts_ms);
-             CREATE INDEX IF NOT EXISTS events_link ON events(link_id);
-             CREATE INDEX IF NOT EXISTS events_chain ON events(cluster);",
+             CREATE INDEX IF NOT EXISTS events_link ON events(link_id);",
         )?;
         crate::rulestate::prepare(&conn)?;
         prepare_stats(&conn)?;
@@ -1202,35 +1202,55 @@ impl Store {
             .prepare("SELECT cluster FROM chain WHERE (?1 IS NULL OR cluster=?1) ORDER BY cluster")?
             .query_map(params![cluster], |r| r.get(0))?
             .collect::<Result<_, _>>()?;
-        let mut out = Vec::new();
-        for cl in clusters {
-            let (base_id, mut prev): (i64, String) =
-                c.query_row("SELECT base_id, base_hash FROM chain_base WHERE cluster=?1", params![cl], |r| Ok((r.get(0)?, r.get(1)?))).optional()?.unwrap_or((0, String::new()));
-            let mut st = c.prepare_cached(CHAIN_SQL)?;
-            let mut rows = st.query(params![cl, base_id])?;
-            let (mut verified, mut first_bad, mut head) = (0i64, None, (base_id, prev.clone()));
-            while let Some(r) = rows.next()? {
-                let g = |i: usize| -> rusqlite::Result<String> { r.get(i) };
-                let (id, ro, stored): (i64, Option<String>, String) = (r.get(0)?, r.get(20)?, r.get(21)?);
-                let (aid, src, ts, actor, pr, uid, via, caller, verb, grp, res, sub, ns, name, sip, ua, uri) =
-                    (g(1)?, g(2)?, g(3)?, g(4)?, g(5)?, g(6)?, g(8)?, g(9)?, g(10)?, g(11)?, g(12)?, g(13)?, g(14)?, g(15)?, g(17)?, g(18)?, g(19)?);
-                let fields = Fields {
-                    cluster: &cl, audit_id: &aid, source: &src, ts: &ts, actor: &actor, principal: &pr, user_id: &uid,
-                    human: r.get::<_, i64>(7)? == 1, via: &via, caller: &caller, verb: &verb, api_group: &grp, resource: &res,
-                    subresource: &sub, namespace: &ns, name: &name, code: r.get(16)?, source_ip: &sip, user_agent: &ua,
-                    request_uri: &uri, request_object: ro.as_deref(),
-                };
-                if link(&prev, &fields) != stored {
-                    first_bad = Some(id);
-                    break;
-                }
-                prev = stored;
-                head = (id, prev.clone());
-                verified += 1;
-            }
-            out.push(ChainReport { cluster: cl, base_id, verified, first_bad_id: first_bad, head_id: head.0, head_hash: head.1 });
+        // Per cluster: base id, previous hash, verified, first bad id, head (id, hash).
+        struct Walk {
+            base_id: i64,
+            prev: String,
+            verified: i64,
+            first_bad: Option<i64>,
+            head: (i64, String),
         }
-        Ok(out)
+        let mut walks: std::collections::BTreeMap<String, Walk> = std::collections::BTreeMap::new();
+        for cl in clusters {
+            let (base_id, prev): (i64, String) =
+                c.query_row("SELECT base_id, base_hash FROM chain_base WHERE cluster=?1", params![cl], |r| Ok((r.get(0)?, r.get(1)?))).optional()?.unwrap_or((0, String::new()));
+            walks.insert(cl, Walk { base_id, head: (base_id, prev.clone()), prev, verified: 0, first_bad: None });
+        }
+        let from = walks.values().map(|w| w.base_id).min().unwrap_or(0);
+        let mut st = c.prepare_cached(CHAIN_SQL)?;
+        let mut rows = st.query(params![from])?;
+        let mut open = walks.len();
+        while open > 0 {
+            let Some(r) = rows.next()? else { break };
+            let cl: String = r.get(22)?;
+            let id: i64 = r.get(0)?;
+            let Some(w) = walks.get_mut(&cl) else { continue };
+            if w.first_bad.is_some() || id <= w.base_id {
+                continue;
+            }
+            let g = |i: usize| -> rusqlite::Result<String> { r.get(i) };
+            let (ro, stored): (Option<String>, String) = (r.get(20)?, r.get(21)?);
+            let (aid, src, ts, actor, pr, uid, via, caller, verb, grp, res, sub, ns, name, sip, ua, uri) =
+                (g(1)?, g(2)?, g(3)?, g(4)?, g(5)?, g(6)?, g(8)?, g(9)?, g(10)?, g(11)?, g(12)?, g(13)?, g(14)?, g(15)?, g(17)?, g(18)?, g(19)?);
+            let fields = Fields {
+                cluster: &cl, audit_id: &aid, source: &src, ts: &ts, actor: &actor, principal: &pr, user_id: &uid,
+                human: r.get::<_, i64>(7)? == 1, via: &via, caller: &caller, verb: &verb, api_group: &grp, resource: &res,
+                subresource: &sub, namespace: &ns, name: &name, code: r.get(16)?, source_ip: &sip, user_agent: &ua,
+                request_uri: &uri, request_object: ro.as_deref(),
+            };
+            if link(&w.prev, &fields) != stored {
+                w.first_bad = Some(id);
+                open -= 1;
+                continue;
+            }
+            w.prev = stored;
+            w.head = (id, w.prev.clone());
+            w.verified += 1;
+        }
+        Ok(walks
+            .into_iter()
+            .map(|(cl, w)| ChainReport { cluster: cl, base_id: w.base_id, verified: w.verified, first_bad_id: w.first_bad, head_id: w.head.0, head_hash: w.head.1 })
+            .collect())
     }
 
     pub fn forward_cursor(&self, target: &str) -> anyhow::Result<(i64, i64)> {
@@ -2176,12 +2196,12 @@ mod tests {
         let plan: Vec<String> = c
             .prepare(&format!("EXPLAIN QUERY PLAN {CHAIN_SQL}"))
             .unwrap()
-            .query_map(params!["c1", 0], |r| r.get(3))
+            .query_map(params![0], |r| r.get(3))
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
         assert!(plan.iter().all(|l| !l.contains("TEMP B-TREE")), "{plan:?}");
-        assert!(plan.iter().any(|l| l.contains("events_chain")), "{plan:?}");
+        assert!(plan.iter().all(|l| !l.contains("INDEX")), "read by id, not through an index: {plan:?}");
     }
 
     #[test]
