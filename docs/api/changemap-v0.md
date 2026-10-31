@@ -15,7 +15,7 @@ v0 是原型：開頁時直接查現有資料表，**不做彙總表、不調效
 | `tab` | `overview`（預設）／`relations`／`events`。只回傳該分頁需要的區塊 |
 | `cursor` | 翻頁；每頁 100 列 |
 | `select` | 物件鍵（見下）；不帶就選排序第一的物件 |
-| `system` | `1` 時包含系統元件與 Rancher 介面維護動作；預設不含 |
+| `system` | `1` 時包含系統元件與 Rancher 介面維護動作；預設不含。Rancher 內部的帳號（Fleet、NeuVector、cluster agent）改到應用程式 namespace 的物件，預設就列出；改到它們自己的 namespace（`kube-*`、`cattle-*`、`fleet-*`、`*-system`）或叢集範圍物件的才隱藏 |
 
 物件鍵：`cluster/apiGroup/resource/namespace/name`。core group 的 `apiGroup` 是空字串；叢集範圍的物件 `namespace` 是空字串。要分得出 Kubernetes 的 Node 與 Longhorn 的 `nodes.longhorn.io`。
 

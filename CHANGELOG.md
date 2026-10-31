@@ -2,6 +2,9 @@
 
 ## 未發佈
 
+### 變更
+- **變更地圖預設列出 Rancher 內部帳號改到應用程式的物件**：Fleet 改應用程式的 Deployment、Service、Secret，Rancher cluster agent 在應用程式 namespace 建立或刪除 RoleBinding，這些是服務出問題時要先看的變更，以前和系統元件一起預設隱藏。現在只有改到 `kube-*`、`cattle-*`、`fleet-*`、`*-system` 這些 namespace 或叢集範圍物件的才隱藏。lab 10/20–10/30 的資料，每天多 0～4 列；叢集元件的寫入照舊隱藏。
+
 ### 修正
 - **規則或白名單寫錯時，升級失敗而不是 server 停擺**：每次安裝或升級前，chart 先用新映像檔跑 `check-config`（Job `audit-loupe-config-check`）。讀不過就讓 `helm upgrade` 失敗，原本的 server 照常運作；以前 server 會先停掉、新的起不來，直到改好設定（lab 實測約停 1 分鐘）。可用 `server.configCheck.enabled: false` 關掉。
 
