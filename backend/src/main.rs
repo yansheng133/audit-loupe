@@ -1,6 +1,7 @@
 mod access;
 mod api;
 mod audit;
+mod behaviors;
 mod changemap;
 mod collect;
 mod config;

@@ -132,8 +132,8 @@ v6 的四個分頁（活動總覽、稽核發現、依身分、依資源範圍�
 - 三個設定值可以在規則設定調整（`AL_BEHAVIOR_LOOK`、`AL_BEHAVIOR_NOTABLE`、`AL_BEHAVIOR_TAG_ONLY`），改了不必重建，下一次開頁就生效。
 
 ### 一段行為的欄位
-- **`id`**：字串，原樣帶回，不要解析。有執行者的段落是 `b<數字>`；沒有執行者的段落是 `u~<cluster>~<scope>~<第一筆時間>`。規則重新判斷或切段設定改變後重建，`id` 會換；新紀錄把兩段接起來時，合併後留較小的那個 `id`。
-- **`title`**：段內**最嚴重的那一筆**（最高嚴重度、不在 `tagOnly` 的警示；同級取最早的一筆）。沒有這種警示時是 `null`，介面改用 `scope`＋`what` 當標題（例如「nv-demo：修改 Deployment ×12」）。
+- **`id`**：字串，原樣帶回，不要解析。有執行者的段落是 `b<數字>`；沒有執行者的段落是 `u~<cluster>~<scope>~<這天第一筆的時間>`（每天各自編，跨午夜時兩天的 `id` 不同；有執行者的段落兩天相同）。規則重新判斷或切段設定改變後重建，`id` 會換；新紀錄把兩段接起來時，合併後留較小的那個 `id`。
+- **`title`**：段內**最嚴重的那一筆**：警示的規則不在 `tagOnly`、嚴重度在 `settings.look` 或 `settings.notable`，先比嚴重度（look 先），同級取最早的一筆。只有低風險或只有 `tagOnly` 的警示時是 `null`，介面改用 `scope`＋`what` 當標題（例如「nv-demo：修改 Deployment ×12」）。
   - `verb` 是**實際的動作**：進入容器時是子資源名稱（`exec`、`attach`、`portforward`），不是規則名稱；其他子資源只有 `create` 才用子資源名稱（與 changemap 的 `detail.ops[].verb` 相同）。沒有執行者的變化是 `added`、`modified`、`deleting`、`deleted`、`added_unseen`、`modified_unseen`。
   - `kind` 依資源種類（`resource_kinds` 表，沒有就用內建對照，再沒有就是資源名稱）。
 - **`what`**：「動作 種類 ×次數」，依次數多到少、全部列出；`verb` 規則同 `title`。介面自己決定顯示前幾項。
@@ -152,9 +152,9 @@ v6 的四個分頁（活動總覽、稽核發現、依身分、依資源範圍�
   - `look`：要看的段落與其 `title`，依時間。
   - `longGaps`：同一叢集的收集中斷合併後（重疊的接起來）長度 ≥ `joinMinutes` 的，`collectors` 是涵蓋的收集元件。
 - **`gaps`**：這天的收集中斷，欄位與 `/api/changemap` 的 `timeline.gaps` 相同（`kind`、`reasonCode`、`cause`、`open`），原本「事件」分頁的收集事件在稽核發現的最後一區用它畫。
-- **`actors`**：依身分分頁左邊的帳號清單；一個 `key` 一列（跨叢集合併，`clusters` 列出出現的叢集）。`behaviors`、`ops`、`look` 是段數、筆數、要看的段數。依 group（people、unrecorded、unauthenticated、routine、system）再依最嚴重的 tier、再依筆數多到少。
+- **`actors`**：依身分分頁左邊的帳號清單；一個 `key` 一列（跨叢集合併，`clusters` 列出出現的叢集）。未記錄執行者（`key` 為空）例外：**每座叢集一列**，因為原因（`noteCode`、`dependsOn`）依叢集而不同。`behaviors`、`ops`、`look` 是段數、筆數、要看的段數。依 group（people、unrecorded、unauthenticated、routine、system）再依最嚴重的 tier、再依筆數多到少。
 - **`scopes`**：依資源範圍分頁左邊的 namespace 清單；一個（`cluster`, `scope`）一列。`actors` 是動過它的帳號數，`tier` 是它最嚴重的段落的 tier。依叢集、再依 `tier`、再依段數多到少。
-- **`strip`**：底部時間列，這天每一格各組的操作筆數（只列有操作的格子，`t` 是格子開始時間）。
+- **`strip`**：底部時間列，這天每一格各組的操作筆數（只列有操作的格子，`t` 是格子開始時間）。帶 `system=1` 時多一個 `system`。
 - **`overlaps`**：`people` 裡兩個不同帳號在同一格都有操作的格數，以及第一格開始到最後一格結束。**只是提示，不能說是同一人**（任務書第 3 節第 6 點）。
 - **`selected`**、**`detail`**：預設選取的段落與其明細（同 `/api/behaviors/detail`）；這天沒有段落時兩者都是 null。
 - **`meta`**：

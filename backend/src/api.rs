@@ -190,6 +190,35 @@ async fn changemap_detail(State(s): State<AppState>, uri: axum::http::Uri) -> Re
     }
 }
 
+/// Behaviors of a day for the change map v6 (`docs/api/behaviors-v0.md`): one request per page view.
+async fn behaviors(State(s): State<AppState>, uri: axum::http::Uri) -> Response {
+    let p = crate::behaviors::parse_query(uri.query().unwrap_or(""));
+    let (store, tz) = (s.store.clone(), s.cfg.tz);
+    let t0 = std::time::Instant::now();
+    let r = tokio::task::spawn_blocking(move || crate::behaviors::page(&store, tz, &p, Utc::now().timestamp_millis())).await;
+    let db = t0.elapsed();
+    match r {
+        Ok(Ok(v)) => with_db_timing(Json(v).into_response(), db),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => err(e.into()),
+    }
+}
+
+/// One behavior's operations and objects, for a click. 404 `no-records` when it has nothing that day.
+async fn behaviors_detail(State(s): State<AppState>, uri: axum::http::Uri) -> Response {
+    let p = crate::behaviors::parse_query(uri.query().unwrap_or(""));
+    let (store, tz) = (s.store.clone(), s.cfg.tz);
+    let t0 = std::time::Instant::now();
+    let r = tokio::task::spawn_blocking(move || crate::behaviors::detail(&store, tz, &p, Utc::now().timestamp_millis())).await;
+    let db = t0.elapsed();
+    match r {
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(json!({"error": "no-records"}))).into_response(),
+        Ok(Ok(Some(v))) => with_db_timing(Json(v).into_response(), db),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => err(e.into()),
+    }
+}
+
 /// The rule settings in force, earlier settings, and whether stored records were judged by
 /// other settings than these (and how long judging them again would take).
 async fn rules(State(s): State<AppState>) -> Response {
@@ -655,6 +684,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/info", get(info))
         .route("/api/changemap", get(changemap))
         .route("/api/changemap/detail", get(changemap_detail))
+        .route("/api/behaviors", get(behaviors))
+        .route("/api/behaviors/detail", get(behaviors_detail))
         .route("/api/actors", get(actors))
         .route("/api/users", get(users))
         .route("/api/identities", get(identities))
