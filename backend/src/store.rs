@@ -124,6 +124,10 @@ CREATE TABLE IF NOT EXISTS listing (
   cluster TEXT NOT NULL, api_group TEXT NOT NULL, resource TEXT NOT NULL, first INTEGER NOT NULL,
   PRIMARY KEY (cluster, api_group, resource)
 );
+CREATE TABLE IF NOT EXISTS listed (
+  cluster TEXT NOT NULL, api_group TEXT NOT NULL, resource TEXT NOT NULL,
+  PRIMARY KEY (cluster, api_group, resource)
+);
 "#;
 
 /// Version kinds:
@@ -299,7 +303,13 @@ pub struct RoleChange {
 }
 
 /// Three missed heartbeats (one a minute) count as a gap.
-const GAP_MS: i64 = 180_000;
+pub const GAP_MS: i64 = 180_000;
+
+/// A collector silent this long is taken as removed (a node replaced, a collector turned off in
+/// the chart), not as down: the change map stops marking the time after it as unseen, and the
+/// coverage page lists it as retired. If it checks in again, the whole silence is recorded as
+/// a gap as usual. Its row is dropped once it is older than retention.
+pub const RETIRED_MS: i64 = 86_400_000;
 
 #[derive(Debug, Serialize)]
 pub struct CoverageRow {
@@ -676,6 +686,17 @@ impl Store {
         )?;
         crate::rulestate::prepare(&conn)?;
         prepare_stats(&conn)?;
+        // The final delete of an object with finalizers takes the event of its "deleting"
+        // version (link_since). Live linking only looks back 45 minutes, so versions stored
+        // before that rule get it here. Only rows that would get an event are written, so a
+        // later start writes nothing.
+        const STARTED: &str = "SELECT g.event_id FROM versions g WHERE g.cluster=versions.cluster AND g.api_group=versions.api_group AND g.resource=versions.resource
+                 AND g.namespace=versions.namespace AND g.name=versions.name AND g.uid=versions.uid AND g.change='deleting' AND g.id < versions.id
+               ORDER BY g.id DESC LIMIT 1";
+        conn.execute(
+            &format!("UPDATE versions SET event_id = ({STARTED}) WHERE change='deleted' AND event_id IS NULL AND ({STARTED}) IS NOT NULL"),
+            [],
+        )?;
         crate::identity::prepare(&conn, &cfg.identities)?;
         // Ingest waits briefly instead of failing while a background build holds the write lock.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -969,11 +990,15 @@ impl Store {
         Ok(self.insert_events(cluster, std::slice::from_ref(r))? == 1)
     }
 
-    /// True if any version of this resource type was ever stored, i.e. a list is a re-list.
+    /// True if this resource type was listed to the end before, or any version of it was ever
+    /// stored, i.e. a list is a re-list. A type with no objects stores no versions, so the
+    /// finished list is remembered in `listed`; otherwise an object created while the
+    /// collector was down would be taken as part of a first look and never shown.
     pub fn has_any(&self, cluster: &str, group: &str, resource: &str) -> anyhow::Result<bool> {
         let c = self.conn.lock().unwrap();
         Ok(c.query_row(
-            "SELECT 1 FROM versions WHERE cluster=?1 AND api_group=?2 AND resource=?3 LIMIT 1",
+            "SELECT 1 FROM versions WHERE cluster=?1 AND api_group=?2 AND resource=?3
+             UNION ALL SELECT 1 FROM listed WHERE cluster=?1 AND api_group=?2 AND resource=?3 LIMIT 1",
             params![cluster, group, resource],
             |_| Ok(()),
         )
@@ -1474,10 +1499,9 @@ impl Store {
                             }
                         }
                     }
-                    self.conn.lock().unwrap().execute(
-                        "DELETE FROM listing WHERE cluster=?1 AND api_group=?2 AND resource=?3",
-                        params![cluster, group, resource],
-                    )?;
+                    let c = self.conn.lock().unwrap();
+                    c.execute("DELETE FROM listing WHERE cluster=?1 AND api_group=?2 AND resource=?3", params![cluster, group, resource])?;
+                    c.execute("INSERT OR IGNORE INTO listed (cluster, api_group, resource) VALUES (?1,?2,?3)", params![cluster, group, resource])?;
                 }
             }
         }
@@ -1580,6 +1604,27 @@ impl Store {
         drop(stmt);
         let mut linked = 0;
         for (vid, cluster, group, resource, ns, name, obs, change) in pending {
+            // An object with finalizers goes in two steps: the delete request sets the deletion
+            // timestamp ("deleting", linked to that request), and the object is gone once the
+            // finalizers are done ("deleted"). Both come from the same request, so the second
+            // takes the first one's event instead of looking for another delete. A controller
+            // usually removes the last finalizer in between (a "modified" version), so this looks
+            // back for the same object (same uid), not only at the version just before.
+            if change == "deleted" {
+                let started: Option<Option<i64>> = c
+                    .query_row(
+                        "SELECT event_id FROM versions WHERE cluster=?1 AND api_group=?2 AND resource=?3 AND namespace=?4 AND name=?5 AND id < ?6
+                         AND change='deleting' AND uid=(SELECT uid FROM versions WHERE id=?6) ORDER BY id DESC LIMIT 1",
+                        params![cluster, group, resource, ns, name, vid],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(Some(eid)) = started {
+                    c.execute("UPDATE versions SET event_id=?1 WHERE id=?2", params![eid, vid])?;
+                    linked += 1;
+                    continue;
+                }
+            }
             let (verbs, before_ms, order) = match change.as_str() {
                 "added" => ("('create','update','patch')", 20_000, "ASC"),
                 "added_unseen" => ("('create','update','patch')", 30 * 60_000, "DESC"),
@@ -1755,12 +1800,18 @@ impl Store {
                 .prepare("SELECT instance, last_ms FROM heartbeats WHERE cluster=?1 AND collector=?2 AND instance<>?3 AND ?4 - last_ms > ?5")?
                 .query_map(params![cluster, collector, instance, now_ms, GAP_MS], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<Result<_, _>>()?;
-            for (old, last) in stale {
+            // Every gap is worked out before any row goes, so with several stale pods each one's
+            // silence ends where the next one started, whatever order their names sort in.
+            let mut ends = Vec::new();
+            for (old, last) in &stale {
                 let next: i64 = c.query_row(
                     "SELECT MIN(COALESCE(first_ms, ?4)) FROM heartbeats WHERE cluster=?1 AND collector=?2 AND instance<>?3 AND last_ms > ?5",
                     params![cluster, collector, old, now_ms, last],
                     |r| r.get(0),
                 )?;
+                ends.push(next);
+            }
+            for ((old, last), next) in stale.iter().zip(ends) {
                 if next - last > GAP_MS {
                     c.execute("INSERT INTO gaps (cluster, collector, instance, from_ms, to_ms) VALUES (?1,?2,?3,?4,?5)", params![cluster, collector, old, last, next])?;
                 }
@@ -1863,7 +1914,8 @@ impl Store {
         for (cl, col, inst, last, details) in beats {
             let i = row(&mut out, &cl);
             let stale = now_ms - last > GAP_MS;
-            out[i].collectors.push(json!({"collector": col, "instance": inst, "lastMs": last, "stale": stale,
+            let retired = now_ms - last > RETIRED_MS;
+            out[i].collectors.push(json!({"collector": col, "instance": inst, "lastMs": last, "stale": stale, "retired": retired,
                                           "details": serde_json::from_str::<Value>(&details).unwrap_or(Value::Null)}));
             if stale && last <= to_ms {
                 out[i].gaps.push(json!({"kind": "heartbeat", "collector": col, "instance": inst, "fromMs": last, "toMs": null, "reason": SILENT, "detail": ""}));
@@ -1962,7 +2014,7 @@ impl Store {
             "SELECT e.id,e.cluster,e.ts,e.actor,e.principal,e.human,e.via,e.caller,e.verb,e.api_group,e.resource,e.subresource,
                     e.namespace,e.name,e.code,e.source_ip,e.user_agent,e.request_uri,e.request_object,
                     (SELECT group_concat(rule || ':' || severity) FROM alerts a WHERE a.event_id=e.id),
-                    (SELECT v.id FROM versions v WHERE v.event_id=e.id ORDER BY v.id DESC LIMIT 1),
+                    (SELECT v.id FROM versions v WHERE v.event_id=e.id ORDER BY v.id LIMIT 1),
                     e.source,e.user_id,r.ts,r.user_agent,r.source_ip,r.request_uri,e.audit_id
              FROM events e LEFT JOIN events r ON r.id=e.link_id AND e.source='k8s'
              WHERE e.ts_ms BETWEEN ?1 AND ?2",
@@ -2160,6 +2212,9 @@ impl Store {
         c.execute("DELETE FROM security_events WHERE ts_ms < ?1", params![cutoff])?;
         c.execute("DELETE FROM hourly WHERE hour_ms < ?1", params![cutoff])?;
         c.execute("DELETE FROM stories WHERE last_ms < ?1", params![cutoff])?;
+        c.execute("DELETE FROM rejected_lines WHERE received_ms < ?1", params![cutoff])?;
+        // A collector silent since before retention is long gone (RETIRED_MS).
+        c.execute("DELETE FROM heartbeats WHERE last_ms < ?1", params![cutoff])?;
         Ok(n + m)
     }
 }
@@ -2440,6 +2495,19 @@ mod tests {
         assert_eq!(s.history(&key()).unwrap()[0].change, "modified");
     }
 
+    /// A type with no objects at its first list stores no versions; the next list after a
+    /// restart is still a re-list, so an object created meanwhile is a change seen late, not
+    /// part of a first look (which the change map leaves out).
+    #[test]
+    fn an_empty_type_listed_once_is_not_a_first_look_again() {
+        let s = Store::open(":memory:").unwrap();
+        let start = ObjMsg::ListStart { group: "apps".into(), resource: "deployments".into() };
+        let done = |names: &[&str]| ObjMsg::ListDone { group: "apps".into(), resource: "deployments".into(), listed: names.iter().map(|n| ("shop".to_string(), n.to_string())).collect() };
+        s.apply_objects("c1", &[start.clone(), done(&[])]).unwrap();
+        s.apply_objects("c1", &[start, ver("list", "web", 1), done(&["web"])]).unwrap();
+        assert_eq!(s.history(&key()).unwrap()[0].change, "added_unseen");
+    }
+
     fn user_msg(seen: &str, uid: &str, created: &str, at_min: i64) -> ObjMsg {
         ObjMsg::Version {
             group: "management.cattle.io".into(), resource: "users".into(), kind: "User".into(),
@@ -2653,6 +2721,22 @@ mod tests {
         let r = &s.verify_chain(None).unwrap()[0];
         assert_eq!((r.base_id, r.verified, r.first_bad_id), (2, 2, None));
 
+        // Set-aside lines and long-silent node collectors go with the records of their time.
+        {
+            let c = s.conn.lock().unwrap();
+            c.execute("INSERT INTO rejected_lines (cluster, source, received_ms, len, sha256, error) VALUES ('c1', 'k8s', ?1, 1, 'x', 'bad')", params![ms(&now) - 40 * 86_400_000]).unwrap();
+            c.execute("INSERT INTO heartbeats (cluster, collector, instance, last_ms, details) VALUES ('c1', 'file', 'gone', ?1, '{}'), ('c1', 'file', 'down', ?2, '{}'), ('c1', 'neuvector', 'off', ?1, '{}'), ('c1', 'watch', 'w', ?2, '{}')",
+                      params![ms(&now) - 40 * 86_400_000, ms(&now) - 2 * 86_400_000]).unwrap();
+        }
+        s.prune(30, now).unwrap();
+        {
+            let c = s.conn.lock().unwrap();
+            let rejected: i64 = c.query_row("SELECT count(*) FROM rejected_lines", [], |r| r.get(0)).unwrap();
+            assert_eq!(rejected, 0);
+            let left: Vec<String> = c.prepare("SELECT instance FROM heartbeats ORDER BY instance").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+            assert_eq!(left, ["down", "w"], "silent two days stays listed; silent past retention goes");
+        }
+
         // Someone edits a stored record directly.
         s.conn.lock().unwrap().execute("UPDATE events SET actor='mallory' WHERE audit_id='p2'", []).unwrap();
         let r = &s.verify_chain(None).unwrap()[0];
@@ -2797,6 +2881,38 @@ mod tests {
         assert_eq!(s.link_since(0).unwrap(), 1);
         let h = s.history(&ns).unwrap();
         assert_eq!((h[0].change.as_str(), h[0].actor.as_deref()), ("deleting", Some("system:admin")));
+        // The finalizers finish later and the object goes: same request, same person. Left
+        // unlinked it showed on the change map as a change nobody made ("unclear"). The
+        // controller removes the last finalizer first (its own change), then the object goes.
+        s.insert_version(&ns, "Namespace", "n1", &json!({"metadata":{"name":"old","deletionTimestamp":"2026-10-14T02:00:01Z","finalizers":[]}}), "modified", t + chrono::Duration::seconds(39)).unwrap();
+        s.insert_version(&ns, "Namespace", "n1", &json!({"metadata":{"name":"old"}}), "deleted", t + chrono::Duration::seconds(40)).unwrap();
+        assert_eq!(s.link_since(0).unwrap(), 1);
+        let h = s.history(&ns).unwrap();
+        assert_eq!((h[0].change.as_str(), h[0].actor.as_deref()), ("deleted", Some("system:admin")));
+        let unlinked: i64 = s.conn.lock().unwrap().query_row("SELECT count(*) FROM versions WHERE event_id IS NULL AND change IN ('deleting','deleted')", [], |r| r.get(0)).unwrap();
+        assert_eq!(unlinked, 0);
+        // The delete request's own row still shows what it did: the deletion timestamp set.
+        let rows = s.timeline(&Query { cluster: None, actor: None, from_ms: 0, to_ms: i64::MAX, humans_only: false, writes_only: false, alerts_only: false, limit: 10 }).unwrap();
+        let del = rows.iter().find(|r| r.verb == "delete").unwrap();
+        assert_eq!(del.change.as_deref(), Some("deleting"));
+    }
+
+    /// Two watch pods stale at once (the second took over within GAP_MS, then stopped too):
+    /// the first had no gap, the second's runs to the third pod, whichever way names sort.
+    #[test]
+    fn several_replaced_pods_each_get_their_own_gap() {
+        let m = 60_000;
+        for (first, second) in [("w-b", "w-a"), ("w-a", "w-b")] {
+            let s = Store::open(":memory:").unwrap();
+            s.heartbeat("c1", "watch", first, &json!({}), 0).unwrap();
+            s.heartbeat("c1", "watch", second, &json!({}), 2 * m).unwrap();
+            s.heartbeat("c1", "watch", second, &json!({}), 3 * m).unwrap();
+            s.heartbeat("c1", "watch", "w-c", &json!({}), 180 * m).unwrap();
+            let gaps: Vec<(String, i64, i64)> = s.conn.lock().unwrap()
+                .prepare("SELECT instance, from_ms, to_ms FROM gaps ORDER BY from_ms").unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(Result::unwrap).collect();
+            assert_eq!(gaps, [(second.to_string(), 3 * m, 180 * m)], "{first} then {second}");
+        }
     }
 
     #[test]
@@ -2835,6 +2951,46 @@ mod tests {
         assert!(!serde_json::to_string(&rows).unwrap().contains("secret"), "no line text");
         let cov = s.coverage(0, 10, 10).unwrap();
         assert_eq!(cov[0].rejected_counts[0]["count"], 1);
+    }
+
+    /// A database from before the finalizer rule: the final delete is linked when it is opened.
+    #[test]
+    fn an_older_finalizer_delete_is_linked_on_open() {
+        let dir = std::env::temp_dir().join(format!("al-fin-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        let path = dir.to_str().unwrap().to_string();
+        {
+            let s = Store::open(&path).unwrap();
+            let ev = r#"{"auditID":"d","stage":"ResponseComplete","verb":"delete","user":{"username":"system:admin"},
+              "objectRef":{"resource":"namespaces","namespace":"old","name":"old","apiVersion":"v1"},
+              "responseStatus":{"code":200},"stageTimestamp":"2026-10-14T02:00:00.500Z"}"#;
+            s.insert_event("c1", &to_record(&parse_body(ev.as_bytes()).unwrap()[0]).unwrap()).unwrap();
+            let c = s.conn.lock().unwrap();
+            let e: i64 = c.query_row("SELECT id FROM events", [], |r| r.get(0)).unwrap();
+            // Another object whose delete has no known request: it stays unlinked and unwritten.
+            for (id, change, eid) in [(1, "deleting", Some(e)), (2, "modified", None), (3, "deleted", None), (4, "deleted", None)] {
+                c.execute(
+                    "INSERT INTO versions (id, cluster, api_group, resource, kind, namespace, name, uid, observed_ms, observed, change, body, event_id)
+                     VALUES (?1, 'c1', '', 'namespaces', 'Namespace', '', ?4, 'n1', ?1, '', ?2, '{}', ?3)",
+                    params![id, change, eid, if id == 4 { "other" } else { "old" }],
+                )
+                .unwrap();
+            }
+        }
+        let s = Store::open(&path).unwrap();
+        let (linked, e): (Option<i64>, i64) = s.conn.lock().unwrap().query_row("SELECT event_id, (SELECT id FROM events) FROM versions WHERE id=3", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(linked, Some(e));
+        s.conn.lock().unwrap().execute_batch(
+            "CREATE TABLE written (id INTEGER); CREATE TRIGGER versions_written AFTER UPDATE ON versions BEGIN INSERT INTO written VALUES (NEW.id); END;",
+        ).unwrap();
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        let written: i64 = s.conn.lock().unwrap().query_row("SELECT count(*) FROM written", [], |r| r.get(0)).unwrap();
+        assert_eq!(written, 0, "a later start writes no version, linked or not");
+        drop(s);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path}{ext}"));
+        }
     }
 
     /// Upgrade a copy of a real database (never the original): AL_TEST_DB=<copy> cargo test -- --ignored migrates

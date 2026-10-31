@@ -617,13 +617,44 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     // Collection gaps overlapping the day, from both sources (spec section 5): an empty reason is
     // a silence the server noticed (no heartbeat); any other reason was reported by the
     // collector (restart, file removed or replaced, state lost). Where collection started is a
-    // marker, not a gap.
-    let mut gaps: Vec<(String, i64, i64, String, String)> = Vec::new();
+    // marker, not a gap. A silence still going on is in no table yet (it is written when the
+    // collector checks in again), so it comes from the heartbeats and runs to now; the last
+    // field says it is still open.
+    let mut gaps: Vec<(String, i64, i64, String, String, bool)> = Vec::new();
     let mut st = c.prepare("SELECT cluster, from_ms, to_ms, collector, reason FROM gaps WHERE to_ms >= ?1 AND from_ms < ?2 AND reason <> ?3 ORDER BY from_ms")?;
-    for row in st.query_map(params![start, end, crate::store::START], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?)))? {
+    for row in st.query_map(params![start, end, crate::store::START], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?, false)))? {
         let g = row?;
         if clusters.is_empty() || clusters.contains(g.0.as_str()) {
             gaps.push(g);
+        }
+    }
+    drop(st);
+    // A silence ends a day after it began (RETIRED_MS: taken as removed), or now. watch, rancher
+    // and neuvector run one pod per cluster, so for them another instance reporting after it
+    // ends it where that instance started, by the same rule as heartbeat() (an overlap or a
+    // handover within GAP_MS is no gap; a row from before 0.2.1 has no start time and is not
+    // taken as a takeover, where heartbeat() can use the time it reports). collect-file runs one per node: another node
+    // reporting proves nothing, so its silence is not ended that way.
+    let mut st = c.prepare(
+        "SELECT h.cluster, h.last_ms, h.collector,
+                CASE WHEN h.collector <> 'file' THEN
+                  (SELECT min(n.first_ms) FROM heartbeats n WHERE n.cluster=h.cluster AND n.collector=h.collector AND n.instance<>h.instance AND n.last_ms > h.last_ms)
+                END
+         FROM heartbeats h WHERE ?1 - h.last_ms > ?2 AND h.last_ms < ?3 AND h.last_ms + ?4 >= ?5",
+    )?;
+    let silences = st.query_map(params![now_ms, crate::store::GAP_MS, end, crate::store::RETIRED_MS, start], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<i64>>(3)?))
+    })?;
+    for row in silences {
+        let (cl, last, col, next) = row?;
+        if !clusters.is_empty() && !clusters.contains(cl.as_str()) {
+            continue;
+        }
+        let to = next.unwrap_or(i64::MAX).min(last + crate::store::RETIRED_MS).min(now_ms);
+        // Still "open" (no "resumed") unless another instance took over: running to now, or cut
+        // off a day after it began.
+        if to - last > crate::store::GAP_MS && to >= start {
+            gaps.push((cl, last, to, col, String::new(), next.is_none_or(|n| n > to)));
         }
     }
     drop(st);
@@ -636,7 +667,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
             ("found-on-reconnect", "收集中斷後重新連線比對物件版本才發現的變更，找不到對應的 audit 紀錄".into())
         }
     };
-    let in_gap = |cluster: &str, t: i64| gaps.iter().any(|(cl, f, to, _, _)| cl == cluster && t >= f - SLOT_GRACE_MS && t <= to + SLOT_GRACE_MS);
+    let in_gap = |cluster: &str, t: i64| gaps.iter().any(|(cl, f, to, _, _, _)| cl == cluster && t >= f - SLOT_GRACE_MS && t <= to + SLOT_GRACE_MS);
 
     for o in objs.values_mut() {
         let sev = o.ops.iter().filter_map(|i| ops[*i].severity.clone()).min_by_key(|s| if s == "high" { 0 } else { 1 });
@@ -765,7 +796,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
             .enumerate()
             .map(|(i, (r, n, a))| {
                 let t = start + i as i64 * slot_ms;
-                let gap = gaps.iter().any(|(cl, f, to, _, _)| lk.as_ref().is_none_or(|c| c == cl) && *f < t + slot_ms && *to > t);
+                let gap = gaps.iter().any(|(cl, f, to, _, _, _)| lk.as_ref().is_none_or(|c| c == cl) && *f < t + slot_ms && *to > t);
                 let state = match r {
                     0 => "look",
                     1 => "unclear",
@@ -783,9 +814,9 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     }
     let gaps_json: Vec<Value> = gaps
         .iter()
-        .map(|(cl, f, t, col, why)| {
+        .map(|(cl, f, t, col, why, open)| {
             if why.is_empty() {
-                json!({"cluster": cl, "fromMs": f, "toMs": t, "kind": "heartbeat", "collector": col, "reasonCode": "collector-silent", "reason": format!("收集元件 {col} 沒有回報")})
+                json!({"cluster": cl, "fromMs": f, "toMs": t, "open": open, "kind": "heartbeat", "collector": col, "reasonCode": "collector-silent", "reason": format!("收集元件 {col} 沒有回報")})
             } else {
                 json!({"cluster": cl, "fromMs": f, "toMs": t, "kind": "reported", "collector": col, "cause": why, "reasonCode": "collector-reported",
                        "reason": format!("收集元件 {col} 回報這段沒有收集（{why}）")})
@@ -911,7 +942,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
                 evs.push(json!({"t": t, "subject": o.key, "from": "clear", "to": "unclear", "reasonCode": "first-unattributed", "reason": "當天第一次出現找不到執行者的變更", "source": "state"}));
             }
         }
-        for (cl, f, t, col, why) in &gaps {
+        for (cl, f, t, col, why, open) in &gaps {
             let (stop, resume) = if why.is_empty() {
                 (json!({"reasonCode": "collector-stopped", "reason": format!("收集元件 {col} 停止回報"), "source": "heartbeat"}),
                  json!({"reasonCode": "collector-resumed", "reason": format!("收集元件 {col} 恢復回報"), "source": "heartbeat"}))
@@ -920,7 +951,8 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
                  json!({"reasonCode": "reported-gap-end", "reason": format!("收集元件 {col} 回報的缺口到這裡為止"), "source": "reported", "cause": why}))
             };
             for (at, from, to, mut e) in [(*f, "ok", "blind", stop), (*t, "blind", "ok", resume)] {
-                if in_range(at) {
+                // A silence nobody came back from has not ended: no "resumed".
+                if in_range(at) && !(*open && from == "blind") {
                     e["t"] = json!(at);
                     e["subject"] = json!(cl);
                     e["from"] = json!(from);
@@ -967,6 +999,93 @@ mod tests {
 
     // 2026-10-20 10:00 Asia/Taipei
     const T: i64 = 1_792_461_600_000;
+
+    /// A collector that stopped and has not checked in again has no gap row yet; the page
+    /// still shows the silence from its last check-in to now, and does not say it resumed.
+    /// A collector silent for over a day is taken as removed and left out.
+    #[test]
+    fn a_silence_still_going_on_is_shown() {
+        let s = store();
+        let now = T + 5 * 3_600_000;
+        {
+            let c = s.conn.lock().unwrap();
+            ev(&c, 1, "c1", T + 3 * 3_600_000 - 60_000, "alice", 1, "direct", "patch", "deployments", "shop", "web");
+            ev(&c, 2, "c1", T, "alice", 1, "direct", "patch", "deployments", "shop", "api");
+            c.execute("INSERT INTO heartbeats (cluster, collector, instance, last_ms, details) VALUES ('c1', 'file', 'n1', ?1, '{}')", params![T + 3 * 3_600_000]).unwrap();
+            c.execute("INSERT INTO heartbeats (cluster, collector, instance, last_ms, details) VALUES ('c1', 'file', 'gone', ?1, '{}'), ('c1', 'neuvector', 'off', ?1, '{}')", params![T - 2 * 86_400_000]).unwrap();
+            c.execute("INSERT INTO heartbeats (cluster, collector, instance, last_ms, details) VALUES ('c1', 'watch', 'w', ?1, '{}')", params![now - 60_000]).unwrap();
+        }
+        let p = Params { day: Some("2026-10-20".into()), ..Default::default() };
+        let v = changemap(&s, chrono_tz::Asia::Taipei, &p, now).unwrap();
+        let gaps = v["timeline"]["gaps"].as_array().unwrap();
+        assert_eq!(gaps.len(), 1, "only n1: the watch collector reported a minute ago, 'gone' and 'off' are retired: {gaps:?}");
+        assert_eq!((gaps[0]["fromMs"].as_i64(), gaps[0]["toMs"].as_i64(), gaps[0]["open"].as_bool()), (Some(T + 3 * 3_600_000), Some(now), Some(true)));
+        let state = |k: &str| v["rows"].as_array().unwrap().iter().find(|r| r["key"] == k).unwrap()["state"].clone();
+        assert_eq!(state("c1//deployments/shop/web"), "blind", "changed a minute before the silence");
+        assert_eq!(state("c1//deployments/shop/api"), "clear");
+        let slot = v["timeline"]["lines"][0]["slots"].as_array().unwrap().iter().find(|x| x["t"].as_i64() == Some(T + 4 * 3_600_000)).unwrap().clone();
+        assert_eq!(slot["state"], "blind", "{slot}");
+        let v = changemap(&s, chrono_tz::Asia::Taipei, &Params { tab: Some("events".into()), ..p.clone() }, now).unwrap();
+        let codes: Vec<&str> = v["events"].as_array().unwrap().iter().filter_map(|e| e["reasonCode"].as_str()).collect();
+        assert!(codes.contains(&"collector-stopped") && !codes.contains(&"collector-resumed"), "{codes:?}");
+    }
+
+    /// A silence past a day still shows its first day (it ends there instead of vanishing), and
+    /// a node replaced by another one ends the old node's silence where the new one started,
+    /// so the rest of the cluster's changes are not marked unseen.
+    #[test]
+    fn a_long_or_handed_over_silence_ends_where_it_should() {
+        let tz = chrono_tz::Asia::Taipei;
+        let day = Params { day: Some("2026-10-20".into()), ..Default::default() };
+        let beats = |s: &Store, rows: &[(&str, &str, i64, Option<i64>)]| {
+            let c = s.conn.lock().unwrap();
+            for (col, inst, last, first) in rows {
+                c.execute("INSERT INTO heartbeats (cluster, collector, instance, last_ms, details, first_ms) VALUES ('c1', ?1, ?2, ?3, '{}', ?4)", params![col, inst, last, first]).unwrap();
+            }
+        };
+        let gap = |v: &Value, i: usize| (v["timeline"]["gaps"][i]["fromMs"].as_i64(), v["timeline"]["gaps"][i]["toMs"].as_i64(), v["timeline"]["gaps"][i]["open"].as_bool());
+
+        // Silent 25 hours: the first day stays marked, nothing "resumed".
+        let s = store();
+        ev(&s.conn.lock().unwrap(), 1, "c1", T - 60_000, "alice", 1, "direct", "patch", "deployments", "shop", "web");
+        beats(&s, &[("file", "n1", T, None)]);
+        let v = changemap(&s, tz, &day, T + 25 * 3_600_000).unwrap();
+        assert_eq!(gap(&v, 0), (Some(T), Some(T + 86_400_000), Some(true)), "{v}");
+        assert_eq!(v["rows"][0]["state"], "blind");
+        let next = Params { day: Some("2026-10-21".into()), tab: Some("events".into()), ..Default::default() };
+        let v = changemap(&s, tz, &next, T + 30 * 3_600_000).unwrap();
+        assert!(!v["events"].to_string().contains("collector-resumed"), "{v}");
+
+        // Another node joining proves nothing about a silent one: n1 stays silent.
+        let s = store();
+        let now = T + 3 * 3_600_000;
+        beats(&s, &[("file", "cp1", T, Some(0)), ("file", "cp2", now - 30_000, Some(0)), ("file", "cp4", now - 30_000, Some(T + 600_000))]);
+        let v = changemap(&s, tz, &day, now).unwrap();
+        assert_eq!(gap(&v, 0), (Some(T), Some(now), Some(true)));
+
+        // The watch pod replaced: its silence ends where the new pod started; one that started
+        // before the old one stopped (a rolling update) is no gap at all.
+        let s = store();
+        ev(&s.conn.lock().unwrap(), 1, "c1", T + 2 * 3_600_000, "alice", 1, "direct", "patch", "deployments", "shop", "web");
+        beats(&s, &[("watch", "w-old", T, Some(0)), ("watch", "w-new", now - 30_000, Some(T + 20 * 60_000)), ("rancher", "r-old", T, Some(0)), ("rancher", "r-new", now - 30_000, Some(T - 60_000))]);
+        let v = changemap(&s, tz, &day, now).unwrap();
+        assert_eq!(v["timeline"]["gaps"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(gap(&v, 0), (Some(T), Some(T + 20 * 60_000), Some(false)));
+        assert_eq!(v["rows"][0]["state"], "clear", "changed long after the new pod took over");
+
+        // Another pod with no start time (a row from before 0.2.1), itself silent now, did not
+        // take over: still open, no "resumed" at now.
+        let s = store();
+        beats(&s, &[("watch", "w-x", T, Some(0)), ("watch", "w-y", T + 120_000, None)]);
+        let v = changemap(&s, tz, &day, now).unwrap();
+        assert_eq!(gap(&v, 0), (Some(T), Some(now), Some(true)), "{v}");
+
+        // A silence that ended before the day is not on it.
+        let s = store();
+        beats(&s, &[("watch", "w-old", T - 11 * 3_600_000, Some(0)), ("watch", "w-new", now - 30_000, Some(T - 10 * 3_600_000 - 30 * 60_000))]);
+        let v = changemap(&s, tz, &day, now).unwrap();
+        assert_eq!(v["timeline"]["gaps"].as_array().unwrap().len(), 0, "{v}");
+    }
 
     #[test]
     fn rancher_writes_in_an_application_namespace_are_shown() {

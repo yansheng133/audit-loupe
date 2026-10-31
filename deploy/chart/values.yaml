@@ -36,7 +36,8 @@ server:
   #    ranges: [{ from: "2026-10-20T22:00:00+08:00", to: "2026-10-21T02:00:00+08:00" }]
   changeWindows: []
   # Rule settings. Anything not listed keeps its default; a mistake (unknown rule or field,
-  # missing reason) stops the server from starting, with the place named in its log.
+  # missing reason) fails the install or upgrade at the config check, with the place named in
+  # its log, and the running server is left as it was.
   # Rules: namespace_deleted, rbac_changed, pod_exec, bypassed_rancher, gitops_bypassed,
   # outside_change_window, user_deleted, secret_read, credential_issued, off_hours,
   # forbidden, login_failed. Severity: high, medium or low.
@@ -118,7 +119,9 @@ collector:
   # Object versions: what changed. Every cluster.
   watch:
     enabled: false
-    # "group/version/resource" list; empty uses the built-in default. Secrets are never watched.
+    # Comma-separated "group/version/resource" list ("v1/resource" for the core group); empty
+    # uses the built-in default. Setting it replaces the default list. Each type listed is
+    # also granted get/list/watch in the collector's ClusterRole. Secrets are never watched.
     resources: ""
     # On the Rancher cluster: also Rancher's role and binding types (for the access review).
     rancherTypes: false
