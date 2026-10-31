@@ -263,7 +263,7 @@ fn perf_gate() {
     let five = five_at_once(&store, tz, &base, now);
     add("總覽第二頁", Some(300.0), Params { cursor: next, ..base.clone() }, false);
     add("總覽只看「要看」", Some(300.0), Params { state: Some("look".into()), ..base.clone() }, false);
-    add("總覽單一 Namespace", Some(300.0), Params { namespace: Some("al-sample".into()), ..base.clone() }, false);
+    add("總覽單一 Namespace", Some(300.0), Params { namespace: vec!["al-sample".into()], ..base.clone() }, false);
     add("總覽時間範圍（兩小時）", Some(300.0), Params { from: Some(day_start() + 10 * 3_600_000), to: Some(day_start() + 12 * 3_600_000), ..base.clone() }, false);
 
     let mut md = format!(

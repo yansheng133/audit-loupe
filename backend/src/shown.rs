@@ -105,7 +105,7 @@ mod tests {
             Params { tab: Some("relations".into()), ..base.clone() },
             Params { tab: Some("events".into()), ..base.clone() },
             Params { state: Some("look".into()), ..base.clone() },
-            Params { namespace: Some("shop".into()), ..base.clone() },
+            Params { namespace: vec!["shop".into()], ..base.clone() },
         ];
         for p in views {
             let (a, b) = (changemap(&s, cfg.tz, &p, now).unwrap(), changemap_by_scan(&s, cfg.tz, &p, now).unwrap());

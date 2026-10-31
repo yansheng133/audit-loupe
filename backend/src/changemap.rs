@@ -20,7 +20,8 @@ pub struct Params {
     pub day: Option<String>,
     #[serde(default)]
     pub cluster: Vec<String>,
-    pub namespace: Option<String>,
+    /// Namespaces to show (repeated or comma-separated); empty means all.
+    pub namespace: Vec<String>,
     pub state: Option<String>,
     pub tab: Option<String>,
     pub cursor: Option<String>,
@@ -44,7 +45,7 @@ pub fn parse_query(q: &str) -> Params {
         match k {
             "day" => p.day = Some(v),
             "cluster" => p.cluster.extend(v.split(',').filter(|s| !s.is_empty()).map(str::to_string)),
-            "namespace" => p.namespace = Some(v),
+            "namespace" => p.namespace.extend(v.split(',').filter(|s| !s.is_empty()).map(str::to_string)),
             "state" => p.state = Some(v),
             "tab" => p.tab = Some(v),
             "cursor" => p.cursor = Some(v),
@@ -410,7 +411,8 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     let tab = p.tab.as_deref().unwrap_or("overview");
     let with_system = p.system.as_deref() == Some("1");
     let clusters: HashSet<&str> = p.cluster.iter().map(String::as_str).collect();
-    let ns_filter = p.namespace.as_deref().filter(|s| !s.is_empty());
+    let namespaces: HashSet<&str> = p.namespace.iter().map(String::as_str).collect();
+    let ns_out = |n: &str| !namespaces.is_empty() && !namespaces.contains(n);
     let chains = chain_status(store, now_ms);
 
     let cursor = match p.cursor.as_deref().filter(|c| !c.is_empty()) {
@@ -463,6 +465,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
 
     let mut ops: Vec<Op> = Vec::new();
     let mut hidden_system = 0i64;
+    let mut ns_seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut hidden_ui = 0i64;
     let mut hidden_request = 0i64;
     let mut objs: HashMap<String, Obj> = HashMap::new();
@@ -533,7 +536,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         // Emptying a deleted namespace is listed with the namespace (cluster-scoped, core group).
         let cascade = s(5)? == "deletecollection" && s(2)? == NAMESPACE_CONTROLLER && !s(9)?.is_empty();
         let group_ref = if cascade { "" } else { s(6)? };
-        if ns_filter.is_some_and(|n| n != s(9).unwrap_or_default()) || only.is_some_and(|k| k.api_group != group_ref) {
+        if only.is_some_and(|k| k.api_group != group_ref) {
             continue;
         }
         // A write without a name is a deletecollection or a create the server named. It is
@@ -566,6 +569,14 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
                 continue;
             }
         }
+        // The namespace menu lists every namespace with something on the page, whichever are
+        // picked, so picking one does not take the others away.
+        if !s(9)?.is_empty() {
+            ns_seen.insert(s(9)?.to_string());
+        }
+        if ns_out(s(9)?) {
+            continue;
+        }
         let (note, note_code) = (crate::identity::reason_text(reason).to_string(), crate::identity::reason_code(reason));
         let (cluster, actor, verb, sub) = (text(r, 0)?, text(r, 2)?, text(r, 5)?, text(r, 8)?);
         let (namespace, name, resource, api_group, cascade) = if cascade {
@@ -595,13 +606,17 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
             continue;
         }
         let (api_group, resource, namespace, name): (String, String, String, String) = (r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?);
-        if ns_filter.is_some_and(|n| n != namespace)
-            || only.is_some_and(|k| k.api_group != api_group || k.resource != resource || k.namespace != namespace || k.name != name)
-        {
+        if only.is_some_and(|k| k.api_group != api_group || k.resource != resource || k.namespace != namespace || k.name != name) {
             continue;
         }
         if !with_system && ui_maintenance(&resource, &name) {
             hidden_ui += 1;
+            continue;
+        }
+        if !namespace.is_empty() {
+            ns_seen.insert(namespace.clone());
+        }
+        if ns_out(&namespace) {
             continue;
         }
         let key = format!("{cluster}/{api_group}/{resource}/{namespace}/{name}");
@@ -842,6 +857,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
             .collect::<serde_json::Map<_, _>>(),
         "counts": counts,
         "hidden": {"system": hidden_system, "uiMaintenance": hidden_ui, "requestOnly": hidden_request},
+        "namespaces": ns_seen,
         "timeline": {"slotMinutes": slot_min, "lines": lines, "gaps": gaps_json},
     });
 
@@ -1109,6 +1125,26 @@ mod tests {
         beats(&s, &[("watch", "w-old", T - 11 * 3_600_000, Some(0)), ("watch", "w-new", now - 30_000, Some(T - 10 * 3_600_000 - 30 * 60_000))]);
         let v = changemap(&s, tz, &day, now).unwrap();
         assert_eq!(v["timeline"]["gaps"].as_array().unwrap().len(), 0, "{v}");
+    }
+
+    /// Several namespaces can be picked; the menu's list keeps every namespace of the page
+    /// whatever is picked.
+    #[test]
+    fn several_namespaces_and_the_full_menu() {
+        let s = store();
+        {
+            let c = s.conn.lock().unwrap();
+            ev(&c, 1, "c1", T, "alice", 1, "direct", "patch", "deployments", "shop", "web");
+            ev(&c, 2, "c1", T + 1000, "alice", 1, "direct", "patch", "deployments", "pay", "api");
+            ev(&c, 3, "c1", T + 2000, "alice", 1, "direct", "patch", "deployments", "ops", "job");
+        }
+        let tz = chrono_tz::Asia::Taipei;
+        let p = |ns: &[&str]| Params { day: Some("2026-10-20".into()), namespace: ns.iter().map(|n| n.to_string()).collect(), ..Default::default() };
+        let keys = |v: &Value| { let mut k: Vec<String> = v["rows"].as_array().unwrap().iter().map(|r| r["namespace"].as_str().unwrap().to_string()).collect(); k.sort(); k };
+        let v = changemap(&s, tz, &p(&["shop", "pay"]), T).unwrap();
+        assert_eq!(keys(&v), ["pay", "shop"]);
+        assert_eq!(v["namespaces"], json!(["ops", "pay", "shop"]));
+        assert_eq!(parse_query("namespace=shop&namespace=pay,ops").namespace, ["shop", "pay", "ops"]);
     }
 
     #[test]
