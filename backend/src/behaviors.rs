@@ -486,9 +486,20 @@ pub fn ensure(store: &Store) -> anyhow::Result<()> {
     let s = store.clone();
     std::thread::spawn(move || {
         let t0 = std::time::Instant::now();
-        match build(&s) {
-            Ok(()) => tracing::info!(ms = t0.elapsed().as_millis() as u64, "behavior table ready"),
-            Err(e) => tracing::warn!(error = %e, "building the behavior table failed; the behaviors page stays empty"),
+        // Another build on its own connection (the change map index after an upgrade) can hold
+        // the write lock longer than the busy timeout: try again rather than leave the page empty.
+        for attempt in 1..=5 {
+            match build(&s) {
+                Ok(()) => {
+                    tracing::info!(ms = t0.elapsed().as_millis() as u64, "behavior table ready");
+                    break;
+                }
+                Err(e) if attempt < 5 => {
+                    tracing::warn!(error = %e, attempt, "building the behavior table failed; trying again");
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                }
+                Err(e) => tracing::warn!(error = %e, "building the behavior table failed; the behaviors page stays empty until the next start"),
+            }
         }
         set_building(&s, false);
     });
@@ -520,7 +531,7 @@ fn build(store: &Store) -> anyhow::Result<()> {
     loop {
         let mut step = || -> anyhow::Result<usize> {
             let mut c = store.conn.lock().unwrap();
-            let tx = c.transaction()?;
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let rs = rows(&tx, &chunk_sql, params![pos.0, pos.1, max_id, CHUNK])?;
             add_rows(&tx, BUILD, &s, &rs)?;
             tx.commit()?;
@@ -543,7 +554,7 @@ fn build(store: &Store) -> anyhow::Result<()> {
             c.execute_batch(&drop_sql(BUILD))?;
             return Ok(());
         }
-        let tx = c.transaction()?;
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let late = rows(&tx, &format!("{SELECT}, {flagged} FROM events e WHERE e.id > ?1 AND {} ORDER BY e.ts_ms, e.id", crate::shown::PREDICATE), params![max_id])?;
         add_rows(&tx, BUILD, &s, &late)?;
         // A Rancher half cut early on its own may have been matched to its downstream record.
@@ -909,7 +920,7 @@ fn actor_json(
         let code = if no_audit { "no-apiserver-audit" } else { "found-on-reconnect" };
         let note = if no_audit { "這座叢集沒有收 apiserver audit log：只看得到物件變了，看不到是誰改的" } else { "收集中斷後重新連線比對物件版本才發現的變更，找不到對應的 audit 紀錄" };
         let depends = no_audit.then(|| json!({"code": "no-apiserver-audit", "cluster": cluster, "collectors": cols.map(|c| c.iter().collect::<Vec<_>>()).unwrap_or_default()}));
-        return Ok((json!({"key": "", "name": "", "category": "unknown", "group": "unrecorded", "noteCode": code, "note": note, "dependsOn": depends}), "unrecorded"));
+        return Ok((json!({"id": format!("~{cluster}"), "key": "", "name": "", "category": "unknown", "group": "unrecorded", "noteCode": code, "note": note, "dependsOn": depends}), "unrecorded"));
     }
     let (class, reason) = match idents.get(&(actor.to_string(), uid.to_string())) {
         Some((c, r)) => (*c, r.clone()),
@@ -926,7 +937,7 @@ fn actor_json(
         c.prepare_cached("SELECT display_name FROM users WHERE user_id=?1 ORDER BY created_ms DESC LIMIT 1")?.query_row(params![uid], |r| r.get(0)).optional()?
     };
     Ok((
-        json!({"key": key, "name": name.unwrap_or_else(|| actor.to_string()), "category": class, "group": group,
+        json!({"id": key, "key": key, "name": name.unwrap_or_else(|| actor.to_string()), "category": class, "group": group,
                "noteCode": crate::identity::reason_code(&reason), "note": crate::identity::reason_text(&reason), "dependsOn": null}),
         group,
     ))
@@ -1132,7 +1143,7 @@ pub fn page(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64) -> anyhow
             *n += 1;
         }
     }
-    let look: Vec<Value> = list.iter().filter(|(v, _)| v["tier"] == "look").map(|(v, _)| json!({"id": v["id"], "title": v["title"]})).collect();
+    let look: Vec<Value> = list.iter().filter(|(v, _)| v["tier"] == "look").map(|(v, _)| json!({"id": v["id"], "title": v["title"], "fromMs": v["fromMs"], "toMs": v["toMs"]})).collect();
     let mut long_gaps = Vec::new();
     let mut per: BTreeMap<&str, Vec<&crate::changemap::GapRow>> = BTreeMap::new();
     for g in &l.gaps {

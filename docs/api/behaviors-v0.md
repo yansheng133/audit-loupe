@@ -33,7 +33,7 @@ v6 的四個分頁（活動總覽、稽核發現、依身分、依資源範圍�
   "summary": {
     "behaviors": 0,
     "byTier": {"look": 0, "notable": 0, "normal": 0, "unrecorded": 0, "unauthenticated": 0, "routine": 0},
-    "look": [{"id": "b12", "title": {}}],
+    "look": [{"id": "b12", "title": {}, "fromMs": 0, "toMs": 0}],
     "longGaps": [{"cluster": "", "fromMs": 0, "toMs": 0, "collectors": ["watch", "file"], "open": false}]
   },
   "hidden": {"system": 0, "uiMaintenance": 0, "requestOnly": 0, "failed": 0, "failedSystem": 0},
@@ -41,7 +41,7 @@ v6 的四個分頁（活動總覽、稽核發現、依身分、依資源範圍�
   "behaviors": [{
     "id": "b12",
     "cluster": "c-m-26kbxk5f",
-    "actor": {"key": "system:admin", "name": "system:admin", "category": "human", "group": "people",
+    "actor": {"id": "system:admin", "key": "system:admin", "name": "system:admin", "category": "human", "group": "people",
               "noteCode": "admin-cert", "note": "管理者憑證，對不到個人", "dependsOn": null},
     "scope": "nv-demo-scope-check",
     "tier": "look",
@@ -59,7 +59,7 @@ v6 的四個分頁（活動總覽、稽核發現、依身分、依資源範圍�
     "rules": [{"rule": "namespace_deleted", "severity": "high", "count": 1, "tagOnly": false}],
     "truncated": false
   }],
-  "actors": [{"key": "", "name": "", "category": "", "group": "", "noteCode": "", "note": "", "dependsOn": null,
+  "actors": [{"id": "", "key": "", "name": "", "category": "", "group": "", "noteCode": "", "note": "", "dependsOn": null,
               "clusters": [""], "behaviors": 0, "ops": 0, "look": 0}],
   "scopes": [{"cluster": "", "scope": "", "actors": 0, "behaviors": 0, "ops": 0, "look": 0, "tier": "look"}],
   "strip": {"cellMinutes": 10, "cells": [{"t": 0, "people": 0, "routine": 0, "unrecorded": 0, "unauthenticated": 0}]},
@@ -187,3 +187,14 @@ v6 的四個分頁（活動總覽、稽核發現、依身分、依資源範圍�
 | `AL_BEHAVIOR_LOOK` | `high` | 算「要看」的嚴重度（逗號分隔） | 不必重建 |
 | `AL_BEHAVIOR_NOTABLE` | `medium` | 算「值得知道」的嚴重度 | 不必重建 |
 | `AL_BEHAVIOR_TAG_ONLY` | `bypassed_rancher,off_hours` | 只當標籤、不影響分級的規則 | 不必重建 |
+
+## v0.1 補充（2026-11-01，回答軌 2 的問題）
+
+原有欄位不變，新增或說明如下：
+
+1. **時間範圍**：v0 不接受 `from`／`to`。段落是整天切好的；介面要看一段時間時，自己留下與範圍重疊的段落（`segments` 有任何一個與範圍重疊），**不重新切段**、計數也不改。範圍內的物件明細請照舊打 `/api/changemap/detail`。
+2. **`actor.id`**（新增，`behaviors[].actor` 與 `actors[]` 都有）：一個帳號在清單裡的唯一鍵，介面原樣使用、不要自己組。有執行者時等於 `key`；未記錄執行者是 `~<cluster>`（每座叢集一列）。
+3. **`summary.look[]`** 多 `fromMs`、`toMs`（同那一段的 `fromMs`、`toMs`）。
+4. **`direct` 與 `bypassed-rancher` 的差別**：`direct` 是事實——段內有 `via: "direct"` 的操作（不論規則；`routine` 不標）。`bypassed-rancher` 是規則——`bypassed_rancher` 有觸發（只看人的寫入與進入容器、成功的請求，而且規則可以在設定裡關掉或排除）。lab 10/30 兩者出現在同一批段落。畫面只要一個「直連 apiserver」標籤時用 `direct`；`bypassed_rancher` 在「觸發的規則」裡列出（`tagOnly: true`）。
+5. **`via: "ace"`**：是。Rancher 使用者用 Authorized Cluster Endpoint 直接連到下游叢集的 apiserver（由下游叢集驗證 Rancher 的身分，紀錄裡有 Rancher 使用者 ID），沒有經過 Rancher 代理。`direct` 則是完全沒有 Rancher 身分的連線（節點的管理者憑證、ServiceAccount 等）。
+6. **行為表還在建時**：`meta.progress` 有 `what: "behaviors"`，`behaviors` 是空陣列。建好後下一次開頁就有資料、`meta.progress` 消失，不必重啟。lab 50 萬筆約 1.5 秒建完；建表失敗會每 10 秒重試，共 5 次。

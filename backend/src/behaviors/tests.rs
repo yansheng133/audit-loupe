@@ -258,6 +258,9 @@ fn who_has_no_author_says_why_from_the_collectors_that_report() {
     assert_eq!(local["ops"], 2);
     assert_eq!(local["tier"], "unrecorded");
     assert_eq!(local["actor"]["noteCode"], "no-apiserver-audit");
+    assert_eq!(local["actor"]["id"], "~local");
+    let ids: Vec<&str> = v["actors"].as_array().unwrap().iter().map(|a| a["id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&"~local") && ids.contains(&"~c1") && ids.contains(&"system:cattle:error"), "{ids:?}");
     assert_eq!(local["actor"]["dependsOn"], json!({"code": "no-apiserver-audit", "cluster": "local", "collectors": ["rancher", "watch"]}));
     let c1 = un.iter().find(|b| b["cluster"] == "c1").unwrap();
     assert_eq!((c1["actor"]["noteCode"].as_str(), c1["actor"]["dependsOn"].is_null()), (Some("found-on-reconnect"), true));
@@ -426,4 +429,36 @@ fn the_page_reads_by_index() {
     let p = plan("SELECT id FROM behaviors WHERE last_ms >= ?1 AND first_ms < ?2", 2);
     assert!(p.contains("behaviors_time"), "{p}");
     let _ = day_of(0);
+}
+
+/// On a copy of a real database (AL_TEST_DB): cutting the records one by one in the order
+/// they arrived (by ID) gives the same behaviors as the build, which goes in time order.
+/// Run: `AL_TEST_DB=<copy> cargo test --release real_database_arrival_order -- --ignored`.
+#[test]
+#[ignore]
+fn real_database_arrival_order_gives_the_build() {
+    let path = std::env::var("AL_TEST_DB").expect("AL_TEST_DB: path to a copy");
+    let s = Store::open(&path).unwrap();
+    while building_since(&s).is_some() {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let built = stored(&s);
+    let t = std::time::Instant::now();
+    {
+        let mut c = s.conn.lock().unwrap();
+        let tx = c.transaction().unwrap();
+        tx.execute_batch("DELETE FROM behaviors; DELETE FROM behavior_ops;").unwrap();
+        let sql = format!(
+            "{SELECT}, EXISTS (SELECT 1 FROM alerts a WHERE a.event_id=e.id AND a.severity IN ('high','medium')) FROM events e WHERE {} ORDER BY e.id",
+            crate::shown::PREDICATE
+        );
+        let rs = rows(&tx, &sql, []).unwrap();
+        add_rows(&tx, LIVE, &s.cfg.behaviors, &rs).unwrap();
+        tx.commit().unwrap();
+    }
+    let by_id = stored(&s);
+    let ops: usize = built.iter().map(|b| b.6.len()).sum();
+    println!("behaviors {} with {ops} operations; arrival order took {:.1} s", built.len(), t.elapsed().as_secs_f64());
+    assert!(built.len() > 100);
+    assert_eq!(by_id, built);
 }
