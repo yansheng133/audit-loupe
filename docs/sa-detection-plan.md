@@ -22,7 +22,7 @@
 4. 「來源不對」：收集元件 watch Pod，只取名稱與 IP，不存版本；需要加 pods 的 list／watch 權限。
 5. 來源比對：該 SA 的 Pod、節點、Helm 設定列出的 Rancher 伺服器 IP。Rancher 自己的 SA 不另外排除。
 6. fleet-agent、local-path-provisioner 這類量大的元件，policy 設 None。代價：這些 SA 的 token 外洩時看不到，要寫進文件。
-7. watch：先在 lab 量 1 小時（policy 也記 SA 的 watch），再決定要不要納入。
+7. watch：先在 lab 量 1 小時（policy 也記 SA 的 watch），再決定要不要納入。→ 10/31 量完：預設不記，提供選用設定（第 4 節）。
 8. 調校用的範例流量四種：應用程式讀設定、監控／控制器、CI runner、叢集外工具（舊式 token）。不做攻擊情境。
 
 ## 2. 設計
@@ -33,7 +33,8 @@
 
 1. **None**：量大的元件，用 `users` 逐一列出（`system:serviceaccount:cattle-fleet-system:fleet-agent`、`system:serviceaccount:local-path-storage:local-path-provisioner`）。
 2. **None**：系統 namespace 的 SA，用 `userGroups: ["system:serviceaccounts:<namespace>"]` 逐一列出。audit policy 不支援萬用字元，所以清單寫死在檔案裡，部署文件說明怎麼增減。預設清單：kube-system、kube-public、kube-node-lease、cattle-system、cattle-fleet-system、cattle-impersonation-system、cattle-neuvector-system、longhorn-system、cert-manager、audit-loupe-system。
-3. **Metadata**：其餘 SA（`userGroups: ["system:serviceaccounts"]`）的 get、list（watch 依第 4 節的量測決定）。
+3. **Metadata**：其餘 SA（`userGroups: ["system:serviceaccounts"]`）的 get、list。
+4. （選用，預設註解掉）**Metadata**＋`omitStages: ["ResponseComplete"]`：管理者列出的 namespace 的 SA 的 watch（第 4 節的決定）。
 
 lab 估計：扣掉系統 namespace、Rancher 和 local-path-storage 之後，一天約 9,300 行；正式環境要另外估，文件寫估算方法（4 小時取樣、乘 6）。
 
@@ -76,7 +77,7 @@ lab 估計：扣掉系統 namespace、Rancher 和 local-path-storage 之後，�
 
 | 階段 | 內容 | 驗收 |
 |---|---|---|
-| S0 | lab 量 1 小時 watch（第 4 節） | 決定 watch 納不納入，寫進本文件 |
+| S0 | lab 量 1 小時 watch（第 4 節） | **完成（10/31）**：預設不記，提供選用設定 |
 | S1 | policy（2.1）＋文件 | `helm template`／policy 檔通過檢查；lab 套上後 apiserver 恢復時間記錄 |
 | S2 | 彙總儲存（2.2） | 重播 10/18 錄下的 4 小時：events 不增加 SA 讀取、彙總表列數與次數和原始 log 一致 |
 | S3 | Pod／Node 位址與 `sa_source`（2.3、2.4） | 重播：external-tool 240 次全部發警示、app-config／ci-runner／pod-watcher 0 次、Rancher 的 SA 0 次（要先在 values 列出 Rancher 伺服器 IP） |
@@ -93,6 +94,28 @@ S1–S3 一個 PR 一段，都附測試；S4 要等模型定案。
   2. pod-watcher（只用 watch 的範例）看不看得到。
   3. watch 的紀錄有沒有來源 IP 與 user.extra，能不能用同一個來源比對。
 - 結果寫在本節下方。
+
+### 結果（2026-10-31 10:24:53–11:25:00，台北）
+
+做法照上面。policy 改回後 sha256、權限、SELinux 標籤、apiserver 參數都和原本相同；兩次重啟 apiserver 各停 43 秒。下游一小時 44,063 行在窗口內。統計用 `~/audit-loupe-lab/run/sa/analyze_watch.py`（IP 只計數、不列出）。
+
+| 項目 | 一小時 | 換算一天 |
+|---|---:|---:|
+| SA 的 get | 2,344 行 | — |
+| SA 的 list | 13,081 行 | — |
+| **SA 的 watch** | **27,334 行、40.0 MB** | **約 65 萬行、958 MB** |
+
+1. **watch 的量是 get＋list 的 1.8 倍。**每個 watch 寫兩行（`ResponseStarted` 13,778、`ResponseComplete` 13,556）。依 SA 所在 namespace：Rancher（`cattle-*`、`fleet-*`）15,524 行（57%，fleet-agent 一個就 11,564）；其他 8,321 行（suse-observability-agent 5,732、argocd 約 2,300、prometheus kube-state-metrics 397 等監控與控制器）；系統 namespace 3,465 行；範例 24 行。
+2. **只用 watch 的程式記得到。**pod-watcher 一小時 24 行（每 5 分鐘一段 watch，開始與結束各一行）。10/18 只記 get／list 時是 0 行。
+3. **watch 也能做來源比對。**27,334 行全部有來源 IP（不重複 32 個）；99.2%（27,116 行）的 user.extra 有 pod-name，沒有的 218 行。
+4. 不重複組合（SA、資源、namespace、User-Agent、來源 IP）637 個，彙總儲存一樣划算。
+5. 附帶：get＋list 一小時 15,425 行，比 10/18 的每小時 9,192 行多，因為 lab 後來多裝了 argocd、SUSE Observability agent、opencost、prometheus。正式環境的量要現場量，不能套 lab 數字。
+
+### 決定（Sam 10/31 授權，由我決定）
+
+- **watch 預設不記。**全叢集一天約 958 MB，多半是 Rancher 與監控元件；預設排除它們之後，剩下的仍主要是監控與控制器，不是要找的對象。
+- **提供選用設定**：只對管理者列出的 namespace 記錄 SA 的 watch，而且只記開始（policy 的 `omitStages: ["ResponseComplete"]`），量減半，足以看出「這個 SA 在 watch 全叢集的 Pod」。來源比對（2.3）照樣適用。
+- 2.1 的 policy 範本加這段選用規則（預設註解掉），部署文件寫估算方法。
 
 ## 5. 還沒決定、要 Sam 決定的
 
