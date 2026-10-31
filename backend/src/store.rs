@@ -1580,6 +1580,24 @@ impl Store {
         drop(stmt);
         let mut linked = 0;
         for (vid, cluster, group, resource, ns, name, obs, change) in pending {
+            // An object with finalizers goes in two steps: the delete request sets the deletion
+            // timestamp ("deleting", linked to that request), and the object is gone once the
+            // finalizers are done ("deleted"). Both come from the same request, so the second
+            // takes the first one's event instead of looking for another delete.
+            if change == "deleted" {
+                let prev: Option<(String, Option<i64>)> = c
+                    .query_row(
+                        "SELECT change, event_id FROM versions WHERE cluster=?1 AND api_group=?2 AND resource=?3 AND namespace=?4 AND name=?5 AND id < ?6 ORDER BY id DESC LIMIT 1",
+                        params![cluster, group, resource, ns, name, vid],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some(("deleting", Some(eid))) = prev.as_ref().map(|(ch, e)| (ch.as_str(), *e)) {
+                    c.execute("UPDATE versions SET event_id=?1 WHERE id=?2", params![eid, vid])?;
+                    linked += 1;
+                    continue;
+                }
+            }
             let (verbs, before_ms, order) = match change.as_str() {
                 "added" => ("('create','update','patch')", 20_000, "ASC"),
                 "added_unseen" => ("('create','update','patch')", 30 * 60_000, "DESC"),
@@ -2797,6 +2815,14 @@ mod tests {
         assert_eq!(s.link_since(0).unwrap(), 1);
         let h = s.history(&ns).unwrap();
         assert_eq!((h[0].change.as_str(), h[0].actor.as_deref()), ("deleting", Some("system:admin")));
+        // The finalizers finish later and the object goes: same request, same person. Left
+        // unlinked it showed on the change map as a change nobody made ("unclear").
+        s.insert_version(&ns, "Namespace", "n1", &json!({"metadata":{"name":"old"}}), "deleted", t + chrono::Duration::seconds(40)).unwrap();
+        assert_eq!(s.link_since(0).unwrap(), 1);
+        let h = s.history(&ns).unwrap();
+        assert_eq!((h[0].change.as_str(), h[0].actor.as_deref()), ("deleted", Some("system:admin")));
+        let unlinked: i64 = s.conn.lock().unwrap().query_row("SELECT count(*) FROM versions WHERE event_id IS NULL AND change <> 'baseline'", [], |r| r.get(0)).unwrap();
+        assert_eq!(unlinked, 0);
     }
 
     #[test]
