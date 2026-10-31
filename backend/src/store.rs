@@ -124,6 +124,10 @@ CREATE TABLE IF NOT EXISTS listing (
   cluster TEXT NOT NULL, api_group TEXT NOT NULL, resource TEXT NOT NULL, first INTEGER NOT NULL,
   PRIMARY KEY (cluster, api_group, resource)
 );
+CREATE TABLE IF NOT EXISTS listed (
+  cluster TEXT NOT NULL, api_group TEXT NOT NULL, resource TEXT NOT NULL,
+  PRIMARY KEY (cluster, api_group, resource)
+);
 "#;
 
 /// Version kinds:
@@ -975,11 +979,15 @@ impl Store {
         Ok(self.insert_events(cluster, std::slice::from_ref(r))? == 1)
     }
 
-    /// True if any version of this resource type was ever stored, i.e. a list is a re-list.
+    /// True if this resource type was listed to the end before, or any version of it was ever
+    /// stored, i.e. a list is a re-list. A type with no objects stores no versions, so the
+    /// finished list is remembered in `listed`; otherwise an object created while the
+    /// collector was down would be taken as part of a first look and never shown.
     pub fn has_any(&self, cluster: &str, group: &str, resource: &str) -> anyhow::Result<bool> {
         let c = self.conn.lock().unwrap();
         Ok(c.query_row(
-            "SELECT 1 FROM versions WHERE cluster=?1 AND api_group=?2 AND resource=?3 LIMIT 1",
+            "SELECT 1 FROM versions WHERE cluster=?1 AND api_group=?2 AND resource=?3
+             UNION ALL SELECT 1 FROM listed WHERE cluster=?1 AND api_group=?2 AND resource=?3 LIMIT 1",
             params![cluster, group, resource],
             |_| Ok(()),
         )
@@ -1480,10 +1488,9 @@ impl Store {
                             }
                         }
                     }
-                    self.conn.lock().unwrap().execute(
-                        "DELETE FROM listing WHERE cluster=?1 AND api_group=?2 AND resource=?3",
-                        params![cluster, group, resource],
-                    )?;
+                    let c = self.conn.lock().unwrap();
+                    c.execute("DELETE FROM listing WHERE cluster=?1 AND api_group=?2 AND resource=?3", params![cluster, group, resource])?;
+                    c.execute("INSERT OR IGNORE INTO listed (cluster, api_group, resource) VALUES (?1,?2,?3)", params![cluster, group, resource])?;
                 }
             }
         }
@@ -2466,6 +2473,19 @@ mod tests {
         // Live changes after that.
         assert_eq!(s.apply_objects("c1", &[ver("modified", "web", 3)]).unwrap(), 1);
         assert_eq!(s.history(&key()).unwrap()[0].change, "modified");
+    }
+
+    /// A type with no objects at its first list stores no versions; the next list after a
+    /// restart is still a re-list, so an object created meanwhile is a change seen late, not
+    /// part of a first look (which the change map leaves out).
+    #[test]
+    fn an_empty_type_listed_once_is_not_a_first_look_again() {
+        let s = Store::open(":memory:").unwrap();
+        let start = ObjMsg::ListStart { group: "apps".into(), resource: "deployments".into() };
+        let done = |names: &[&str]| ObjMsg::ListDone { group: "apps".into(), resource: "deployments".into(), listed: names.iter().map(|n| ("shop".to_string(), n.to_string())).collect() };
+        s.apply_objects("c1", &[start.clone(), done(&[])]).unwrap();
+        s.apply_objects("c1", &[start, ver("list", "web", 1), done(&["web"])]).unwrap();
+        assert_eq!(s.history(&key()).unwrap()[0].change, "added_unseen");
     }
 
     fn user_msg(seen: &str, uid: &str, created: &str, at_min: i64) -> ObjMsg {
