@@ -3,6 +3,8 @@
 寫作：2026-10-21。給平行開發用：後端（軌 B）照這個回應，介面（軌 C）照這個讀。
 v0 是原型：開頁時直接查現有資料表，**不做彙總表、不調效能**。第 1 層的正式版（`docs/layer1-plan.md`）之後再換，欄位盡量沿用。
 
+> 0.7.0 起，介面的變更地圖（v6 四個分頁）改讀 `/api/behaviors`（約定見 `docs/api/behaviors-v0.md`）。這支 API 照舊提供、欄位意義不變，物件明細仍用 `/api/changemap/detail`。
+
 ## 請求
 
 `GET /api/changemap`
