@@ -147,5 +147,5 @@ v0 是原型：開頁時直接查現有資料表，**不做彙總表、不調效
    - `open: true`：收集元件還沒回報，或已被當成換掉的節點（見下一點）；`toMs` 是現在或截斷的時間，事件分頁不會有 `collector-resumed`。
    - `open: false`：已經結束（收集元件回報了，或 watch、rancher、neuvector 換了新 Pod）。
    - 缺口表裡已經記下的缺口（收集元件回報後才寫）沒有這個欄位。
-2. **`GET /api/coverage`**：`collectors[]` 與心跳中斷的 `gaps[]` 多一個 `retired`。只有在一個收集元件超過一天沒有回報、而同一座叢集同一種收集元件還有別的執行個體在回報時才是 `true`（實際上就是換掉的節點）；這時變更地圖只標中斷開始後的一天。那座叢集這種收集元件一個都沒在回報時永遠是 `false`。
+2. **`GET /api/coverage`**：`collectors[]` 與心跳中斷的 `gaps[]` 多一個 `retired`。只有在一個收集元件超過一天沒有回報、而同一座叢集同一種收集元件還有別的執行個體在回報時才是 `true`（實際上就是換掉的節點）；這時中斷的 `toMs` 是新執行個體開始回報的時間（至少中斷後一天），變更地圖與收集狀態頁相同。那座叢集這種收集元件一個都沒在回報時永遠是 `false`。
 3. **watch 收集元件的回報內容**：`collectors[].details` 裡每個資源類型的值，除了 `watching`、`not served`，多了 `forbidden`（被拒，通常是 ClusterRole 沒涵蓋）與 `failing`（其他錯誤），恢復後改回 `watching`。

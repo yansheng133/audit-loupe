@@ -634,24 +634,27 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     // as heartbeat() (an overlap or a handover within GAP_MS is no gap; a row from before 0.2.1
     // has no start time and is not taken as a takeover). collect-file runs one per node:
     // another node reporting proves nothing, but a node silent over a day while another node
-    // reports is taken as replaced (RETIRED_MS), so its silence ends a day after it began.
-    let mut st = c.prepare(
+    // reports is taken as replaced (RETIRED_MS): its silence ends where the replacement started
+    // (however late), and at least a day after it began (store::RETIRED_END).
+    let mut st = c.prepare(&format!(
         "SELECT h.cluster, h.last_ms, h.collector,
                 CASE WHEN h.collector <> 'file' THEN
                   (SELECT min(n.first_ms) FROM heartbeats n WHERE n.cluster=h.cluster AND n.collector=h.collector AND n.instance<>h.instance AND n.last_ms > h.last_ms)
                 END,
-                EXISTS (SELECT 1 FROM heartbeats o WHERE o.cluster=h.cluster AND o.collector=h.collector AND o.instance<>h.instance AND ?1 - o.last_ms <= ?2)
+                EXISTS (SELECT 1 FROM heartbeats o WHERE o.cluster=h.cluster AND o.collector=h.collector AND o.instance<>h.instance AND ?1 - o.last_ms <= ?2),
+                {}
          FROM heartbeats h WHERE ?1 - h.last_ms > ?2 AND h.last_ms < ?3",
-    )?;
+        crate::store::RETIRED_END
+    ))?;
     let silences = st.query_map(params![now_ms, crate::store::GAP_MS, end], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<i64>>(3)?, r.get::<_, bool>(4)?))
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<i64>>(3)?, r.get::<_, bool>(4)?, r.get::<_, i64>(5)?))
     })?;
     for row in silences {
-        let (cl, last, col, next, others) = row?;
+        let (cl, last, col, next, others, retired_end) = row?;
         if !clusters.is_empty() && !clusters.contains(cl.as_str()) {
             continue;
         }
-        let cap = if others { last + crate::store::RETIRED_MS } else { i64::MAX };
+        let cap = if others { retired_end } else { i64::MAX };
         let to = next.unwrap_or(i64::MAX).min(cap).min(now_ms);
         // Still "open" (no "resumed") unless another instance took over: running to now, or cut
         // off as retired.
@@ -1092,6 +1095,14 @@ mod tests {
         beats(&s, &[("watch", "w-x", T, Some(0)), ("watch", "w-y", T + 120_000, None)]);
         let v = changemap(&s, tz, &day, now).unwrap();
         assert_eq!(gap(&v, 0), (Some(T), Some(now), Some(true)), "{v}");
+
+        // The only node stops; a new node joins three days later. The whole time between is
+        // unseen, not just the first day.
+        let s = store();
+        beats(&s, &[("file", "n1", T, Some(0)), ("file", "n2", T + 3 * 86_400_000 + 3_570_000, Some(T + 3 * 86_400_000))]);
+        let late = Params { day: Some("2026-10-22".into()), ..Default::default() };
+        let v = changemap(&s, tz, &late, T + 3 * 86_400_000 + 3_600_000).unwrap();
+        assert_eq!((gap(&v, 0).0, gap(&v, 0).1), (Some(T), Some(T + 3 * 86_400_000)), "{v}");
 
         // A silence that ended before the day is not on it.
         let s = store();
