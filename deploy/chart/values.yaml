@@ -63,6 +63,12 @@ server:
   #    class: component
   #    reason: 用憑證登入的 RKE2 元件，只能靠名稱認
   identities: []
+  # Before every install or upgrade, check the settings above with the new image (a Job
+  # that reads them and stops). Wrong settings then fail the upgrade and the running server
+  # stays up; without the check the server stops until the settings are fixed.
+  configCheck:
+    enabled: true
+    timeoutSeconds: 120
   persistence:
     # SQLite on a volume. Empty storageClass uses the cluster default; RKE2 ships none.
     storageClass: ""

@@ -40,7 +40,8 @@ async fn main() -> anyhow::Result<()> {
         "collect-watch" => return watch::run().await,
         "collect-neuvector" => return neuvector::run().await,
         "replay" => return replay::run().await,
-        other => anyhow::bail!("unknown command {other:?}; use server, collect-file, collect-rancher, collect-watch, collect-neuvector, replay or seed-demo"),
+        "check-config" => return check_config(),
+        other => anyhow::bail!("unknown command {other:?}; use server, collect-file, collect-rancher, collect-watch, collect-neuvector, replay, check-config or seed-demo"),
     }
     let cfg = Arc::new(config::Config::from_env()?);
     let store = store::Store::open_with(&cfg.db_path, cfg.clone())?;
@@ -102,5 +103,21 @@ async fn main() -> anyhow::Result<()> {
     let api_app = api::router(state.clone()).layer(tower_http::trace::TraceLayer::new_for_http());
     let ingest_app = api::ingest_router(state);
     tokio::try_join!(axum::serve(api_listener, api_app), axum::serve(ingest_listener, ingest_app))?;
+    Ok(())
+}
+
+/// Reads the settings the server would start with and stops. The chart runs this before an
+/// install or upgrade, so settings the server would refuse fail the upgrade instead of
+/// stopping a running server (its Deployment is Recreate: the old pod is gone first).
+fn check_config() -> anyhow::Result<()> {
+    let cfg = config::Config::from_env()?;
+    info!(
+        timezone = %cfg.tz,
+        rules_off = cfg.rules.rules.iter().filter(|r| !r.enabled).count(),
+        exceptions = cfg.rules.rules.iter().map(|r| r.except.len()).sum::<usize>(),
+        identities = cfg.identities.entries.len(),
+        change_windows = cfg.change_windows.len(),
+        "settings ok"
+    );
     Ok(())
 }

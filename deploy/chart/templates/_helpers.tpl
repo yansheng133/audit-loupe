@@ -73,3 +73,22 @@ seccompProfile:
     items: [{ key: ca.crt, path: ca.crt }]
 {{- end }}
 {{- end -}}
+
+{{/* Settings the server reads at start; the pre-upgrade check reads the same ones. */}}
+{{- define "al.serverSettingsEnv" -}}
+- { name: AL_CLUSTER, value: {{ .Values.server.cluster | quote }} }
+- { name: AL_RANCHER_CLUSTER, value: {{ .Values.server.rancherCluster | quote }} }
+- { name: AL_TZ, value: {{ .Values.server.timezone | quote }} }
+- { name: AL_WORK_HOURS, value: {{ .Values.server.workHours | quote }} }
+- { name: AL_WORK_DAYS, value: {{ .Values.server.workDays | quote }} }
+- { name: AL_RETENTION_DAYS, value: {{ .Values.server.retentionDays | quote }} }
+{{- with .Values.server.changeWindows }}
+- { name: AL_CHANGE_WINDOWS, value: {{ toJson . | quote }} }
+{{- end }}
+{{- with .Values.server.rules }}
+- { name: AL_RULES, value: {{ toJson . | quote }} }
+{{- end }}
+{{- with .Values.server.identities }}
+- { name: AL_IDENTITIES, value: {{ toJson . | quote }} }
+{{- end }}
+{{- end -}}
