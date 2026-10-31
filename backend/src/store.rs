@@ -688,13 +688,13 @@ impl Store {
         prepare_stats(&conn)?;
         // The final delete of an object with finalizers takes the event of its "deleting"
         // version (link_since). Live linking only looks back 45 minutes, so versions stored
-        // before that rule get it here; once linked they no longer match, so this is cheap.
-        conn.execute(
-            "UPDATE versions SET event_id = (
-               SELECT g.event_id FROM versions g WHERE g.cluster=versions.cluster AND g.api_group=versions.api_group AND g.resource=versions.resource
+        // before that rule get it here. Only rows that would get an event are written, so a
+        // later start writes nothing.
+        const STARTED: &str = "SELECT g.event_id FROM versions g WHERE g.cluster=versions.cluster AND g.api_group=versions.api_group AND g.resource=versions.resource
                  AND g.namespace=versions.namespace AND g.name=versions.name AND g.uid=versions.uid AND g.change='deleting' AND g.id < versions.id
-               ORDER BY g.id DESC LIMIT 1)
-             WHERE change='deleted' AND event_id IS NULL",
+               ORDER BY g.id DESC LIMIT 1";
+        conn.execute(
+            &format!("UPDATE versions SET event_id = ({STARTED}) WHERE change='deleted' AND event_id IS NULL AND ({STARTED}) IS NOT NULL"),
             [],
         )?;
         crate::identity::prepare(&conn, &cfg.identities)?;
@@ -2967,11 +2967,12 @@ mod tests {
             s.insert_event("c1", &to_record(&parse_body(ev.as_bytes()).unwrap()[0]).unwrap()).unwrap();
             let c = s.conn.lock().unwrap();
             let e: i64 = c.query_row("SELECT id FROM events", [], |r| r.get(0)).unwrap();
-            for (id, change, eid) in [(1, "deleting", Some(e)), (2, "modified", None), (3, "deleted", None)] {
+            // Another object whose delete has no known request: it stays unlinked and unwritten.
+            for (id, change, eid) in [(1, "deleting", Some(e)), (2, "modified", None), (3, "deleted", None), (4, "deleted", None)] {
                 c.execute(
                     "INSERT INTO versions (id, cluster, api_group, resource, kind, namespace, name, uid, observed_ms, observed, change, body, event_id)
-                     VALUES (?1, 'c1', '', 'namespaces', 'Namespace', '', 'old', 'n1', ?1, '', ?2, '{}', ?3)",
-                    params![id, change, eid],
+                     VALUES (?1, 'c1', '', 'namespaces', 'Namespace', '', ?4, 'n1', ?1, '', ?2, '{}', ?3)",
+                    params![id, change, eid, if id == 4 { "other" } else { "old" }],
                 )
                 .unwrap();
             }
@@ -2979,6 +2980,13 @@ mod tests {
         let s = Store::open(&path).unwrap();
         let (linked, e): (Option<i64>, i64) = s.conn.lock().unwrap().query_row("SELECT event_id, (SELECT id FROM events) FROM versions WHERE id=3", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         assert_eq!(linked, Some(e));
+        s.conn.lock().unwrap().execute_batch(
+            "CREATE TABLE written (id INTEGER); CREATE TRIGGER versions_written AFTER UPDATE ON versions BEGIN INSERT INTO written VALUES (NEW.id); END;",
+        ).unwrap();
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        let written: i64 = s.conn.lock().unwrap().query_row("SELECT count(*) FROM written", [], |r| r.get(0)).unwrap();
+        assert_eq!(written, 0, "a later start writes no version, linked or not");
         drop(s);
         for ext in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{path}{ext}"));
