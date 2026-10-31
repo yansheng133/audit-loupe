@@ -305,10 +305,10 @@ pub struct RoleChange {
 /// Three missed heartbeats (one a minute) count as a gap.
 pub const GAP_MS: i64 = 180_000;
 
-/// A file collector (one per node) silent this long is taken as a node that was removed or
-/// replaced, not a node that is down: the change map stops marking the time after it as
-/// unseen, and the coverage page lists it as retired. If it checks in again, the whole
-/// silence is recorded as a gap as usual. Its row is dropped once it is older than retention.
+/// A collector silent this long is taken as removed (a node replaced, a collector turned off in
+/// the chart), not as down: the change map stops marking the time after it as unseen, and the
+/// coverage page lists it as retired. If it checks in again, the whole silence is recorded as
+/// a gap as usual. Its row is dropped once it is older than retention.
 pub const RETIRED_MS: i64 = 86_400_000;
 
 #[derive(Debug, Serialize)]
@@ -1897,7 +1897,7 @@ impl Store {
         for (cl, col, inst, last, details) in beats {
             let i = row(&mut out, &cl);
             let stale = now_ms - last > GAP_MS;
-            let retired = col == "file" && now_ms - last > RETIRED_MS;
+            let retired = now_ms - last > RETIRED_MS;
             out[i].collectors.push(json!({"collector": col, "instance": inst, "lastMs": last, "stale": stale, "retired": retired,
                                           "details": serde_json::from_str::<Value>(&details).unwrap_or(Value::Null)}));
             if stale && last <= to_ms {
@@ -2196,8 +2196,8 @@ impl Store {
         c.execute("DELETE FROM hourly WHERE hour_ms < ?1", params![cutoff])?;
         c.execute("DELETE FROM stories WHERE last_ms < ?1", params![cutoff])?;
         c.execute("DELETE FROM rejected_lines WHERE received_ms < ?1", params![cutoff])?;
-        // A node's collector silent since before retention: the node is long gone (RETIRED_MS).
-        c.execute("DELETE FROM heartbeats WHERE collector='file' AND last_ms < ?1", params![cutoff])?;
+        // A collector silent since before retention is long gone (RETIRED_MS).
+        c.execute("DELETE FROM heartbeats WHERE last_ms < ?1", params![cutoff])?;
         Ok(n + m)
     }
 }
@@ -2708,7 +2708,7 @@ mod tests {
         {
             let c = s.conn.lock().unwrap();
             c.execute("INSERT INTO rejected_lines (cluster, source, received_ms, len, sha256, error) VALUES ('c1', 'k8s', ?1, 1, 'x', 'bad')", params![ms(&now) - 40 * 86_400_000]).unwrap();
-            c.execute("INSERT INTO heartbeats (cluster, collector, instance, last_ms, details) VALUES ('c1', 'file', 'gone', ?1, '{}'), ('c1', 'file', 'down', ?2, '{}'), ('c1', 'watch', 'w', ?1, '{}')",
+            c.execute("INSERT INTO heartbeats (cluster, collector, instance, last_ms, details) VALUES ('c1', 'file', 'gone', ?1, '{}'), ('c1', 'file', 'down', ?2, '{}'), ('c1', 'neuvector', 'off', ?1, '{}'), ('c1', 'watch', 'w', ?2, '{}')",
                       params![ms(&now) - 40 * 86_400_000, ms(&now) - 2 * 86_400_000]).unwrap();
         }
         s.prune(30, now).unwrap();
@@ -2717,7 +2717,7 @@ mod tests {
             let rejected: i64 = c.query_row("SELECT count(*) FROM rejected_lines", [], |r| r.get(0)).unwrap();
             assert_eq!(rejected, 0);
             let left: Vec<String> = c.prepare("SELECT instance FROM heartbeats ORDER BY instance").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
-            assert_eq!(left, ["down", "w"], "a node silent two days stays listed; only one silent past retention goes");
+            assert_eq!(left, ["down", "w"], "silent two days stays listed; silent past retention goes");
         }
 
         // Someone edits a stored record directly.
