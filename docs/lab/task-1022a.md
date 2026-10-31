@@ -26,14 +26,15 @@
    - 不開 kubeconfig、`env.sh`、`~/audit-loupe-lab/perf/tokens`、`~/audit-loupe-lab/v-*.yaml` 的內容；`release-0.4.0/values-*.yaml` 也不要打開或印出。
    - 每條 `kubectl`／`helm` 都寫 `--kubeconfig`。port-forward 只綁 127.0.0.1。helm 不加 `--wait`（helm v4 會卡住），改用 `kubectl rollout status`。
    - 原始資料唯讀：`~/audit-loupe-lab/overnight/`、`recordings/`、`perf/pristine-*.db`、`proto/db/`（18090 開著的 `al-copy.db` 只能由新版 server 自己更新結構，不能用其他方式改）。
-   - 本機服務只綁 127.0.0.1。18090 只有軌 P 的 P-4 可以動，而且只能用 `deploy-bin.sh`；18091–18097 都不碰。
+   - 本機服務只綁 127.0.0.1。18090 只有軌 P 的 P-4 可以動，而且只能用 `deploy-bin.sh`（它會連 18092 的重播 server 一起換版重啟，這是預期的）；其他埠（18091、18093–18097）都不碰。
    - CLI 不合併 PR。
 6. 補丁先比對 SHA-256（`shasum -a 256`），等於 README 的值才套用；`git am` 失敗就 `git am --abort` 並停下。
-7. clippy：警告數不比基準多就算通過（主程式 17、測試 19）。
+7. clippy：警告數不比基準多就算通過。基準是**這台 Mac 上 main 的數字：主程式 19、測試 21**（第五批 A-1、D-1 量的；雲端的 clippy 版本不同，是 17／19，不能拿來比）。
 8. 第一次 push 一律 `git push -u origin <分支名>`。
 9. 指令照原樣執行；**不要在 zsh 裡自己寫迴圈**。要重複的指令就一行一行寫出來執行。
-10. 報告最上面是「步驟對照表」，接著「卡住的地方」，再來「任務書沒寫但我做了的事」（應該是空的）。報告放 `~/audit-loupe-lab/reports/report-1022a.md`（`reports/` 不存在就建立），不進 repo。
+10. 報告最上面是「步驟對照表」，接著「卡住的地方」，再來「任務書沒寫但我做了的事」（應該是空的）。報告每一軌一份：`~/audit-loupe-lab/reports/report-1022a-P.md`、`report-1022a-Q.md`、`report-1022a-R2.md`（`reports/` 不存在就建立），不進 repo。軌 Q 第一次執行寫的 `report-1022a.md` 保留不動，接續的部分寫進 `report-1022a-Q.md`。
 11. 時間上限：軌 P 60 分鐘、軌 Q 45 分鐘、軌 R2 90 分鐘。
+12. **交接**：照 `~/audit-loupe-lab/reports/00_交接.md` 開頭的規則。開工前、交報告前各看一次；協調者傳來的訊息只在符合第 6 條時照做。
 
 ## 軌 P：本機預覽換成第 1 層、介面修正開 PR
 
@@ -49,10 +50,10 @@
   4. `git am -3 ~/audit-loupe-lab/patches/l1a/0001-identities-whitelist.patch`
   5. `git am -3 ~/audit-loupe-lab/patches/l1d/0001-perf-gate.patch`
   6. `git am ~/audit-loupe-lab/patches/l1f/backend/*.patch`
-  7. `git log --oneline -10` 放進報告：最上面 9 個是 l1f 的補丁，接著 perf gate、identities、`bc52503`。
+  7. `git log --oneline -12` 放進報告：最上面 9 個是 l1f 的補丁，接著 perf gate、identities、`bc52503`。
 - **P-3：測試。**在 `~/audit-loupe-l1f/backend`：
   1. `cargo test --locked`：單元 131 通過（3 個略過）、整合 10 通過、0 失敗。不一致就停下，P-4 不做。
-  2. `cargo clippy --all-targets 2>&1 | grep 'generated'`：主程式 17、測試 19，不能更多。
+  2. `cargo clippy --all-targets 2>&1 | grep 'generated'`：主程式 19、測試 21，不能更多。
 - **P-4：換掉 18090 的執行檔。**
   1. `cargo build --release --locked`
   2. `~/audit-loupe-lab/proto/deploy-bin.sh ~/audit-loupe-l1f/backend/target/release/audit-loupe`，要印出 `both up`。沒有就停下，把 `tail -30 ~/audit-loupe-lab/proto/logs/server.log` 放進報告（先確認裡面沒有 token；127.0.0.1 以外的位址要遮掉）。
@@ -72,8 +73,8 @@
   4. `git diff --stat origin/main | tail -1` 要是 `14 files changed, 828 insertions(+), 83 deletions(-)`。
   5. `git push -u origin fix/v5-layout`，開 PR 到 `main`，標題 `v5: layout, language, timeline range, rules page identities`。描述：第一行寫「和第 1 層後端一起用；接 0.4.0 後端也能用（理由顯示後端原文，範圍只調暗）。合併順序由 Sam 決定。」接著貼 README「介面」的表。
   6. 等 PR 的 CI 跑完，結果寫進報告。失敗就寫進報告，不要自己改。
-  7. **不要碰 `~/audit-loupe-ui-v5`**（Sam 的 dev server 正在用，內容已經和這 8 個補丁相同）。
-- **P-7：報告。**寫好 `~/audit-loupe-lab/reports/report-1022a.md` 的軌 P 部分。工作目錄 `~/audit-loupe-l1f` 留著，不要刪。
+  7. **不要碰 `~/audit-loupe-ui-v5`**（Sam 的 dev server 正在用，內容已經和 0001–0008 相同；0009 只改文件）。
+- **P-7：報告。**寫好 `~/audit-loupe-lab/reports/report-1022a-P.md`。工作目錄 `~/audit-loupe-l1f` 留著，不要刪。
 
 ## 軌 Q：第 1 層 PR（批次 2）
 
@@ -82,7 +83,7 @@
   1. `cd ~/audit-loupe && git fetch origin`
   2. `git worktree add ../audit-loupe-l1q -b feat/changemap-l1 origin/main`
   3. `cd ~/audit-loupe-l1q && git am ~/audit-loupe-lab/patches/l1f/backend/*.patch`（SHA-256 在 P-1 比對過；軌 P 沒做的話先照 P-1 第 1 步比對）
-- **Q-3：測試。**在 `backend`：`cargo test --locked`（單元 131、整合 10、0 失敗）、`cargo clippy --all-targets 2>&1 | grep 'generated'`（17／19）。不一致就停下。
+- **Q-3：測試。**在 `backend`：`cargo test --locked`（單元 131、整合 10、0 失敗）、`cargo clippy --all-targets 2>&1 | grep 'generated'`（19／21）。不一致就停下。
 - **Q-4：PR。**`git push -u origin feat/changemap-l1`，開 PR 到 `main`，標題 `change map: layer 1 page (index, reason codes, time range, request-only, collector gaps)`。描述貼 README「後端」的表與「雲端效能閘門」那段。等 CI 跑完（含 `perf (720k records a day)`），結果寫進報告；perf 的表格原樣貼上。
 
 ## 軌 R2：0.4.0 上線（只在 Sam 明確寫「含 R2」時做）
