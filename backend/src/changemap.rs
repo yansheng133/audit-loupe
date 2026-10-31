@@ -555,9 +555,13 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
             Some((c, n)) => (*c, n.as_str()),
             None => crate::identity::builtin(actor_ref, r.get::<_, i64>(3)? == 1, s(11)?, principals.get(uid_ref).map(String::as_str)),
         };
+        // Hidden rows are counted only in the picked namespaces; the namespace menu lists every
+        // namespace with something on the page, whichever are picked, so picking one does not
+        // take the others away.
+        let picked = !ns_out(s(9)?);
         if !with_system {
             if ui_maintenance(s(7)?, name_ref) {
-                hidden_ui += 1;
+                hidden_ui += picked as i64;
                 continue;
             }
             // Rancher's own accounts (Fleet, NeuVector, the cluster agent) are hidden only where
@@ -565,16 +569,14 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
             // Fleet patches its Deployments, the agent writes its RoleBindings. Those are changes
             // to look at when the service misbehaves, so they stay on the page.
             if category == "component" || (category == "rancher" && !application_namespace(s(9)?)) {
-                hidden_system += 1;
+                hidden_system += picked as i64;
                 continue;
             }
         }
-        // The namespace menu lists every namespace with something on the page, whichever are
-        // picked, so picking one does not take the others away.
         if !s(9)?.is_empty() {
             ns_seen.insert(s(9)?.to_string());
         }
-        if ns_out(s(9)?) {
+        if !picked {
             continue;
         }
         let (note, note_code) = (crate::identity::reason_text(reason).to_string(), crate::identity::reason_code(reason));
@@ -610,7 +612,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
             continue;
         }
         if !with_system && ui_maintenance(&resource, &name) {
-            hidden_ui += 1;
+            hidden_ui += !ns_out(&namespace) as i64;
             continue;
         }
         if !namespace.is_empty() {
@@ -1144,6 +1146,15 @@ mod tests {
         let v = changemap(&s, tz, &p(&["shop", "pay"]), T).unwrap();
         assert_eq!(keys(&v), ["pay", "shop"]);
         assert_eq!(v["namespaces"], json!(["ops", "pay", "shop"]));
+        // Hidden rows count only in the picked namespaces.
+        {
+            let c = s.conn.lock().unwrap();
+            ev(&c, 4, "c1", T + 3000, "system:kube-scheduler", 0, "direct", "create", "bindings", "ops", "p1");
+        }
+        let v = changemap(&s, tz, &p(&["shop", "pay"]), T + 1).unwrap();
+        assert_eq!(v["hidden"]["system"], 0);
+        let v = changemap(&s, tz, &p(&["ops"]), T + 2).unwrap();
+        assert_eq!(v["hidden"]["system"], 1);
         assert_eq!(parse_query("namespace=shop&namespace=pay,ops").namespace, ["shop", "pay", "ops"]);
     }
 
