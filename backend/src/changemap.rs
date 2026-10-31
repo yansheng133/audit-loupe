@@ -20,7 +20,8 @@ pub struct Params {
     pub day: Option<String>,
     #[serde(default)]
     pub cluster: Vec<String>,
-    pub namespace: Option<String>,
+    /// Namespaces to show (repeated or comma-separated); empty means all.
+    pub namespace: Vec<String>,
     pub state: Option<String>,
     pub tab: Option<String>,
     pub cursor: Option<String>,
@@ -44,7 +45,7 @@ pub fn parse_query(q: &str) -> Params {
         match k {
             "day" => p.day = Some(v),
             "cluster" => p.cluster.extend(v.split(',').filter(|s| !s.is_empty()).map(str::to_string)),
-            "namespace" => p.namespace = Some(v),
+            "namespace" => p.namespace.extend(v.split(',').filter(|s| !s.is_empty()).map(str::to_string)),
             "state" => p.state = Some(v),
             "tab" => p.tab = Some(v),
             "cursor" => p.cursor = Some(v),
@@ -59,7 +60,7 @@ pub fn parse_query(q: &str) -> Params {
     p
 }
 
-fn decode(s: &str) -> String {
+pub(crate) fn decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -83,7 +84,7 @@ fn decode(s: &str) -> String {
 }
 
 /// Rancher UI housekeeping: temporary RBAC for the kubectl shell and per-user UI settings.
-fn ui_maintenance(resource: &str, name: &str) -> bool {
+pub(crate) fn ui_maintenance(resource: &str, name: &str) -> bool {
     name.starts_with("pod-impersonation-shell-")
         || name.starts_with("pod-impersonation-helm-")
         || name.starts_with("impersonation-shell-")
@@ -92,18 +93,18 @@ fn ui_maintenance(resource: &str, name: &str) -> bool {
 
 /// A namespace an application lives in: not cluster-scoped, and not one of Kubernetes',
 /// Rancher's or an add-on's own (`kube-*`, `cattle-*`, `fleet-*`, `*-system`).
-fn application_namespace(ns: &str) -> bool {
+pub(crate) fn application_namespace(ns: &str) -> bool {
     !ns.is_empty() && !ns.starts_with("kube-") && !ns.starts_with("cattle-") && !ns.starts_with("fleet-") && !ns.ends_with("-system")
 }
 
-fn is_write(source: &str, verb: &str, sub: &str) -> bool {
+pub(crate) fn is_write(source: &str, verb: &str, sub: &str) -> bool {
     if source == "rancher" {
         return !matches!(verb, "get" | "list" | "watch");
     }
     matches!(verb, "create" | "update" | "patch" | "delete" | "deletecollection") || matches!(sub, "exec" | "attach" | "portforward")
 }
 
-fn kind_from_resource(resource: &str) -> String {
+pub(crate) fn kind_from_resource(resource: &str) -> String {
     let known = [
         ("pods", "Pod"), ("deployments", "Deployment"), ("replicasets", "ReplicaSet"), ("daemonsets", "DaemonSet"), ("statefulsets", "StatefulSet"),
         ("services", "Service"), ("configmaps", "ConfigMap"), ("secrets", "Secret"), ("namespaces", "Namespace"), ("nodes", "Node"),
@@ -127,7 +128,7 @@ const REQUEST_ONLY: [&str; 7] = [
 /// Rancher actions that are requests, not changes: searching users and groups, logging out.
 const REQUEST_ONLY_ACTIONS: [&str; 2] = ["search", "logout"];
 
-fn request_only(resource: &str, verb: &str, name: &str) -> bool {
+pub(crate) fn request_only(resource: &str, verb: &str, name: &str) -> bool {
     name.is_empty() && (REQUEST_ONLY.contains(&resource) || REQUEST_ONLY_ACTIONS.contains(&verb))
 }
 
@@ -141,7 +142,7 @@ pub const BATCH: &str = "*";
 
 /// First instant of a local day. Where midnight does not exist (clocks jump forward at 00:00),
 /// the day starts at the first local minute that does.
-fn day_start(tz: chrono_tz::Tz, d: NaiveDate) -> i64 {
+pub(crate) fn day_start(tz: chrono_tz::Tz, d: NaiveDate) -> i64 {
     let mut t = d.and_hms_opt(0, 0, 0).unwrap();
     for _ in 0..24 * 60 {
         if let Some(dt) = tz.from_local_datetime(&t).earliest() {
@@ -329,6 +330,73 @@ pub fn shown_query() -> String {
     )
 }
 
+/// One collection gap: cluster, from, to, collector, reason ('' = heartbeat silence), still open.
+pub(crate) type GapRow = (String, i64, i64, String, String, bool);
+
+/// Collection gaps overlapping `[start, end)`, for the picked clusters (empty = all).
+pub(crate) fn day_gaps(c: &rusqlite::Connection, start: i64, end: i64, clusters: &HashSet<&str>, now_ms: i64) -> anyhow::Result<Vec<GapRow>> {
+    let mut gaps: Vec<GapRow> = Vec::new();
+    let mut st = c.prepare("SELECT cluster, from_ms, to_ms, collector, reason FROM gaps WHERE to_ms >= ?1 AND from_ms < ?2 AND reason <> ?3 ORDER BY from_ms")?;
+    for row in st.query_map(params![start, end, crate::store::START], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?, false)))? {
+        let g = row?;
+        if clusters.is_empty() || clusters.contains(g.0.as_str()) {
+            gaps.push(g);
+        }
+    }
+    drop(st);
+    // A silence runs to now. watch, rancher and neuvector run one pod per cluster, so for them
+    // another instance reporting after it ends it where that instance started, by the same rule
+    // as heartbeat() (an overlap or a handover within GAP_MS is no gap; a row from before 0.2.1
+    // has no start time and is not taken as a takeover). collect-file runs one per node:
+    // another node reporting proves nothing, but a node silent over a day while another node
+    // reports is taken as replaced (RETIRED_MS): its silence ends where the replacement started
+    // (however late), and at least a day after it began (store::RETIRED_END).
+    let mut st = c.prepare(&format!(
+        "SELECT h.cluster, h.last_ms, h.collector,
+                CASE WHEN h.collector <> 'file' THEN
+                  (SELECT min(n.first_ms) FROM heartbeats n WHERE n.cluster=h.cluster AND n.collector=h.collector AND n.instance<>h.instance AND n.last_ms > h.last_ms)
+                END,
+                EXISTS (SELECT 1 FROM heartbeats o WHERE o.cluster=h.cluster AND o.collector=h.collector AND o.instance<>h.instance AND ?1 - o.last_ms <= ?2),
+                {}
+         FROM heartbeats h WHERE ?1 - h.last_ms > ?2 AND h.last_ms < ?3",
+        crate::store::RETIRED_END
+    ))?;
+    let silences = st.query_map(params![now_ms, crate::store::GAP_MS, end], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<i64>>(3)?, r.get::<_, bool>(4)?, r.get::<_, i64>(5)?))
+    })?;
+    for row in silences {
+        let (cl, last, col, next, others, retired_end) = row?;
+        if !clusters.is_empty() && !clusters.contains(cl.as_str()) {
+            continue;
+        }
+        let cap = if others { retired_end } else { i64::MAX };
+        let to = next.unwrap_or(i64::MAX).min(cap).min(now_ms);
+        // Still "open" (no "resumed") unless another instance took over: running to now, or cut
+        // off as retired.
+        if to - last > crate::store::GAP_MS && to >= start {
+            gaps.push((cl, last, to, col, String::new(), next.is_none_or(|n| n > to)));
+        }
+    }
+    drop(st);
+
+    Ok(gaps)
+}
+
+/// The page's gaps as the API gives them (`timeline.gaps`).
+pub(crate) fn gaps_json(gaps: &[GapRow]) -> Vec<Value> {
+    gaps
+        .iter()
+        .map(|(cl, f, t, col, why, open)| {
+            if why.is_empty() {
+                json!({"cluster": cl, "fromMs": f, "toMs": t, "open": open, "kind": "heartbeat", "collector": col, "reasonCode": "collector-silent", "reason": format!("收集元件 {col} 沒有回報")})
+            } else {
+                json!({"cluster": cl, "fromMs": f, "toMs": t, "kind": "reported", "collector": col, "cause": why, "reasonCode": "collector-reported",
+                       "reason": format!("收集元件 {col} 回報這段沒有收集（{why}）")})
+            }
+        })
+        .collect()
+}
+
 /// Page views being built now, per server and view. People who open the same view at the same
 /// moment share one build instead of queueing for the database one after another (five at
 /// once took about 0.9 s each without this, at 720,000 records a day). A view asked for after
@@ -410,7 +478,8 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     let tab = p.tab.as_deref().unwrap_or("overview");
     let with_system = p.system.as_deref() == Some("1");
     let clusters: HashSet<&str> = p.cluster.iter().map(String::as_str).collect();
-    let ns_filter = p.namespace.as_deref().filter(|s| !s.is_empty());
+    let namespaces: HashSet<&str> = p.namespace.iter().map(String::as_str).collect();
+    let ns_out = |n: &str| !namespaces.is_empty() && !namespaces.contains(n);
     let chains = chain_status(store, now_ms);
 
     let cursor = match p.cursor.as_deref().filter(|c| !c.is_empty()) {
@@ -463,6 +532,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
 
     let mut ops: Vec<Op> = Vec::new();
     let mut hidden_system = 0i64;
+    let mut ns_seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut hidden_ui = 0i64;
     let mut hidden_request = 0i64;
     let mut objs: HashMap<String, Obj> = HashMap::new();
@@ -533,7 +603,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         // Emptying a deleted namespace is listed with the namespace (cluster-scoped, core group).
         let cascade = s(5)? == "deletecollection" && s(2)? == NAMESPACE_CONTROLLER && !s(9)?.is_empty();
         let group_ref = if cascade { "" } else { s(6)? };
-        if ns_filter.is_some_and(|n| n != s(9).unwrap_or_default()) || only.is_some_and(|k| k.api_group != group_ref) {
+        if only.is_some_and(|k| k.api_group != group_ref) {
             continue;
         }
         // A write without a name is a deletecollection or a create the server named. It is
@@ -552,9 +622,13 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
             Some((c, n)) => (*c, n.as_str()),
             None => crate::identity::builtin(actor_ref, r.get::<_, i64>(3)? == 1, s(11)?, principals.get(uid_ref).map(String::as_str)),
         };
+        // Hidden rows are counted only in the picked namespaces; the namespace menu lists every
+        // namespace with something on the page, whichever are picked, so picking one does not
+        // take the others away.
+        let picked = !ns_out(s(9)?);
         if !with_system {
             if ui_maintenance(s(7)?, name_ref) {
-                hidden_ui += 1;
+                hidden_ui += picked as i64;
                 continue;
             }
             // Rancher's own accounts (Fleet, NeuVector, the cluster agent) are hidden only where
@@ -562,9 +636,15 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
             // Fleet patches its Deployments, the agent writes its RoleBindings. Those are changes
             // to look at when the service misbehaves, so they stay on the page.
             if category == "component" || (category == "rancher" && !application_namespace(s(9)?)) {
-                hidden_system += 1;
+                hidden_system += picked as i64;
                 continue;
             }
+        }
+        if !s(9)?.is_empty() {
+            ns_seen.insert(s(9)?.to_string());
+        }
+        if !picked {
+            continue;
         }
         let (note, note_code) = (crate::identity::reason_text(reason).to_string(), crate::identity::reason_code(reason));
         let (cluster, actor, verb, sub) = (text(r, 0)?, text(r, 2)?, text(r, 5)?, text(r, 8)?);
@@ -595,13 +675,17 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
             continue;
         }
         let (api_group, resource, namespace, name): (String, String, String, String) = (r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?);
-        if ns_filter.is_some_and(|n| n != namespace)
-            || only.is_some_and(|k| k.api_group != api_group || k.resource != resource || k.namespace != namespace || k.name != name)
-        {
+        if only.is_some_and(|k| k.api_group != api_group || k.resource != resource || k.namespace != namespace || k.name != name) {
             continue;
         }
         if !with_system && ui_maintenance(&resource, &name) {
-            hidden_ui += 1;
+            hidden_ui += !ns_out(&namespace) as i64;
+            continue;
+        }
+        if !namespace.is_empty() {
+            ns_seen.insert(namespace.clone());
+        }
+        if ns_out(&namespace) {
             continue;
         }
         let key = format!("{cluster}/{api_group}/{resource}/{namespace}/{name}");
@@ -620,49 +704,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     // marker, not a gap. A silence still going on is in no table yet (it is written when the
     // collector checks in again), so it comes from the heartbeats and runs to now; the last
     // field says it is still open.
-    let mut gaps: Vec<(String, i64, i64, String, String, bool)> = Vec::new();
-    let mut st = c.prepare("SELECT cluster, from_ms, to_ms, collector, reason FROM gaps WHERE to_ms >= ?1 AND from_ms < ?2 AND reason <> ?3 ORDER BY from_ms")?;
-    for row in st.query_map(params![start, end, crate::store::START], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?, false)))? {
-        let g = row?;
-        if clusters.is_empty() || clusters.contains(g.0.as_str()) {
-            gaps.push(g);
-        }
-    }
-    drop(st);
-    // A silence runs to now. watch, rancher and neuvector run one pod per cluster, so for them
-    // another instance reporting after it ends it where that instance started, by the same rule
-    // as heartbeat() (an overlap or a handover within GAP_MS is no gap; a row from before 0.2.1
-    // has no start time and is not taken as a takeover). collect-file runs one per node:
-    // another node reporting proves nothing, but a node silent over a day while another node
-    // reports is taken as replaced (RETIRED_MS): its silence ends where the replacement started
-    // (however late), and at least a day after it began (store::RETIRED_END).
-    let mut st = c.prepare(&format!(
-        "SELECT h.cluster, h.last_ms, h.collector,
-                CASE WHEN h.collector <> 'file' THEN
-                  (SELECT min(n.first_ms) FROM heartbeats n WHERE n.cluster=h.cluster AND n.collector=h.collector AND n.instance<>h.instance AND n.last_ms > h.last_ms)
-                END,
-                EXISTS (SELECT 1 FROM heartbeats o WHERE o.cluster=h.cluster AND o.collector=h.collector AND o.instance<>h.instance AND ?1 - o.last_ms <= ?2),
-                {}
-         FROM heartbeats h WHERE ?1 - h.last_ms > ?2 AND h.last_ms < ?3",
-        crate::store::RETIRED_END
-    ))?;
-    let silences = st.query_map(params![now_ms, crate::store::GAP_MS, end], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<i64>>(3)?, r.get::<_, bool>(4)?, r.get::<_, i64>(5)?))
-    })?;
-    for row in silences {
-        let (cl, last, col, next, others, retired_end) = row?;
-        if !clusters.is_empty() && !clusters.contains(cl.as_str()) {
-            continue;
-        }
-        let cap = if others { retired_end } else { i64::MAX };
-        let to = next.unwrap_or(i64::MAX).min(cap).min(now_ms);
-        // Still "open" (no "resumed") unless another instance took over: running to now, or cut
-        // off as retired.
-        if to - last > crate::store::GAP_MS && to >= start {
-            gaps.push((cl, last, to, col, String::new(), next.is_none_or(|n| n > to)));
-        }
-    }
-    drop(st);
+    let gaps = day_gaps(&c, start, end, &clusters, now_ms)?;
 
     let unclear_reason = |cluster: &str| -> (&'static str, String) {
         let cols = collectors.get(cluster);
@@ -817,17 +859,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
             .collect();
         lines.push(json!({"cluster": lk, "slots": out}));
     }
-    let gaps_json: Vec<Value> = gaps
-        .iter()
-        .map(|(cl, f, t, col, why, open)| {
-            if why.is_empty() {
-                json!({"cluster": cl, "fromMs": f, "toMs": t, "open": open, "kind": "heartbeat", "collector": col, "reasonCode": "collector-silent", "reason": format!("收集元件 {col} 沒有回報")})
-            } else {
-                json!({"cluster": cl, "fromMs": f, "toMs": t, "kind": "reported", "collector": col, "cause": why, "reasonCode": "collector-reported",
-                       "reason": format!("收集元件 {col} 回報這段沒有收集（{why}）")})
-            }
-        })
-        .collect();
+    let gaps_json = gaps_json(&gaps);
 
     // Prefer the latest op with a known author; fall back to the latest unattributed change.
     // Who the row names: the latest attributed record, and for a namespace whoever deleted it
@@ -842,6 +874,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
             .collect::<serde_json::Map<_, _>>(),
         "counts": counts,
         "hidden": {"system": hidden_system, "uiMaintenance": hidden_ui, "requestOnly": hidden_request},
+        "namespaces": ns_seen,
         "timeline": {"slotMinutes": slot_min, "lines": lines, "gaps": gaps_json},
     });
 
@@ -1109,6 +1142,35 @@ mod tests {
         beats(&s, &[("watch", "w-old", T - 11 * 3_600_000, Some(0)), ("watch", "w-new", now - 30_000, Some(T - 10 * 3_600_000 - 30 * 60_000))]);
         let v = changemap(&s, tz, &day, now).unwrap();
         assert_eq!(v["timeline"]["gaps"].as_array().unwrap().len(), 0, "{v}");
+    }
+
+    /// Several namespaces can be picked; the menu's list keeps every namespace of the page
+    /// whatever is picked.
+    #[test]
+    fn several_namespaces_and_the_full_menu() {
+        let s = store();
+        {
+            let c = s.conn.lock().unwrap();
+            ev(&c, 1, "c1", T, "alice", 1, "direct", "patch", "deployments", "shop", "web");
+            ev(&c, 2, "c1", T + 1000, "alice", 1, "direct", "patch", "deployments", "pay", "api");
+            ev(&c, 3, "c1", T + 2000, "alice", 1, "direct", "patch", "deployments", "ops", "job");
+        }
+        let tz = chrono_tz::Asia::Taipei;
+        let p = |ns: &[&str]| Params { day: Some("2026-10-20".into()), namespace: ns.iter().map(|n| n.to_string()).collect(), ..Default::default() };
+        let keys = |v: &Value| { let mut k: Vec<String> = v["rows"].as_array().unwrap().iter().map(|r| r["namespace"].as_str().unwrap().to_string()).collect(); k.sort(); k };
+        let v = changemap(&s, tz, &p(&["shop", "pay"]), T).unwrap();
+        assert_eq!(keys(&v), ["pay", "shop"]);
+        assert_eq!(v["namespaces"], json!(["ops", "pay", "shop"]));
+        // Hidden rows count only in the picked namespaces.
+        {
+            let c = s.conn.lock().unwrap();
+            ev(&c, 4, "c1", T + 3000, "system:kube-scheduler", 0, "direct", "create", "bindings", "ops", "p1");
+        }
+        let v = changemap(&s, tz, &p(&["shop", "pay"]), T + 1).unwrap();
+        assert_eq!(v["hidden"]["system"], 0);
+        let v = changemap(&s, tz, &p(&["ops"]), T + 2).unwrap();
+        assert_eq!(v["hidden"]["system"], 1);
+        assert_eq!(parse_query("namespace=shop&namespace=pay,ops").namespace, ["shop", "pay", "ops"]);
     }
 
     #[test]

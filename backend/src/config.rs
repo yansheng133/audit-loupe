@@ -26,6 +26,8 @@ pub struct Config {
     pub rules: crate::rules::RuleSet,
     /// Identities the built-in classification cannot tell apart (AL_IDENTITIES).
     pub identities: crate::identity::Whitelist,
+    /// How the change map v6 cuts operations into behaviors (AL_BEHAVIOR_*).
+    pub behaviors: crate::behaviors::Settings,
 }
 
 fn var(name: &str, default: &str) -> String {
@@ -146,6 +148,7 @@ impl Config {
             change_windows: crate::windows::parse(&env::var("AL_CHANGE_WINDOWS").unwrap_or_default()).map_err(|e| anyhow::anyhow!("AL_CHANGE_WINDOWS: {e}"))?,
             rules: crate::rules::RuleSet::parse(&env::var("AL_RULES").unwrap_or_default(), &tz).map_err(|e| anyhow::anyhow!("AL_RULES: {e}"))?,
             identities: crate::identity::Whitelist::parse(&env::var("AL_IDENTITIES").unwrap_or_default()).map_err(|e| anyhow::anyhow!("AL_IDENTITIES: {e}"))?,
+            behaviors: crate::behaviors::Settings::from_env()?,
             tz,
         })
     }
@@ -168,6 +171,7 @@ impl Config {
             change_windows: vec![],
             rules: crate::rules::RuleSet::default(),
             identities: crate::identity::Whitelist::default(),
+            behaviors: crate::behaviors::Settings::default(),
         }
     }
 
@@ -192,6 +196,7 @@ impl Config {
             change_windows: vec![],
             rules: crate::rules::RuleSet::default(),
             identities: crate::identity::Whitelist::default(),
+            behaviors: crate::behaviors::Settings::default(),
         }
     }
 }

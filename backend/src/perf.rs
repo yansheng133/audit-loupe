@@ -263,8 +263,32 @@ fn perf_gate() {
     let five = five_at_once(&store, tz, &base, now);
     add("總覽第二頁", Some(300.0), Params { cursor: next, ..base.clone() }, false);
     add("總覽只看「要看」", Some(300.0), Params { state: Some("look".into()), ..base.clone() }, false);
-    add("總覽單一 Namespace", Some(300.0), Params { namespace: Some("al-sample".into()), ..base.clone() }, false);
+    add("總覽單一 Namespace", Some(300.0), Params { namespace: vec!["al-sample".into()], ..base.clone() }, false);
     add("總覽時間範圍（兩小時）", Some(300.0), Params { from: Some(day_start() + 10 * 3_600_000), to: Some(day_start() + 12 * 3_600_000), ..base.clone() }, false);
+    // Change map v6: the behaviors of the day (one request per page view) and one behavior's detail.
+    let bp = crate::behaviors::Params { day: day.clone(), ..Default::default() };
+    let (ms, bytes) = time(runs, || crate::behaviors::page(&store, tz, &bp, now).unwrap());
+    rows.push(Row { view: "行為（v6 開頁）", target_ms: Some(300.0), ms, bytes, scan_ms: None, same: None });
+    let bsys = crate::behaviors::Params { system: Some("1".into()), ..bp.clone() };
+    let (ms, bytes) = time(runs, || crate::behaviors::page(&store, tz, &bsys, now).unwrap());
+    rows.push(Row { view: "行為（v6，含系統元件）", target_ms: Some(300.0), ms, bytes, scan_ms: None, same: None });
+    let biggest = crate::behaviors::page(&store, tz, &bsys, now).unwrap()["behaviors"]
+        .as_array()
+        .and_then(|b| b.iter().max_by_key(|x| x["ops"].as_i64().unwrap_or(0)))
+        .and_then(|b| b["id"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    let bd = crate::behaviors::Params { id: Some(biggest), ..bp.clone() };
+    let (ms, bytes) = time(runs, || crate::behaviors::detail(&store, tz, &bd, now).unwrap().unwrap());
+    rows.push(Row { view: "行為明細（最大的一段）", target_ms: Some(100.0), ms, bytes, scan_ms: None, same: None });
+    // Building the behavior table from scratch (the first start after upgrading).
+    store.conn.lock().unwrap().execute("DELETE FROM behavior_state", []).unwrap();
+    let t = Instant::now();
+    crate::behaviors::ensure(&store).unwrap();
+    while crate::behaviors::building_since(&store).is_some() {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let build_s = t.elapsed().as_secs_f64();
 
     let mut md = format!(
         "### 變更地圖效能閘門\n\n一天 {n} 筆（lab 10/20 的 {scale} 倍），寫入 {ingest_s:.1} 秒（每秒 {:.0} 筆）；雜湊鏈完整檢查 {chain_s:.1} 秒（背景，每 10 分鐘一次，不計入下表）。每項 {runs} 次，不含第一次。伺服器端時間，不含網路與瀏覽器。\n\n| 畫面 | p50 (ms) | p95 (ms) | 最慢 (ms) | 回應大小（gzip） | 目標 p95 | 結果 | 舊做法 p50 (ms) | 與舊做法相同 |\n|---|---|---|---|---|---|---|---|---|\n",
@@ -295,6 +319,7 @@ fn perf_gate() {
             match r.same { Some(true) => "相同", Some(false) => "**不同**", None => "—" },
         );
     }
+    md += &format!("\n行為表從頭建一次（升級後第一次啟動，在背景）：{build_s:.1} 秒。\n");
     md += &format!(
         "\n5 個人同時開總覽首頁（3 輪）：每個請求最慢 {:.0} ms（目標 ≤ 1,000 ms）。同一個畫面同時被要求時只算一次，其他人等它算完共用結果。\n",
         five

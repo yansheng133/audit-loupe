@@ -716,8 +716,10 @@ impl Store {
         // Ingest waits briefly instead of failing while a background build holds the write lock.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         crate::shown::prepare(&conn, conn.path().map(str::to_string).filter(|p| !p.is_empty()))?;
+        crate::behaviors::prepare(&conn)?;
         let store = Store { conn: Arc::new(Mutex::new(conn)), cfg, job: Arc::new(Mutex::new(None)) };
         store.register_settings(Utc::now().timestamp_millis())?;
+        crate::behaviors::ensure(&store)?;
         Ok(store)
     }
 
@@ -986,9 +988,14 @@ impl Store {
                     // The downstream record is the one shown; this half was never counted.
                     (Source::Rancher, Some(_)) => continue,
                     // This record takes over from a Rancher half that was counted on its own.
-                    (Source::K8s, Some(other)) => Self::uncount(&tx, other)?,
+                    (Source::K8s, Some(other)) => {
+                        Self::uncount(&tx, other)?;
+                        crate::behaviors::remove(&tx, crate::behaviors::LIVE, other)?;
+                    }
                     _ => {}
                 }
+                let flagged = alerts.iter().any(|a| matches!(a.severity, "high" | "medium"));
+                crate::behaviors::add(&tx, crate::behaviors::LIVE, &self.cfg.behaviors, id, cl, &crate::behaviors::OpIn::of(r), flagged)?;
                 if counts(r, alerts) {
                     Self::bump(&tx, cl, t, key, r.human, 1, !alerts.is_empty() as i64)?;
                 }
@@ -1833,6 +1840,7 @@ impl Store {
                 c.execute("DELETE FROM heartbeats WHERE cluster=?1 AND collector=?2 AND instance=?3", params![cluster, collector, old])?;
             }
         }
+        crate::behaviors::sync_gaps(&c)?;
         Ok(())
     }
 
@@ -1844,6 +1852,7 @@ impl Store {
             "INSERT OR IGNORE INTO gaps (cluster, collector, instance, from_ms, to_ms, reason, detail) VALUES (?1,?2,?3,?4,?5,?6,?7)",
             params![cluster, g.collector, g.instance, g.from_ms, g.to_ms, g.reason, g.detail],
         )?;
+        crate::behaviors::sync_gaps(&c)?;
         Ok(n == 1)
     }
 
@@ -2233,6 +2242,7 @@ impl Store {
         c.execute("DELETE FROM security_events WHERE ts_ms < ?1", params![cutoff])?;
         c.execute("DELETE FROM hourly WHERE hour_ms < ?1", params![cutoff])?;
         c.execute("DELETE FROM stories WHERE last_ms < ?1", params![cutoff])?;
+        crate::behaviors::prune(&c, cutoff)?;
         c.execute("DELETE FROM rejected_lines WHERE received_ms < ?1", params![cutoff])?;
         // A retired collector (RETIRED_MS) silent since before retention is long gone. One with
         // no other instance reporting stays: dropping it would hide that nothing is collected.
@@ -2249,6 +2259,7 @@ impl Store {
             &format!("DELETE FROM heartbeats WHERE (cluster, collector, instance) IN (SELECT h.cluster, h.collector, h.instance {retired})"),
             params![cutoff, ms(&now)],
         )?;
+        crate::behaviors::sync_gaps(&tx)?;
         tx.commit()?;
         Ok(n + m)
     }

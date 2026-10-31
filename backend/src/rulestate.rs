@@ -357,6 +357,8 @@ impl Store {
             if *hidden || *ts_ms < cutoff {
                 continue;
             }
+            let flagged = alerts.iter().any(|a| matches!(a.severity, "high" | "medium"));
+            crate::behaviors::add(c, crate::behaviors::RECOMPUTE, &self.cfg.behaviors, *id, cluster, &crate::behaviors::OpIn::of(r), flagged)?;
             c.prepare_cached("INSERT OR IGNORE INTO rc_counted (event_id) VALUES (?1)")?.execute(params![id])?;
             let key = if r.user_id.is_empty() { r.actor.as_str() } else { r.user_id.as_str() };
             if crate::store::counts(r, &alerts) {
@@ -379,7 +381,7 @@ impl Store {
     fn recompute(&self) -> anyhow::Result<()> {
         let started = Instant::now();
         let started_ms = Utc::now().timestamp_millis();
-        let setup = || -> anyhow::Result<(i64, i64, i64)> {
+        let setup = || -> anyhow::Result<(i64, i64, i64, i64)> {
             let mut c = self.conn.lock().unwrap();
             let tx = c.transaction()?;
             tx.execute_batch(SHADOW)?;
@@ -395,17 +397,21 @@ impl Store {
             let sid: i64 = tx.query_row("SELECT id FROM rule_settings WHERE fingerprint=?1 ORDER BY id DESC LIMIT 1", params![fp], |r| r.get(0))?;
             let max_id: i64 = tx.query_row("SELECT coalesce(max(id), 0) FROM events", [], |r| r.get(0))?;
             let total: i64 = tx.query_row("SELECT count(*) FROM events", [], |r| r.get(0))?;
+            let gap_id = crate::behaviors::recompute_start(&tx)?;
             tx.execute("INSERT INTO recomputes (settings_id, started_ms) VALUES (?1, ?2)", params![sid, started_ms])?;
             let run_id = tx.last_insert_rowid();
             tx.commit()?;
-            Ok((run_id, max_id, total))
+            Ok((run_id, max_id, total, gap_id))
         };
-        let (run_id, max_id, total) = setup().inspect_err(|_| {
-            let _ = self.conn.lock().unwrap().execute_batch(SHADOW);
+        let (run_id, max_id, total, gap_id) = setup().inspect_err(|_| {
+            let c = self.conn.lock().unwrap();
+            let _ = c.execute_batch(SHADOW);
+            crate::behaviors::recompute_drop(&c);
         })?;
         let fail = |e: anyhow::Error| -> anyhow::Error {
             let c = self.conn.lock().unwrap();
             let _ = c.execute_batch(SHADOW);
+            crate::behaviors::recompute_drop(&c);
             let _ = c.execute("UPDATE recomputes SET error=?2, finished_ms=?3 WHERE id=?1", params![run_id, e.to_string(), Utc::now().timestamp_millis()]);
             e
         };
@@ -459,6 +465,7 @@ impl Store {
                 .collect::<Result<_, _>>()?;
             for (id, cluster, ts_ms, key, story, alerts, human) in paired {
                 Store::bump_in(&tx, Tables::SHADOW, &cluster, ts_ms, &key, human, -1, -((alerts > 0) as i64))?;
+                crate::behaviors::remove(&tx, crate::behaviors::RECOMPUTE, id)?;
                 if let Some(sid) = story {
                     tx.execute("DELETE FROM rc_story_of WHERE event_id=?1", params![id])?;
                     tx.execute("UPDATE rc_stories SET count=count-1 WHERE id=?1", params![sid])?;
@@ -478,6 +485,7 @@ impl Store {
                  INSERT INTO hourly (cluster, hour_ms, actor_key, human, writes, alerts)
                    SELECT cluster, hour_ms, actor_key, human, writes, alerts FROM rc_hourly WHERE writes <> 0 OR alerts <> 0;",
             )?;
+            crate::behaviors::recompute_swap(&tx, &self.cfg.behaviors, gap_id)?;
             tx.execute_batch(SHADOW)?;
             let (from_ms, to_ms): (Option<i64>, Option<i64>) = tx.query_row("SELECT min(ts_ms), max(ts_ms) FROM events", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
             let n = done + late.len() as i64;
