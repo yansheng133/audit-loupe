@@ -1997,7 +1997,7 @@ impl Store {
             "SELECT e.id,e.cluster,e.ts,e.actor,e.principal,e.human,e.via,e.caller,e.verb,e.api_group,e.resource,e.subresource,
                     e.namespace,e.name,e.code,e.source_ip,e.user_agent,e.request_uri,e.request_object,
                     (SELECT group_concat(rule || ':' || severity) FROM alerts a WHERE a.event_id=e.id),
-                    (SELECT v.id FROM versions v WHERE v.event_id=e.id ORDER BY v.id DESC LIMIT 1),
+                    (SELECT v.id FROM versions v WHERE v.event_id=e.id ORDER BY v.id LIMIT 1),
                     e.source,e.user_id,r.ts,r.user_agent,r.source_ip,r.request_uri,e.audit_id
              FROM events e LEFT JOIN events r ON r.id=e.link_id AND e.source='k8s'
              WHERE e.ts_ms BETWEEN ?1 AND ?2",
@@ -2874,6 +2874,10 @@ mod tests {
         assert_eq!((h[0].change.as_str(), h[0].actor.as_deref()), ("deleted", Some("system:admin")));
         let unlinked: i64 = s.conn.lock().unwrap().query_row("SELECT count(*) FROM versions WHERE event_id IS NULL AND change IN ('deleting','deleted')", [], |r| r.get(0)).unwrap();
         assert_eq!(unlinked, 0);
+        // The delete request's own row still shows what it did: the deletion timestamp set.
+        let rows = s.timeline(&Query { cluster: None, actor: None, from_ms: 0, to_ms: i64::MAX, humans_only: false, writes_only: false, alerts_only: false, limit: 10 }).unwrap();
+        let del = rows.iter().find(|r| r.verb == "delete").unwrap();
+        assert_eq!(del.change.as_deref(), Some("deleting"));
     }
 
     #[test]

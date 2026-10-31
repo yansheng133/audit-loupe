@@ -40,7 +40,8 @@ pub fn days(spec: &str) -> anyhow::Result<Vec<u32>> {
         _ => Err(anyhow::anyhow!("\"{spec}\": days are numbers 1 (Monday) to 7 (Sunday), as \"1-5\" or \"1,3,5\"")),
     };
     let mut out = Vec::new();
-    for part in spec.split(',') {
+    // Empty parts ("1-5,") are skipped, as before; a list with no day at all is refused.
+    for part in spec.split(',').filter(|p| !p.trim().is_empty()) {
         match part.split_once('-') {
             Some((a, b)) => {
                 let (a, b) = (day(a)?, day(b)?);
@@ -51,6 +52,9 @@ pub fn days(spec: &str) -> anyhow::Result<Vec<u32>> {
             }
             None => out.push(day(part)?),
         }
+    }
+    if out.is_empty() {
+        anyhow::bail!("\"{spec}\": no days");
     }
     Ok(out)
 }
@@ -218,7 +222,8 @@ mod tests {
     /// quietly ("Mon-Fri" meant no working days, "90d" meant 30 days kept).
     #[test]
     fn unreadable_settings_are_refused() {
-        for bad in ["Mon-Fri", "0-5", "1-8", "5-1", "1,,2", ""] {
+        assert_eq!(days("1-5,").unwrap(), vec![1, 2, 3, 4, 5], "a trailing comma was accepted before");
+        for bad in ["Mon-Fri", "0-5", "1-8", "5-1", ",", ""] {
             assert!(days(bad).is_err(), "{bad}");
         }
         for bad in ["9:00-18:00", "9", "9-25", "9-9", "a-b"] {

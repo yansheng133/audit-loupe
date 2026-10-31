@@ -619,7 +619,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     // collector (restart, file removed or replaced, state lost). Where collection started is a
     // marker, not a gap. A silence still going on is in no table yet (it is written when the
     // collector checks in again), so it comes from the heartbeats and runs to now; the last
-    // field says it is still open. One silent over a day is taken as removed (RETIRED_MS).
+    // field says it is still open.
     let mut gaps: Vec<(String, i64, i64, String, String, bool)> = Vec::new();
     let mut st = c.prepare("SELECT cluster, from_ms, to_ms, collector, reason FROM gaps WHERE to_ms >= ?1 AND from_ms < ?2 AND reason <> ?3 ORDER BY from_ms")?;
     for row in st.query_map(params![start, end, crate::store::START], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?, false)))? {
@@ -629,13 +629,25 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         }
     }
     drop(st);
+    // A silence ends where a new instance of the same collector in the cluster started after it
+    // (a node replaced, a pod renamed: a handover within GAP_MS is no gap at all), else a day
+    // after it began (RETIRED_MS: taken as removed), else it is still going on.
     let mut st = c.prepare(
-        "SELECT cluster, last_ms, collector FROM heartbeats WHERE ?1 - last_ms > ?2 AND ?1 - last_ms <= ?4 AND last_ms < ?3",
+        "SELECT h.cluster, h.last_ms, h.collector,
+                (SELECT min(n.first_ms) FROM heartbeats n WHERE n.cluster=h.cluster AND n.collector=h.collector AND n.instance<>h.instance AND n.first_ms > h.last_ms)
+         FROM heartbeats h WHERE ?1 - h.last_ms > ?2 AND h.last_ms < ?3 AND h.last_ms + ?4 >= ?5",
     )?;
-    for row in st.query_map(params![now_ms, crate::store::GAP_MS, end, crate::store::RETIRED_MS], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get::<_, String>(2)?)))? {
-        let (cl, last, col) = row?;
-        if clusters.is_empty() || clusters.contains(cl.as_str()) {
-            gaps.push((cl, last, now_ms.max(last), col, String::new(), true));
+    let silences = st.query_map(params![now_ms, crate::store::GAP_MS, end, crate::store::RETIRED_MS, start], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<i64>>(3)?))
+    })?;
+    for row in silences {
+        let (cl, last, col, next) = row?;
+        if !clusters.is_empty() && !clusters.contains(cl.as_str()) {
+            continue;
+        }
+        let to = next.unwrap_or(i64::MAX).min(last + crate::store::RETIRED_MS).min(now_ms);
+        if to - last > crate::store::GAP_MS {
+            gaps.push((cl, last, to, col, String::new(), to == now_ms));
         }
     }
     drop(st);
@@ -1009,6 +1021,43 @@ mod tests {
         let v = changemap(&s, chrono_tz::Asia::Taipei, &Params { tab: Some("events".into()), ..p.clone() }, now).unwrap();
         let codes: Vec<&str> = v["events"].as_array().unwrap().iter().filter_map(|e| e["reasonCode"].as_str()).collect();
         assert!(codes.contains(&"collector-stopped") && !codes.contains(&"collector-resumed"), "{codes:?}");
+    }
+
+    /// A silence past a day still shows its first day (it ends there instead of vanishing), and
+    /// a node replaced by another one ends the old node's silence where the new one started,
+    /// so the rest of the cluster's changes are not marked unseen.
+    #[test]
+    fn a_long_or_handed_over_silence_ends_where_it_should() {
+        let s = store();
+        let day = Params { day: Some("2026-10-20".into()), ..Default::default() };
+        {
+            let c = s.conn.lock().unwrap();
+            ev(&c, 1, "c1", T - 60_000, "alice", 1, "direct", "patch", "deployments", "shop", "web");
+            c.execute("INSERT INTO heartbeats (cluster, collector, instance, last_ms, details) VALUES ('c1', 'file', 'n1', ?1, '{}')", params![T]).unwrap();
+        }
+        let v = changemap(&s, chrono_tz::Asia::Taipei, &day, T + 25 * 3_600_000).unwrap();
+        let g = &v["timeline"]["gaps"][0];
+        assert_eq!((g["fromMs"].as_i64(), g["toMs"].as_i64(), g["open"].as_bool()), (Some(T), Some(T + 86_400_000), Some(false)), "{v}");
+        assert_eq!(v["rows"][0]["state"], "blind");
+
+        let s = store();
+        let now = T + 3 * 3_600_000;
+        {
+            let c = s.conn.lock().unwrap();
+            ev(&c, 1, "c1", T + 2 * 3_600_000, "alice", 1, "direct", "patch", "deployments", "shop", "web");
+            c.execute(
+                "INSERT INTO heartbeats (cluster, collector, instance, last_ms, details, first_ms) VALUES
+                 ('c1', 'file', 'old-node', ?1, '{}', 0), ('c1', 'file', 'new-node', ?2, '{}', ?3),
+                 ('c1', 'watch', 'w-old', ?1, '{}', 0), ('c1', 'watch', 'w-new', ?2, '{}', ?4)",
+                params![T, now - 30_000, T + 20 * 60_000, T + 60_000],
+            )
+            .unwrap();
+        }
+        let v = changemap(&s, chrono_tz::Asia::Taipei, &day, now).unwrap();
+        let gaps = v["timeline"]["gaps"].as_array().unwrap();
+        assert_eq!(gaps.len(), 1, "the watch handed over within a minute: no gap; {gaps:?}");
+        assert_eq!((gaps[0]["fromMs"].as_i64(), gaps[0]["toMs"].as_i64(), gaps[0]["open"].as_bool()), (Some(T), Some(T + 20 * 60_000), Some(false)));
+        assert_eq!(v["rows"][0]["state"], "clear", "changed long after the new node took over");
     }
 
     #[test]
