@@ -91,4 +91,12 @@ seccompProfile:
 {{- with .Values.server.identities }}
 - { name: AL_IDENTITIES, value: {{ toJson . | quote }} }
 {{- end }}
+{{- with .Values.server.behaviors }}
+- { name: AL_BEHAVIOR_CELL_MINUTES, value: {{ .cellMinutes | default 10 | quote }} }
+- { name: AL_BEHAVIOR_JOIN_MINUTES, value: {{ .joinMinutes | default 60 | quote }} }
+- { name: AL_BEHAVIOR_DROP_FAILED, value: {{ ternary "true" "false" (ne .dropFailed false) | quote }} }
+- { name: AL_BEHAVIOR_LOOK, value: {{ join "," (.look | default (list "high")) | quote }} }
+- { name: AL_BEHAVIOR_NOTABLE, value: {{ join "," (.notable | default (list "medium")) | quote }} }
+- { name: AL_BEHAVIOR_TAG_ONLY, value: {{ join "," (.tagOnly | default (list "bypassed_rancher" "off_hours")) | quote }} }
+{{- end }}
 {{- end -}}

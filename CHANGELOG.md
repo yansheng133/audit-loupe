@@ -1,5 +1,16 @@
 # 變更紀錄
 
+## 0.7.0（未發佈）
+
+### 新增
+- **變更地圖 v6 的行為段落**：`GET /api/behaviors`（開頁一個請求）與 `/api/behaviors/detail`，約定見 `docs/api/behaviors-v0.md`。同一叢集、同一身分、同一目標 namespace 的所有操作切成一段行為：相隔超過 60 分鐘或中間有收集中斷開始就斷開，10 分鐘一格（依 server 時區）；Namespace 物件算它自己的名稱。分級：有高風險警示「要看」、有中風險警示「值得知道」，`bypassed_rancher`、`off_hours` 只當標籤。無執行者拆成「未記錄執行者」（原因依該叢集實際回報的收集元件判斷）與「Rancher 未驗證請求」（`system:cattle:error`）。
+- 行為在寫入時切好（`behaviors`、`behavior_ops` 兩張表），規則重新判斷時與 stories、hourly 一起重建；升級後第一次啟動在背景建一次（lab 約 50 萬筆 1.5 秒），建好前 API 回 `meta.progress`。
+- 新設定 `server.behaviors.*`（`AL_BEHAVIOR_*`）：格寬、斷開門檻、失敗請求是否列入、分級對照（`docs/deploy.md` 9.2）。失敗的請求（回應碼 ≥ 400）預設不列為操作，計入 `hidden.failed`／`hidden.failedSystem`。
+
+### 不變
+- `/api/changemap`、`/api/changemap/detail`、`/api/stories`、`/api/hourly` 的內容：lab 10/17–10/31 的資料新舊版逐欄位比對相同。既有變更地圖仍然**不**過濾失敗的請求（要不要過濾由 Sam 決定）。
+- 實測報告：`docs/lab/report-task-1101-backend.md`。
+
 ## 0.6.0（預覽版）
 
 **預覽版**：修正 10/31 審查找到的問題，變更地圖、收集狀態與設定檢查顯示的內容更正確。介面另外在 [audit-loupe-ui](https://github.com/yansheng133/audit-loupe-ui) 發佈 0.6.0（明細跟著時間範圍、已移除的收集元件改成灰色）。升級注意事項見 `docs/deploy.md` 第 11 節「從 0.5.1 升級」。lab 兩座叢集已用測試映像檔實測，報告不在 repo 內。

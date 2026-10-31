@@ -64,6 +64,22 @@ server:
   #    class: component
   #    reason: 用憑證登入的 RKE2 元件，只能靠名稱認
   identities: []
+  # Change map v6 behaviors (docs/api/behaviors-v0.md): the operations of one identity on one
+  # cluster in one target namespace, cut where two are more than joinMinutes apart or a
+  # collection gap starts between them. cellMinutes (must divide 1440) is the width of the
+  # cells on the page, aligned in server.timezone. dropFailed: refused or failed requests
+  # (code >= 400) are counted in hidden.failed instead of listed. joinMinutes and dropFailed
+  # decide what is stored: changing them rebuilds the behavior table on the next start (in
+  # the background; about 1.5 s on the lab's 500,000 records). look, notable and tagOnly are
+  # applied when the page is read: severities that make a behavior "look" or "notable", and
+  # rules that are only shown as tags (bypassed_rancher, off_hours by default).
+  behaviors:
+    cellMinutes: 10
+    joinMinutes: 60
+    dropFailed: true
+    look: [high]
+    notable: [medium]
+    tagOnly: [bypassed_rancher, off_hours]
   # Before every install or upgrade, check the settings above with the new image (a Job
   # that reads them and stops). Wrong settings then fail the upgrade and the running server
   # stays up; without the check the server stops until the settings are fixed.

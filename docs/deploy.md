@@ -292,6 +292,24 @@ server:
 
 **從 0.3.x 升級時**：Rancher 叢集佈建用的帳號（例如 `u-xxxxx`，principal 為 `system://`）以前被當成人，現在歸「Rancher 內部」，「非上班時間」「繞過 Rancher」這類警示會變少。升級後到「規則」頁執行一次重新計算，舊紀錄才會照新的分類判斷。
 
+### 9.2 變更地圖 v6 的行為段落（`server.behaviors`，0.7.0 起）
+
+變更地圖 v6 把同一叢集、同一身分、同一目標 namespace 的操作切成「一段行為」（API：`docs/api/behaviors-v0.md`）。
+
+| 值 | 預設 | 說明 |
+|---|---|---|
+| `cellMinutes` | `10` | 畫面上一格幾分鐘（依 `server.timezone` 對齊），要能整除 1440 |
+| `joinMinutes` | `60` | 兩筆操作相隔超過這麼久，或中間有收集中斷開始，就斷成兩段 |
+| `dropFailed` | `true` | 失敗的請求（回應碼 ≥ 400）不算操作，只計入 `hidden.failed`／`hidden.failedSystem` |
+| `look` | `[high]` | 段內有這些嚴重度的警示 →「要看」 |
+| `notable` | `[medium]` | 段內有這些嚴重度的警示 →「值得知道」 |
+| `tagOnly` | `[bypassed_rancher, off_hours]` | 只當段落標籤、不影響分級的規則 |
+
+- `joinMinutes`、`dropFailed` 決定存下來的切法：改了之後下一次啟動會在背景重建行為表（lab 約 50 萬筆 1.5 秒），建好之前行為 API 回 `meta.progress`。其他三個在開頁時套用，不必重建。
+- 升級到 0.7.0 後第一次啟動也會建一次；之後同樣的設定不再重建。
+- 「規則」頁的重新計算會一起重建行為表。
+- 設定有誤（格寬不能整除一天、嚴重度不是 high／medium／low、規則名稱不存在）時，設定檢查失敗，升級停下來。
+
 ## 10. 移除
 
 ```bash
