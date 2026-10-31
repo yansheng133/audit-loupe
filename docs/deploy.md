@@ -243,7 +243,16 @@ server:
       enabled: false
 ```
 
-`helm upgrade` 之後 server 重新啟動才會套用。設定有誤時 server 不會啟動，原因寫在 log 第一行，例如 `AL_RULES: pod_exec.except[0]: reason is required`。
+`helm upgrade` 之後 server 重新啟動才會套用。
+
+**設定有誤時升級會失敗，原本的 server 照常運作。**每次安裝或升級前，chart 會先用新的映像檔跑一個 Job（`audit-loupe-config-check`）讀一次規則、白名單、時區與變更時段，讀不過就讓 `helm upgrade` 失敗，叢集上的東西都不會換。原因看這個 Job 的 log：
+
+```bash
+kubectl -n audit-loupe-system logs job/audit-loupe-config-check
+# Error: AL_RULES: pod_exec.except[0]: reason is required
+```
+
+改好 values 再升級一次即可（失敗的 Job 會在下次升級前自動刪掉）。這個檢查可以用 `server.configCheck.enabled: false` 關掉；關掉之後設定有誤時，server 會停在啟動失敗，直到改好為止（server 的 Deployment 是先停舊的再起新的）。
 
 套用之後：
 
@@ -299,4 +308,5 @@ PVC（`audit-loupe-data`）不會自動刪除，要保留稽核資料請先備�
 - **第一次啟動會從既有紀錄回填身分表**（每個名稱加 Rancher 使用者 ID 一筆），並依內建判斷分類。存下來的紀錄本身不改，雜湊鏈不受影響。
 - **介面要一起升級。**新介面接舊後端時，時間範圍只把範圍外的列調暗、件數不變，理由顯示後端原文；舊介面接新後端可以正常使用，只是看不到新欄位。
 - 設定白名單（`server.identities`）會改變設定代碼，「規則」頁會提示重新計算，見 9.1。
+- 升級前會先檢查設定（第 9 節），設定有誤時升級失敗、原本的 server 照常運作。
 - values 沒有必須改的項目。

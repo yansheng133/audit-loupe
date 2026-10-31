@@ -1,5 +1,10 @@
 # 變更紀錄
 
+## 未發佈
+
+### 修正
+- **規則或白名單寫錯時，升級失敗而不是 server 停擺**：每次安裝或升級前，chart 先用新映像檔跑 `check-config`（Job `audit-loupe-config-check`）。讀不過就讓 `helm upgrade` 失敗，原本的 server 照常運作；以前 server 會先停掉、新的起不來，直到改好設定（lab 實測約停 1 分鐘）。可用 `server.configCheck.enabled: false` 關掉。
+
 ## 0.4.0（預覽版）
 
 **預覽版**：v5 變更地圖與它的 API 第一次發佈。lab 的實際資料量下可以正常使用；「整頁 5 秒」的目標（每天約 72 萬筆）還沒有達到，見下方「已知限制」。介面另外在 [audit-loupe-ui](https://github.com/yansheng133/audit-loupe-ui) 發佈 0.4.0。

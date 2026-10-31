@@ -1,0 +1,42 @@
+{{- if and .Values.server.enabled .Values.server.configCheck.enabled }}
+# Before an install or upgrade, the new server image reads the new settings and stops.
+# Settings it would refuse fail the upgrade here, while the running server keeps serving;
+# without this the Recreate rollout removes the old pod first and the new one never starts.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: audit-loupe-config-check
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "al.labels" . | nindent 4 }}
+    app.kubernetes.io/component: config-check
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    # A failed check is kept so `kubectl logs job/audit-loupe-config-check` says what is wrong.
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ .Values.server.configCheck.timeoutSeconds }}
+  template:
+    metadata:
+      labels: {{- include "al.selector" . | nindent 8 }}
+        app.kubernetes.io/component: config-check
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: check
+          image: {{ include "al.serverImage" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [check-config]
+          env:
+            # Tokens live in a Secret this release may not have created yet; the check skips them.
+            - { name: AL_INGEST_TOKENS_FILE, value: /nonexistent }
+            {{- include "al.serverSettingsEnv" . | nindent 12 }}
+          securityContext: {{- include "al.securityContext" . | nindent 12 }}
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 64Mi }
+{{- end }}
