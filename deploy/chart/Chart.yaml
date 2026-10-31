@@ -2,6 +2,6 @@ apiVersion: v2
 name: audit-loupe
 description: Audit Loupe - who changed what across Rancher-managed clusters. One chart for every role; values decide what runs in this cluster (the server, and the collectors that push to it).
 type: application
-version: 0.4.0
-appVersion: "0.4.0"
+version: 0.5.0
+appVersion: "0.5.0"
 kubeVersion: ">= 1.30.0-0"

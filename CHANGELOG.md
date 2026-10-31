@@ -1,8 +1,20 @@
 # 變更紀錄
 
-## 未發佈
+## 0.5.0（預覽版）
+
+**預覽版**：第 1 層（變更地圖的資料底層）與身分表。CI 的效能閘門（每天約 72 萬筆）十個畫面 p95 都在 300 毫秒以內，單一物件細節 4 毫秒。介面另外在 [audit-loupe-ui](https://github.com/yansheng133/audit-loupe-ui) 發佈 0.5.0。升級注意事項見 `docs/deploy.md` 第 11 節「從 0.4.0 升級」。
+
+### 新增
+- **身分表與白名單**（#20）：每個身分（名稱加上 Rancher 使用者 ID）分類一次，分成人、叢集元件、ServiceAccount、Rancher 內部、未知；內建判斷認不出來的寫在 `server.identities`。規則只看「人」。新增 `GET /api/identities`。
+- **變更地圖的時間範圍**（#22）：`from`／`to` 只看一段時間；同時開同一個畫面的人共用一次計算。
+- **每個理由都有代碼**（#22）：介面依 Rancher 的語言顯示，不再只有中文原文。
+- **效能閘門**（#21）：CI 產生一天約 72 萬筆紀錄，量十種畫面的時間，結果寫在 job summary。
 
 ### 變更
+- **Rancher 叢集佈建帳號不再當成人**（#20）：principal 為 `system://` 的帳號（例如 `u-xxxxx`）歸「Rancher 內部」。lab 10/18–10/31 的資料重新判斷後，警示從 15,134 筆降到 3,089 筆，少掉的幾乎全是這個帳號與 `rke2-cloud-controller-manager` 的「非上班時間」；真人帳號的警示數不變。升級後要到「規則」頁執行一次重新計算，舊紀錄才會照新的分類判斷。
+- **開頁只讀可能列出的紀錄**（#22）：新增覆蓋式部分索引 `events_shown`。第一次啟動時建立，20 萬筆以上在背景建，期間畫面註明「索引建立中」。
+- **只計數、不列的請求**（#22）：Rancher 的取得目前使用者、搜尋、登出。刪除 namespace 後 controller 送的 `deletecollection` 併進那個 namespace 的列。
+- **收集元件回報的缺口和心跳中斷分開顯示**（#22）；「開始收集」的標記不再當成缺口。
 - **變更地圖預設列出 Rancher 內部帳號改到應用程式的物件**：Fleet 改應用程式的 Deployment、Service、Secret，Rancher cluster agent 在應用程式 namespace 建立或刪除 RoleBinding，這些是服務出問題時要先看的變更，以前和系統元件一起預設隱藏。現在只有改到 `kube-*`、`cattle-*`、`fleet-*`、`*-system` 這些 namespace 或叢集範圍物件的才隱藏。lab 10/20–10/30 的資料，每天多 0～4 列；叢集元件的寫入照舊隱藏。
 
 ### 修正
