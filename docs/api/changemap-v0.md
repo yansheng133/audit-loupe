@@ -138,3 +138,14 @@ v0 是原型：開頁時直接查現有資料表，**不做彙總表、不調效
 7. **缺口分兩種來源**（介面規格第 5 節）：缺口表裡沒有原因的是 server 沒收到心跳，有原因的是收集元件自己回報的；「開始收集」的標記不是缺口，不再算進來。
    - `timeline.gaps[]`：心跳中斷是 `kind: "heartbeat"`、`reasonCode: "collector-silent"`；收集元件回報的是 `kind: "reported"`、`reasonCode: "collector-reported"`，多一個 `cause`：`collector-restart`、`collector-state-lost`、`file-removed`、`file-replaced`。
    - 事件：心跳中斷照舊是 `collector-stopped`、`collector-resumed`，`source: "heartbeat"`；收集元件回報的是 `reported-gap-start`、`reported-gap-end`，`source: "reported"`，帶 `collector` 與 `cause`。
+
+## 0.6.0 補充（2026-10-31）
+
+原有的欄位與意義都不變，新增：
+
+1. **還沒結束的中斷**：`timeline.gaps[]` 的心跳中斷多一個 `open`。
+   - `open: true`：收集元件還沒回報，或已被當成換掉的節點（見下一點）；`toMs` 是現在或截斷的時間，事件分頁不會有 `collector-resumed`。
+   - `open: false`：已經結束（收集元件回報了，或 watch、rancher、neuvector 換了新 Pod）。
+   - 缺口表裡已經記下的缺口（收集元件回報後才寫）沒有這個欄位。
+2. **`GET /api/coverage`**：`collectors[]` 與心跳中斷的 `gaps[]` 多一個 `retired`。只有在一個收集元件超過一天沒有回報、而同一座叢集同一種收集元件還有別的執行個體在回報時才是 `true`（實際上就是換掉的節點）；這時變更地圖只標中斷開始後的一天。那座叢集這種收集元件一個都沒在回報時永遠是 `false`。
+3. **watch 收集元件的回報內容**：`collectors[].details` 裡每個資源類型的值，除了 `watching`、`not served`，多了 `forbidden`（被拒，通常是 ClusterRole 沒涵蓋）與 `failing`（其他錯誤），恢復後改回 `watching`。
