@@ -1596,16 +1596,19 @@ impl Store {
             // An object with finalizers goes in two steps: the delete request sets the deletion
             // timestamp ("deleting", linked to that request), and the object is gone once the
             // finalizers are done ("deleted"). Both come from the same request, so the second
-            // takes the first one's event instead of looking for another delete.
+            // takes the first one's event instead of looking for another delete. A controller
+            // usually removes the last finalizer in between (a "modified" version), so this looks
+            // back for the same object (same uid), not only at the version just before.
             if change == "deleted" {
-                let prev: Option<(String, Option<i64>)> = c
+                let started: Option<Option<i64>> = c
                     .query_row(
-                        "SELECT change, event_id FROM versions WHERE cluster=?1 AND api_group=?2 AND resource=?3 AND namespace=?4 AND name=?5 AND id < ?6 ORDER BY id DESC LIMIT 1",
+                        "SELECT event_id FROM versions WHERE cluster=?1 AND api_group=?2 AND resource=?3 AND namespace=?4 AND name=?5 AND id < ?6
+                         AND change='deleting' AND uid=(SELECT uid FROM versions WHERE id=?6) ORDER BY id DESC LIMIT 1",
                         params![cluster, group, resource, ns, name, vid],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
+                        |r| r.get(0),
                     )
                     .optional()?;
-                if let Some(("deleting", Some(eid))) = prev.as_ref().map(|(ch, e)| (ch.as_str(), *e)) {
+                if let Some(Some(eid)) = started {
                     c.execute("UPDATE versions SET event_id=?1 WHERE id=?2", params![eid, vid])?;
                     linked += 1;
                     continue;
@@ -2862,12 +2865,14 @@ mod tests {
         let h = s.history(&ns).unwrap();
         assert_eq!((h[0].change.as_str(), h[0].actor.as_deref()), ("deleting", Some("system:admin")));
         // The finalizers finish later and the object goes: same request, same person. Left
-        // unlinked it showed on the change map as a change nobody made ("unclear").
+        // unlinked it showed on the change map as a change nobody made ("unclear"). The
+        // controller removes the last finalizer first (its own change), then the object goes.
+        s.insert_version(&ns, "Namespace", "n1", &json!({"metadata":{"name":"old","deletionTimestamp":"2026-10-14T02:00:01Z","finalizers":[]}}), "modified", t + chrono::Duration::seconds(39)).unwrap();
         s.insert_version(&ns, "Namespace", "n1", &json!({"metadata":{"name":"old"}}), "deleted", t + chrono::Duration::seconds(40)).unwrap();
         assert_eq!(s.link_since(0).unwrap(), 1);
         let h = s.history(&ns).unwrap();
         assert_eq!((h[0].change.as_str(), h[0].actor.as_deref()), ("deleted", Some("system:admin")));
-        let unlinked: i64 = s.conn.lock().unwrap().query_row("SELECT count(*) FROM versions WHERE event_id IS NULL AND change <> 'baseline'", [], |r| r.get(0)).unwrap();
+        let unlinked: i64 = s.conn.lock().unwrap().query_row("SELECT count(*) FROM versions WHERE event_id IS NULL AND change IN ('deleting','deleted')", [], |r| r.get(0)).unwrap();
         assert_eq!(unlinked, 0);
     }
 
