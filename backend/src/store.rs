@@ -686,6 +686,17 @@ impl Store {
         )?;
         crate::rulestate::prepare(&conn)?;
         prepare_stats(&conn)?;
+        // The final delete of an object with finalizers takes the event of its "deleting"
+        // version (link_since). Live linking only looks back 45 minutes, so versions stored
+        // before that rule get it here; once linked they no longer match, so this is cheap.
+        conn.execute(
+            "UPDATE versions SET event_id = (
+               SELECT g.event_id FROM versions g WHERE g.cluster=versions.cluster AND g.api_group=versions.api_group AND g.resource=versions.resource
+                 AND g.namespace=versions.namespace AND g.name=versions.name AND g.uid=versions.uid AND g.change='deleting' AND g.id < versions.id
+               ORDER BY g.id DESC LIMIT 1)
+             WHERE change='deleted' AND event_id IS NULL",
+            [],
+        )?;
         crate::identity::prepare(&conn, &cfg.identities)?;
         // Ingest waits briefly instead of failing while a background build holds the write lock.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -1789,12 +1800,18 @@ impl Store {
                 .prepare("SELECT instance, last_ms FROM heartbeats WHERE cluster=?1 AND collector=?2 AND instance<>?3 AND ?4 - last_ms > ?5")?
                 .query_map(params![cluster, collector, instance, now_ms, GAP_MS], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<Result<_, _>>()?;
-            for (old, last) in stale {
+            // Every gap is worked out before any row goes, so with several stale pods each one's
+            // silence ends where the next one started, whatever order their names sort in.
+            let mut ends = Vec::new();
+            for (old, last) in &stale {
                 let next: i64 = c.query_row(
                     "SELECT MIN(COALESCE(first_ms, ?4)) FROM heartbeats WHERE cluster=?1 AND collector=?2 AND instance<>?3 AND last_ms > ?5",
                     params![cluster, collector, old, now_ms, last],
                     |r| r.get(0),
                 )?;
+                ends.push(next);
+            }
+            for ((old, last), next) in stale.iter().zip(ends) {
                 if next - last > GAP_MS {
                     c.execute("INSERT INTO gaps (cluster, collector, instance, from_ms, to_ms) VALUES (?1,?2,?3,?4,?5)", params![cluster, collector, old, last, next])?;
                 }
@@ -2880,6 +2897,24 @@ mod tests {
         assert_eq!(del.change.as_deref(), Some("deleting"));
     }
 
+    /// Two watch pods stale at once (the second took over within GAP_MS, then stopped too):
+    /// the first had no gap, the second's runs to the third pod, whichever way names sort.
+    #[test]
+    fn several_replaced_pods_each_get_their_own_gap() {
+        let m = 60_000;
+        for (first, second) in [("w-b", "w-a"), ("w-a", "w-b")] {
+            let s = Store::open(":memory:").unwrap();
+            s.heartbeat("c1", "watch", first, &json!({}), 0).unwrap();
+            s.heartbeat("c1", "watch", second, &json!({}), 2 * m).unwrap();
+            s.heartbeat("c1", "watch", second, &json!({}), 3 * m).unwrap();
+            s.heartbeat("c1", "watch", "w-c", &json!({}), 180 * m).unwrap();
+            let gaps: Vec<(String, i64, i64)> = s.conn.lock().unwrap()
+                .prepare("SELECT instance, from_ms, to_ms FROM gaps ORDER BY from_ms").unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(Result::unwrap).collect();
+            assert_eq!(gaps, [(second.to_string(), 3 * m, 180 * m)], "{first} then {second}");
+        }
+    }
+
     #[test]
     fn a_resent_gap_report_is_kept_once_and_both_kinds_are_returned() {
         let s = Store::open(":memory:").unwrap();
@@ -2916,6 +2951,38 @@ mod tests {
         assert!(!serde_json::to_string(&rows).unwrap().contains("secret"), "no line text");
         let cov = s.coverage(0, 10, 10).unwrap();
         assert_eq!(cov[0].rejected_counts[0]["count"], 1);
+    }
+
+    /// A database from before the finalizer rule: the final delete is linked when it is opened.
+    #[test]
+    fn an_older_finalizer_delete_is_linked_on_open() {
+        let dir = std::env::temp_dir().join(format!("al-fin-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        let path = dir.to_str().unwrap().to_string();
+        {
+            let s = Store::open(&path).unwrap();
+            let ev = r#"{"auditID":"d","stage":"ResponseComplete","verb":"delete","user":{"username":"system:admin"},
+              "objectRef":{"resource":"namespaces","namespace":"old","name":"old","apiVersion":"v1"},
+              "responseStatus":{"code":200},"stageTimestamp":"2026-10-14T02:00:00.500Z"}"#;
+            s.insert_event("c1", &to_record(&parse_body(ev.as_bytes()).unwrap()[0]).unwrap()).unwrap();
+            let c = s.conn.lock().unwrap();
+            let e: i64 = c.query_row("SELECT id FROM events", [], |r| r.get(0)).unwrap();
+            for (id, change, eid) in [(1, "deleting", Some(e)), (2, "modified", None), (3, "deleted", None)] {
+                c.execute(
+                    "INSERT INTO versions (id, cluster, api_group, resource, kind, namespace, name, uid, observed_ms, observed, change, body, event_id)
+                     VALUES (?1, 'c1', '', 'namespaces', 'Namespace', '', 'old', 'n1', ?1, '', ?2, '{}', ?3)",
+                    params![id, change, eid],
+                )
+                .unwrap();
+            }
+        }
+        let s = Store::open(&path).unwrap();
+        let (linked, e): (Option<i64>, i64) = s.conn.lock().unwrap().query_row("SELECT event_id, (SELECT id FROM events) FROM versions WHERE id=3", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(linked, Some(e));
+        drop(s);
+        for ext in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path}{ext}"));
+        }
     }
 
     /// Upgrade a copy of a real database (never the original): AL_TEST_DB=<copy> cargo test -- --ignored migrates

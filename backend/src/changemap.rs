@@ -632,12 +632,13 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     // A silence ends a day after it began (RETIRED_MS: taken as removed), or now. watch, rancher
     // and neuvector run one pod per cluster, so for them another instance reporting after it
     // ends it where that instance started, by the same rule as heartbeat() (an overlap or a
-    // handover within GAP_MS is no gap). collect-file runs one per node: another node
+    // handover within GAP_MS is no gap; a row from before 0.2.1 has no start time and is not
+    // taken as a takeover, where heartbeat() can use the time it reports). collect-file runs one per node: another node
     // reporting proves nothing, so its silence is not ended that way.
     let mut st = c.prepare(
         "SELECT h.cluster, h.last_ms, h.collector,
                 CASE WHEN h.collector <> 'file' THEN
-                  (SELECT min(coalesce(n.first_ms, ?1)) FROM heartbeats n WHERE n.cluster=h.cluster AND n.collector=h.collector AND n.instance<>h.instance AND n.last_ms > h.last_ms)
+                  (SELECT min(n.first_ms) FROM heartbeats n WHERE n.cluster=h.cluster AND n.collector=h.collector AND n.instance<>h.instance AND n.last_ms > h.last_ms)
                 END
          FROM heartbeats h WHERE ?1 - h.last_ms > ?2 AND h.last_ms < ?3 AND h.last_ms + ?4 >= ?5",
     )?;
@@ -1071,6 +1072,13 @@ mod tests {
         assert_eq!(v["timeline"]["gaps"].as_array().unwrap().len(), 1, "{v}");
         assert_eq!(gap(&v, 0), (Some(T), Some(T + 20 * 60_000), Some(false)));
         assert_eq!(v["rows"][0]["state"], "clear", "changed long after the new pod took over");
+
+        // Another pod with no start time (a row from before 0.2.1), itself silent now, did not
+        // take over: still open, no "resumed" at now.
+        let s = store();
+        beats(&s, &[("watch", "w-x", T, Some(0)), ("watch", "w-y", T + 120_000, None)]);
+        let v = changemap(&s, tz, &day, now).unwrap();
+        assert_eq!(gap(&v, 0), (Some(T), Some(now), Some(true)), "{v}");
 
         // A silence that ended before the day is not on it.
         let s = store();
