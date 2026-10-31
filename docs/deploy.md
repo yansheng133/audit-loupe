@@ -193,6 +193,7 @@ UI extension 的原始碼在 [yansheng133/audit-loupe-ui](https://github.com/yan
 
 1. 在 Rancher 的 `Apps` → `Repositories` 加入 `https://yansheng133.github.io/audit-loupe-ui`。
 2. 到 Extensions 頁面安裝 Audit Loupe。
+3. 升級：到 Extensions 頁面選新版本。用 helm 指令升級時要加 `--reset-values`（或明確指定版本對應的值），**不要用 `--reuse-values`**：這個 chart 沒有使用者自訂的 values 時，`--reuse-values` 會沿用舊版 chart 的預設值，其中下載位址指向舊版目錄；Rancher 會顯示新版本號，卻找不到檔案（404），擴充功能整個載不起來、左上選單看不到 Audit Loupe（lab 0.6.0 → 0.7.0 實際遇到）。
 
 安裝後：
 

@@ -188,3 +188,11 @@ lab 的叢集：
 6. **本任務書哪裡害你走冤枉路。**
 
 報告裡不准出現密碼或 token。完成後各自開 PR，PR 說明附上報告。
+
+## 結果（2026-11-01 補記）
+
+- 軌 0：`system:cattle:error` 10/30 共 272 筆，271 筆 HTTP 200、1 筆 500，沒有 4xx；照常列為「Rancher 未驗證請求」。
+- 軌 1：後端 PR #31，報告 `docs/lab/report-task-1101-backend.md`，API 約定 `docs/api/behaviors-v0.md`。
+- 軌 2：介面 audit-loupe-ui PR #14，報告在該 repo 的 `docs/lab/report-task-1101-ui.md`。
+- 兩邊於 11-01 合併，發佈為 0.7.0（後端 tag `v0.7.0`、介面 release `audit-loupe-0.7.0`），lab 兩座叢集與 Rancher 擴充功能已升級。
+- 待 Sam 決定：既有 `/api/changemap` 要不要也不列失敗請求；設計模型 `audit-loupe-views.html`（內嵌 lab 資料）要不要進 repo；cattle 建立 Namespace `local` 回 409 的 8 筆要算系統元件還是例行。
