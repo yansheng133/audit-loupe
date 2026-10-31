@@ -1936,8 +1936,10 @@ impl Store {
             let retired = now_ms - last > RETIRED_MS && others;
             out[i].collectors.push(json!({"collector": col, "instance": inst, "lastMs": last, "stale": stale, "retired": retired,
                                           "details": serde_json::from_str::<Value>(&details).unwrap_or(Value::Null)}));
-            if stale && last <= to_ms {
-                out[i].gaps.push(json!({"kind": "heartbeat", "collector": col, "instance": inst, "fromMs": last, "toMs": if retired { Some(retired_end.min(now_ms)) } else { None }, "reason": SILENT, "detail": "", "retired": retired}));
+            // A retired silence ends (RETIRED_END); one that ended before the range is not listed.
+            let end = retired.then(|| retired_end.min(now_ms));
+            if stale && last <= to_ms && end.is_none_or(|e| e >= from_ms) {
+                out[i].gaps.push(json!({"kind": "heartbeat", "collector": col, "instance": inst, "fromMs": last, "toMs": end, "reason": SILENT, "detail": "", "retired": retired}));
             }
         }
         for (cl, col, inst, f, t, reason, detail) in gaps {
@@ -2236,15 +2238,18 @@ impl Store {
         // no other instance reporting stays: dropping it would hide that nothing is collected.
         // Its silence is kept as a gap first, so the outage is still on record until the gap
         // itself ages out.
+        // In one transaction, so a crash in between cannot leave the gap written twice.
         let retired = format!("FROM heartbeats h WHERE h.last_ms < ?1 AND {}", others_reporting("?2"));
-        c.execute(
+        let tx = c.unchecked_transaction()?;
+        tx.execute(
             &format!("INSERT INTO gaps (cluster, collector, instance, from_ms, to_ms) SELECT h.cluster, h.collector, h.instance, h.last_ms, min({RETIRED_END}, ?2) {retired}"),
             params![cutoff, ms(&now)],
         )?;
-        c.execute(
+        tx.execute(
             &format!("DELETE FROM heartbeats WHERE (cluster, collector, instance) IN (SELECT h.cluster, h.collector, h.instance {retired})"),
             params![cutoff, ms(&now)],
         )?;
+        tx.commit()?;
         Ok(n + m)
     }
 }
@@ -2969,6 +2974,8 @@ mod tests {
         let cov = s.coverage(0, now, now).unwrap();
         let g = cov[0].gaps.iter().find(|g| g["instance"] == "old").unwrap();
         assert_eq!((g["fromMs"].as_i64(), g["toMs"].as_i64(), g["retired"].as_bool()), (Some(stop), Some(start), Some(true)));
+        let recent = s.coverage(start + 600_000, now, now).unwrap();
+        assert!(recent[0].gaps.iter().all(|g| g["instance"] != "old"), "ended before the range: not listed");
         // Retention passes the old row: it goes, its silence stays as a gap.
         let later = chrono::DateTime::from_timestamp_millis(stop + 31 * d).unwrap();
         s.heartbeat("c1", "file", "new", &json!({}), stop + 31 * d - 30_000).unwrap();
