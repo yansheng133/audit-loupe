@@ -844,7 +844,7 @@ fn behavior_json(ctx: &Ctx, b: &Beh) -> (Value, &'static str) {
             .cloned()
             .unwrap_or_default();
         json!({"verb": op.verb, "kind": ctx.kind(&b.cluster, &op.api_group, &op.resource), "apiGroup": op.api_group, "resource": op.resource,
-               "namespace": op.namespace, "name": op.name, "t": op.t, "rule": rule, "severity": sev})
+               "namespace": op.namespace, "name": op.name, "t": op.t, "code": op.code, "rule": rule, "severity": sev})
     });
     let v = json!({
         "id": b.id, "cluster": b.cluster, "actor": b.actor, "scope": b.scope, "tier": tier, "title": title,

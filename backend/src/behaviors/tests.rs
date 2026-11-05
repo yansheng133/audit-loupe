@@ -181,6 +181,7 @@ fn a_namespace_counts_as_its_own_and_cluster_scoped_objects_as_none() {
     // The namespace deletion is the title, and the behavior is "look".
     assert_eq!(b[0]["tier"], "look");
     assert_eq!((b[0]["title"]["verb"].as_str(), b[0]["title"]["kind"].as_str(), b[0]["title"]["name"].as_str()), (Some("delete"), Some("Namespace"), Some("shop")));
+    assert_eq!(b[0]["title"]["code"], 200);
     assert_eq!(v["hidden"]["system"], 1);
     let sys = page(&s, TZ, &Params { day: Some("2026-10-20".into()), system: Some("1".into()), ..Default::default() }, at(23, 0)).unwrap();
     let ctl = of_actor(&sys, NAMESPACE_CONTROLLER);

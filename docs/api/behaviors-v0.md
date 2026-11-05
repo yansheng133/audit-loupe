@@ -46,7 +46,7 @@ v6 的四個分頁（活動總覽、稽核發現、依身分、依資源範圍�
     "scope": "nv-demo-scope-check",
     "tier": "look",
     "title": {"verb": "delete", "kind": "Namespace", "apiGroup": "", "resource": "namespaces",
-              "namespace": "", "name": "nv-demo-scope-check", "t": 0, "rule": "namespace_deleted", "severity": "high"},
+              "namespace": "", "name": "nv-demo-scope-check", "t": 0, "code": 200, "rule": "namespace_deleted", "severity": "high"},
     "what": [{"verb": "delete", "kind": "Pod", "count": 3}],
     "fromMs": 0, "toMs": 0,
     "startedBefore": false, "continuesAfter": false,
@@ -136,6 +136,7 @@ v6 的四個分頁（活動總覽、稽核發現、依身分、依資源範圍�
 - **`title`**：段內**最嚴重的那一筆**：警示的規則不在 `tagOnly`、嚴重度在 `settings.look` 或 `settings.notable`，先比嚴重度（look 先），同級取最早的一筆。只有低風險或只有 `tagOnly` 的警示時是 `null`，介面改用 `scope`＋`what` 當標題（例如「nv-demo：修改 Deployment ×12」）。
   - `verb` 是**實際的動作**：進入容器時是子資源名稱（`exec`、`attach`、`portforward`），不是規則名稱；其他子資源只有 `create` 才用子資源名稱（與 changemap 的 `detail.ops[].verb` 相同）。沒有執行者的變化是 `added`、`modified`、`deleting`、`deleted`、`added_unseen`、`modified_unseen`。
   - `kind` 依資源種類（`resource_kinds` 表，沒有就用內建對照，再沒有就是資源名稱）。
+  - `code`：那一筆的回應碼（未記錄執行者的變化是 null）。0.7.1 新增：失敗請求預設不算操作，但有中、高風險警示的會留下（例如登入失敗），標題要看得出它失敗了。
 - **`what`**：「動作 種類 ×次數」，依次數多到少、全部列出；`verb` 規則同 `title`。介面自己決定顯示前幾項。
 - **`ops`**：這天的操作筆數（全量，不截斷）。**`objects`**：動到的物件數。**`objectsTop`**：依筆數多到少的前 20 個；`objects` > 20 時 `truncated` 為 true 的意思**不是**這個（見下）。
 - **`via`**：段內出現過的管道（`direct`、`rancher`、`impersonation`、`ace`、`unknown`），依名稱排序。
