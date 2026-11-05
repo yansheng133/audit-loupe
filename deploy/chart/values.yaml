@@ -68,7 +68,8 @@ server:
   # cluster in one target namespace, cut where two are more than joinMinutes apart or a
   # collection gap starts between them. cellMinutes (must divide 1440) is the width of the
   # cells on the page, aligned in server.timezone. dropFailed: refused or failed requests
-  # (code >= 400) are counted in hidden.failed instead of listed. joinMinutes and dropFailed
+  # (code >= 400) are counted in hidden.failed instead of listed, on the behaviors page and
+  # the change map alike (one with a medium or high alert stays). joinMinutes and dropFailed
   # decide what is stored: changing them rebuilds the behavior table on the next start (in
   # the background; about 1.5 s on the lab's 500,000 records). look, notable and tagOnly are
   # applied when the page is read: severities that make a behavior "look" or "notable", and

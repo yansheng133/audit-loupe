@@ -220,7 +220,8 @@ impl<'a> OpIn<'a> {
 
 /// What a record is to the behaviors: an operation ("op"), only counted ("request", "ui",
 /// "failed"), or nothing (a read without a medium or high alert). The same records the change
-/// map lists, in the same order of checks.
+/// map lists by default, in the same order of checks (with `system=1` the change map also lists
+/// Rancher UI maintenance; a failed one is still only counted).
 fn kind_of(o: &OpIn, flagged: bool, s: &Settings) -> Option<&'static str> {
     if !is_write(o.source, o.verb, o.sub) && !flagged {
         return None;
@@ -844,7 +845,7 @@ fn behavior_json(ctx: &Ctx, b: &Beh) -> (Value, &'static str) {
             .cloned()
             .unwrap_or_default();
         json!({"verb": op.verb, "kind": ctx.kind(&b.cluster, &op.api_group, &op.resource), "apiGroup": op.api_group, "resource": op.resource,
-               "namespace": op.namespace, "name": op.name, "t": op.t, "rule": rule, "severity": sev})
+               "namespace": op.namespace, "name": op.name, "t": op.t, "code": op.code, "rule": rule, "severity": sev})
     });
     let v = json!({
         "id": b.id, "cluster": b.cluster, "actor": b.actor, "scope": b.scope, "tier": tier, "title": title,
