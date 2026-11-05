@@ -17,7 +17,7 @@ v0 是原型：開頁時直接查現有資料表，**不做彙總表、不調效
 | `tab` | `overview`（預設）／`relations`／`events`。只回傳該分頁需要的區塊 |
 | `cursor` | 翻頁；每頁 100 列 |
 | `select` | 物件鍵（見下）；不帶就選排序第一的物件 |
-| `system` | `1` 時包含系統元件與 Rancher 介面維護動作；預設不含。Rancher 內部的帳號（Fleet、NeuVector、cluster agent）改到應用程式 namespace 的物件，預設就列出；改到它們自己的 namespace（`kube-*`、`cattle-*`、`fleet-*`、`*-system`）或叢集範圍物件的才隱藏 |
+| `system` | `1` 時包含系統元件與 Rancher 介面維護動作；預設不含。Rancher 內部的帳號（Fleet、NeuVector、cluster agent）改到應用程式 namespace 的物件，預設就列出；改到它們自己的 namespace（`kube-*`、`cattle-*`、`fleet-*`、`*-system`）或叢集範圍物件的才隱藏。namespace 指目標 namespace：Namespace 物件算它自己的名稱（0.7.1 起） |
 
 物件鍵：`cluster/apiGroup/resource/namespace/name`。core group 的 `apiGroup` 是空字串；叢集範圍的物件 `namespace` 是空字串。要分得出 Kubernetes 的 Node 與 Longhorn 的 `nodes.longhorn.io`。
 
@@ -154,7 +154,7 @@ v0 是原型：開頁時直接查現有資料表，**不做彙總表、不調效
 
 ## 0.7.1 補充（尚未發版）
 
-1. **失敗的請求預設不列**（Sam 11/06 決定，與行為頁面一致）：回應碼 ≥ 400 的寫入不算物件變更，不列；計入 `hidden.failed`（會列出來的身分）或 `hidden.failedSystem`（系統元件、在 Rancher 自己 namespace 的 Rancher 帳號）。
+1. **失敗的請求預設不列**（Sam 11/06 決定，與行為頁面一致）：回應碼 ≥ 400 的寫入不算物件變更，不列；計入 `hidden.failed`（會列出來的身分）或 `hidden.failedSystem`（系統元件，以及改到 Rancher 自己 namespace 或叢集範圍物件的 Rancher 帳號）。Rancher 介面的維護動作失敗時照舊計入 `hidden.uiMaintenance`（與行為頁面相同）。
    - 有中、高風險警示的失敗請求照樣列出（警示講的就是被拒這件事）。
    - 帶 `system=1` 也不會列出失敗的請求；要列出來，把 `server.behaviors.dropFailed` 設成 `false`（變更地圖與行為頁面共用這個設定）。
    - `hidden` 一律有 `failed`、`failedSystem` 兩個欄位（設定關掉時是 0）。

@@ -220,7 +220,8 @@ impl<'a> OpIn<'a> {
 
 /// What a record is to the behaviors: an operation ("op"), only counted ("request", "ui",
 /// "failed"), or nothing (a read without a medium or high alert). The same records the change
-/// map lists, in the same order of checks.
+/// map lists by default, in the same order of checks (with `system=1` the change map also lists
+/// Rancher UI maintenance; a failed one is still only counted).
 fn kind_of(o: &OpIn, flagged: bool, s: &Settings) -> Option<&'static str> {
     if !is_write(o.source, o.verb, o.sub) && !flagged {
         return None;

@@ -630,7 +630,8 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         // namespace with something on the page, whichever are picked, so picking one does not
         // take the others away.
         let picked = !ns_out(s(9)?);
-        if !with_system && ui_maintenance(s(7)?, name_ref) {
+        let ui = ui_maintenance(s(7)?, name_ref);
+        if !with_system && ui {
             hidden_ui += picked as i64;
             continue;
         }
@@ -644,7 +645,10 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         // A refused request changed nothing; it is counted, not listed, as on the behaviors page
         // (the same setting). One with a medium or high alert stays: the alert is about the refusal.
         if drop_failed && r.get::<_, i64>(16)? >= 400 && severity.is_none() {
-            if system {
+            // Rancher UI maintenance stays counted as such, as on the behaviors page.
+            if ui {
+                hidden_ui += picked as i64;
+            } else if system {
                 hidden_failed_system += picked as i64;
             } else {
                 hidden_failed += picked as i64;
@@ -1243,6 +1247,9 @@ mod tests {
         assert_eq!(v["hidden"]["failed"], 2, "alice's refused patch and cattle's 409 on Namespace local");
         assert_eq!(v["hidden"]["failedSystem"], 1, "the 409 in cattle-system");
         assert_eq!(v["hidden"]["system"], 1, "Namespace kube-public");
+        // Both ways of reading the day agree.
+        let scan = changemap_by_scan(&s, chrono_tz::Asia::Taipei, &p, T + 7000).unwrap();
+        assert_eq!((keys(&scan), &scan["hidden"]), (keys(&v), &v["hidden"]));
         // Showing system accounts does not bring refused requests back.
         let v = changemap(&s, chrono_tz::Asia::Taipei, &Params { system: Some("1".into()), ..p.clone() }, T + 7000).unwrap();
         assert_eq!(v["rows"].as_array().unwrap().len(), 4, "{v}");
