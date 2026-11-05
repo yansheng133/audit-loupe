@@ -322,7 +322,8 @@ pub fn shown_query() -> String {
     format!(
         "SELECT e.cluster, e.ts_ms, e.actor, e.human, e.via, e.verb, e.api_group, e.resource, e.subresource, e.namespace, e.name,
                 '', e.user_id, e.source, 0,
-                (SELECT CASE WHEN max(a.severity='high') THEN 'high' WHEN max(a.severity='medium') THEN 'medium' END FROM alerts a WHERE a.event_id=e.id)
+                (SELECT CASE WHEN max(a.severity='high') THEN 'high' WHEN max(a.severity='medium') THEN 'medium' END FROM alerts a WHERE a.event_id=e.id),
+                e.code
          FROM events e INDEXED BY {} WHERE e.ts_ms >= ?1 AND e.ts_ms < ?2 AND e.id <= ?3 AND {} AND {}",
         crate::shown::NAME,
         crate::store::SHOWN_PUB,
@@ -535,6 +536,8 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     let mut ns_seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut hidden_ui = 0i64;
     let mut hidden_request = 0i64;
+    let (mut hidden_failed, mut hidden_failed_system) = (0i64, 0i64);
+    let drop_failed = store.cfg.behaviors.drop_failed;
     let mut objs: HashMap<String, Obj> = HashMap::new();
     // Every record of the day goes to the timeline; only those in the picked range make objects.
     let (range_from, range_to) = (p.from.unwrap_or(i64::MIN), p.to.unwrap_or(i64::MAX));
@@ -563,7 +566,8 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
     let scan_sql = format!(
         "SELECT e.cluster, e.ts_ms, e.actor, e.human, e.via, e.verb, e.api_group, e.resource, e.subresource, e.namespace, e.name,
                 e.user_agent, e.user_id, e.source, e.hash IS NOT NULL,
-                (SELECT CASE WHEN max(a.severity='high') THEN 'high' WHEN max(a.severity='medium') THEN 'medium' END FROM alerts a WHERE a.event_id=e.id)
+                (SELECT CASE WHEN max(a.severity='high') THEN 'high' WHEN max(a.severity='medium') THEN 'medium' END FROM alerts a WHERE a.event_id=e.id),
+                e.code
          FROM events e WHERE e.ts_ms >= ?1 AND e.ts_ms < ?2 AND e.id <= ?3 AND {} {}",
         crate::store::SHOWN_PUB,
         // A namespace's own detail also reads the records that emptied it.
@@ -626,19 +630,30 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         // namespace with something on the page, whichever are picked, so picking one does not
         // take the others away.
         let picked = !ns_out(s(9)?);
-        if !with_system {
-            if ui_maintenance(s(7)?, name_ref) {
-                hidden_ui += picked as i64;
-                continue;
+        if !with_system && ui_maintenance(s(7)?, name_ref) {
+            hidden_ui += picked as i64;
+            continue;
+        }
+        // Rancher's own accounts (Fleet, NeuVector, the cluster agent) are hidden only where
+        // they keep themselves running. In an application's namespace they deploy and grant:
+        // Fleet patches its Deployments, the agent writes its RoleBindings. Those are changes
+        // to look at when the service misbehaves, so they stay on the page. The namespace is the
+        // target one, as on the behaviors page: a Namespace object counts as its own.
+        let scope = crate::behaviors::scope_of(s(5)?, actor_ref, s(6)?, s(7)?, s(9)?, raw_name);
+        let system = category == "component" || (category == "rancher" && !application_namespace(scope));
+        // A refused request changed nothing; it is counted, not listed, as on the behaviors page
+        // (the same setting). One with a medium or high alert stays: the alert is about the refusal.
+        if drop_failed && r.get::<_, i64>(16)? >= 400 && severity.is_none() {
+            if system {
+                hidden_failed_system += picked as i64;
+            } else {
+                hidden_failed += picked as i64;
             }
-            // Rancher's own accounts (Fleet, NeuVector, the cluster agent) are hidden only where
-            // they keep themselves running. In an application's namespace they deploy and grant:
-            // Fleet patches its Deployments, the agent writes its RoleBindings. Those are changes
-            // to look at when the service misbehaves, so they stay on the page.
-            if category == "component" || (category == "rancher" && !application_namespace(s(9)?)) {
-                hidden_system += picked as i64;
-                continue;
-            }
+            continue;
+        }
+        if !with_system && system {
+            hidden_system += picked as i64;
+            continue;
         }
         if !s(9)?.is_empty() {
             ns_seen.insert(s(9)?.to_string());
@@ -873,7 +888,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
             .map(|(c, t)| (c.clone(), json!(Utc.timestamp_millis_opt(*t).unwrap().to_rfc3339_opts(chrono::SecondsFormat::Millis, true))))
             .collect::<serde_json::Map<_, _>>(),
         "counts": counts,
-        "hidden": {"system": hidden_system, "uiMaintenance": hidden_ui, "requestOnly": hidden_request},
+        "hidden": {"system": hidden_system, "uiMaintenance": hidden_ui, "requestOnly": hidden_request, "failed": hidden_failed, "failedSystem": hidden_failed_system},
         "namespaces": ns_seen,
         "timeline": {"slotMinutes": slot_min, "lines": lines, "gaps": gaps_json},
     });
@@ -1193,6 +1208,58 @@ mod tests {
         assert!(v["rows"].as_array().unwrap().iter().all(|r| r["who"]["category"] == "rancher"));
         // Their own namespaces, cluster-scoped objects, add-on namespaces and components stay hidden.
         assert_eq!(v["hidden"]["system"], 4);
+    }
+
+    /// Refused requests are counted, not listed, by default (the behaviors setting), split by
+    /// whether the account would be a system one; one with a medium or high alert stays. The
+    /// namespace that decides is the target one: a Namespace object counts as its own.
+    #[test]
+    fn failed_requests_are_counted_and_namespaces_count_as_their_own() {
+        let cattle = "system:serviceaccount:cattle-system:cattle";
+        let load = |s: &Store| {
+            let c = s.conn.lock().unwrap();
+            ev(&c, 1, "c1", T, "alice", 1, "direct", "patch", "deployments", "shop", "web");
+            ev(&c, 2, "c1", T + 1000, "alice", 1, "direct", "patch", "deployments", "shop", "api");
+            ev(&c, 3, "c1", T + 2000, cattle, 0, "direct", "create", "namespaces", "", "local");
+            ev(&c, 4, "c1", T + 3000, cattle, 0, "direct", "patch", "namespaces", "", "shop");
+            ev(&c, 5, "c1", T + 4000, cattle, 0, "direct", "patch", "namespaces", "", "kube-public");
+            ev(&c, 6, "c1", T + 5000, cattle, 0, "direct", "update", "configmaps", "cattle-system", "x");
+            ev(&c, 7, "c1", T + 6000, "bob", 1, "direct", "delete", "secrets", "shop", "db");
+            c.execute("UPDATE events SET code = 409 WHERE id IN (2, 3, 6)", []).unwrap();
+            c.execute("UPDATE events SET code = 403 WHERE id = 7", []).unwrap();
+            c.execute("INSERT INTO alerts (event_id, rule, severity) VALUES (7, 'secret_access', 'medium')", []).unwrap();
+        };
+        let keys = |v: &Value| {
+            let mut k: Vec<String> = v["rows"].as_array().unwrap().iter().map(|r| r["key"].as_str().unwrap().to_string()).collect();
+            k.sort();
+            k
+        };
+        let p = Params { day: Some("2026-10-20".into()), ..Default::default() };
+        let s = store();
+        load(&s);
+        let v = changemap(&s, chrono_tz::Asia::Taipei, &p, T + 7000).unwrap();
+        // The cattle patch of Namespace shop is in an application's namespace, so it is shown.
+        assert_eq!(keys(&v), ["c1//deployments/shop/web", "c1//namespaces//shop", "c1//secrets/shop/db"], "{v}");
+        assert_eq!(v["hidden"]["failed"], 2, "alice's refused patch and cattle's 409 on Namespace local");
+        assert_eq!(v["hidden"]["failedSystem"], 1, "the 409 in cattle-system");
+        assert_eq!(v["hidden"]["system"], 1, "Namespace kube-public");
+        // Showing system accounts does not bring refused requests back.
+        let v = changemap(&s, chrono_tz::Asia::Taipei, &Params { system: Some("1".into()), ..p.clone() }, T + 7000).unwrap();
+        assert_eq!(v["rows"].as_array().unwrap().len(), 4, "{v}");
+        assert_eq!((v["hidden"]["failed"].as_i64(), v["hidden"]["failedSystem"].as_i64()), (Some(2), Some(1)));
+
+        // With the setting off they are listed as before.
+        let mut cfg = Config::test();
+        cfg.behaviors.drop_failed = false;
+        let s = Store::open_with(":memory:", Arc::new(cfg)).unwrap();
+        load(&s);
+        let v = changemap(&s, chrono_tz::Asia::Taipei, &p, T + 7000).unwrap();
+        assert_eq!(
+            keys(&v),
+            ["c1//deployments/shop/api", "c1//deployments/shop/web", "c1//namespaces//local", "c1//namespaces//shop", "c1//secrets/shop/db"],
+            "{v}"
+        );
+        assert_eq!((v["hidden"]["failed"].as_i64(), v["hidden"]["system"].as_i64()), (Some(0), Some(2)));
     }
 
     #[test]

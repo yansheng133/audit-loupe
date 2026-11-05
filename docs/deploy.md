@@ -301,7 +301,7 @@ server:
 |---|---|---|
 | `cellMinutes` | `10` | 畫面上一格幾分鐘（依 `server.timezone` 對齊），要能整除 1440 |
 | `joinMinutes` | `60` | 兩筆操作相隔超過這麼久，或中間有收集中斷開始，就斷成兩段 |
-| `dropFailed` | `true` | 失敗的請求（回應碼 ≥ 400）不算操作，只計入 `hidden.failed`／`hidden.failedSystem` |
+| `dropFailed` | `true` | 失敗的請求（回應碼 ≥ 400）不算操作，只計入 `hidden.failed`／`hidden.failedSystem`。行為頁面與變更地圖共用；有中、高風險警示的照樣列出 |
 | `look` | `[high]` | 段內有這些嚴重度的警示 →「要看」 |
 | `notable` | `[medium]` | 段內有這些嚴重度的警示 →「值得知道」 |
 | `tagOnly` | `[bypassed_rancher, off_hours]` | 只當段落標籤、不影響分級的規則 |

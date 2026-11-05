@@ -1,5 +1,12 @@
 # 變更紀錄
 
+## 未發版
+
+### 變更
+- **變更地圖預設不列失敗的請求**：回應碼 ≥ 400 的寫入（沒有中、高風險警示的）不再當成變更顯示，計入 `hidden.failed`／`hidden.failedSystem`，與行為頁面一致，共用 `server.behaviors.dropFailed`。lab 10/30 有 4,491 筆，其中幾十筆是人的帳號。
+- **變更地圖與行為頁面判斷系統元件的方式統一**：都用目標 namespace，Namespace 物件算它自己的名稱。以前變更地圖把 Rancher 帳號對 Namespace 物件的修改一律當成系統元件（例如 cattle 在下游叢集建立 Namespace `local` 回 409 的 8 筆，兩頁分類不同）。
+- 約定見 `docs/api/changemap-v0.md`「0.7.1 補充」。
+
 ## 0.7.0（預覽版）
 
 **預覽版**：變更地圖改用「行為」呈現，介面在 [audit-loupe-ui](https://github.com/yansheng133/audit-loupe-ui) 同步發佈 0.7.0（活動總覽、稽核發現、依身分、依資源範圍四個分頁）。升級注意事項見 `docs/deploy.md` 第 11 節「從 0.6.0 升級」。

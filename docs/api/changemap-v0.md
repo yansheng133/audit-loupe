@@ -151,3 +151,13 @@ v0 是原型：開頁時直接查現有資料表，**不做彙總表、不調效
    - 缺口表裡已經記下的缺口（收集元件回報後才寫）沒有這個欄位。
 2. **`GET /api/coverage`**：`collectors[]` 與心跳中斷的 `gaps[]` 多一個 `retired`。只有在一個收集元件超過一天沒有回報、而同一座叢集同一種收集元件還有別的執行個體在回報時才是 `true`（實際上就是換掉的節點）；這時中斷的 `toMs` 是新執行個體開始回報的時間（至少中斷後一天），變更地圖與收集狀態頁相同。那座叢集這種收集元件一個都沒在回報時永遠是 `false`。
 3. **watch 收集元件的回報內容**：`collectors[].details` 裡每個資源類型的值，除了 `watching`、`not served`，多了 `forbidden`（被拒，通常是 ClusterRole 沒涵蓋）與 `failing`（其他錯誤），恢復後改回 `watching`。
+
+## 0.7.1 補充（尚未發版）
+
+1. **失敗的請求預設不列**（Sam 11/06 決定，與行為頁面一致）：回應碼 ≥ 400 的寫入不算物件變更，不列；計入 `hidden.failed`（會列出來的身分）或 `hidden.failedSystem`（系統元件、在 Rancher 自己 namespace 的 Rancher 帳號）。
+   - 有中、高風險警示的失敗請求照樣列出（警示講的就是被拒這件事）。
+   - 帶 `system=1` 也不會列出失敗的請求；要列出來，把 `server.behaviors.dropFailed` 設成 `false`（變更地圖與行為頁面共用這個設定）。
+   - `hidden` 一律有 `failed`、`failedSystem` 兩個欄位（設定關掉時是 0）。
+2. **判斷系統元件用目標 namespace**（與行為頁面一致）：Namespace 物件算它自己的名稱。Rancher 帳號修改應用程式 namespace 的 Namespace 物件（例如加上專案標註）會列出來；以前因為 Namespace 物件本身沒有 namespace，一律當成系統元件。
+3. lab 10/17–10/31 的資料（10/31 的資料庫複本）新舊版比對：預設畫面 10/30 從 207 個物件變成 197 個（少的 10 個只有失敗請求），隱藏數與行為頁面完全相同（failed 1,815、failedSystem 2,676、system 4,668）；10/17、10/18 各多出 Namespace `laoban-dev`（Rancher 與 Fleet 修改這個應用程式 namespace）。
+
