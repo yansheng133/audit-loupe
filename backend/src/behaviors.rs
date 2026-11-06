@@ -1101,7 +1101,7 @@ fn load(store: &Store, ctx: &Ctx, clusters: &HashSet<&str>, with_system: bool, s
 fn context(store: &Store, tz: chrono_tz::Tz) -> anyhow::Result<Ctx> {
     let c = store.conn.lock().unwrap();
     let kinds = c
-        .prepare_cached("SELECT cluster, api_group, resource, kind FROM resource_kinds")?
+        .prepare_cached("SELECT cluster, api_group, resource, kind, 0 FROM api_kinds UNION ALL SELECT cluster, api_group, resource, kind, 1 FROM resource_kinds ORDER BY 5")?
         .query_map([], |r| Ok(((r.get(0)?, r.get(1)?, r.get(2)?), r.get(3)?)))?
         .collect::<Result<_, _>>()?;
     Ok(Ctx { tz, s: store.cfg.behaviors.clone(), kinds })
