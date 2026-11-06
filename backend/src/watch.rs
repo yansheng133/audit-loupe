@@ -60,6 +60,62 @@ pub enum ObjMsg {
     ListDone { group: String, resource: String, listed: Vec<(String, String)> },
 }
 
+/// The `k8s-kinds` message: every resource type this cluster serves, as (group, plural, Kind).
+/// Sent apart from the object batches: a server that does not know it refuses it, and that
+/// must not hold up the object changes behind it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KindList {
+    pub kinds: Vec<(String, String, String)>,
+}
+
+/// How often discovery is repeated, for custom resources installed later.
+const KINDS_EVERY: Duration = Duration::from_secs(6 * 3600);
+
+/// Every served resource type's Kind. Group by group, so one unavailable aggregated API
+/// (a metrics server that is down, say) does not lose all the others; subresources skipped.
+async fn discover_kinds(client: &Client) -> anyhow::Result<KindList> {
+    let mut kinds = Vec::new();
+    let mut names: Vec<String> = client.list_api_groups().await?.groups.into_iter().map(|g| g.name).collect();
+    names.push(String::new());
+    for name in names {
+        match discovery::group(client, &name).await {
+            Ok(g) => {
+                for (ar, _) in g.resources_by_stability() {
+                    if !ar.plural.contains('/') && !ar.kind.is_empty() {
+                        kinds.push((ar.group.clone(), ar.plural.clone(), ar.kind.clone()));
+                    }
+                }
+            }
+            Err(e) => warn!(group = %name, error = %e, "discovery failed for this group; its kinds are left out"),
+        }
+    }
+    kinds.sort();
+    kinds.dedup();
+    Ok(KindList { kinds })
+}
+
+/// Report the cluster's kinds now and every KINDS_EVERY. Best effort: a failure is logged and
+/// tried again next time (an older server answers 400 for the unknown source).
+async fn report_kinds(client: Client) {
+    let sender = match Sender::from_env("k8s-kinds") {
+        Ok(s) => s,
+        Err(e) => return warn!(error = %e, "cannot report kinds"),
+    };
+    loop {
+        match discover_kinds(&client).await {
+            Ok(k) => match serde_json::to_vec(&k) {
+                Ok(body) => match sender.send(&body).await {
+                    Ok(()) => info!(kinds = k.kinds.len(), "reported resource kinds"),
+                    Err(e) => warn!(error = %e, "reporting resource kinds failed; will try again later"),
+                },
+                Err(e) => warn!(error = %e, "cannot encode kinds"),
+            },
+            Err(e) => warn!(error = %e, "discovery failed; will try again later"),
+        }
+        tokio::time::sleep(KINDS_EVERY).await;
+    }
+}
+
 /// "apps/v1/deployments" -> ("apps", "v1", "deployments"); "v1/configmaps" -> ("", "v1", "configmaps")
 pub fn split_spec(spec: &str) -> Option<(String, String, String)> {
     let parts: Vec<&str> = spec.split('/').collect();
@@ -246,6 +302,7 @@ pub async fn run() -> anyhow::Result<()> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Line>(4096);
     let sending = tokio::spawn(batch_and_send(rx, sender, None));
     info!(resources = specs.len(), "watching");
+    let kinds = tokio::spawn(report_kinds(client.clone()));
     let mut tasks = Vec::new();
     for spec in specs {
         let (client, tx, health) = (client.clone(), tx.clone(), health.clone());
@@ -283,6 +340,7 @@ pub async fn run() -> anyhow::Result<()> {
     for t in tasks {
         let _ = t.await;
     }
+    kinds.abort();
     let _ = sending.await;
     Ok(())
 }
@@ -330,6 +388,29 @@ mod tests {
         let mut ua = json!({"metadata":{"name":"u-abc"},"GroupPrincipals":{"openldap":{"items":[]}},"LastRefresh":"2026-10-17T01:00:00Z","NeedsRefresh":false});
         sanitize("management.cattle.io", "userattributes", &mut ua);
         assert!(ua.get("LastRefresh").is_none() && ua.get("GroupPrincipals").is_some());
+    }
+
+    /// Against a real cluster: `KUBECONFIG=... cargo test -- --ignored discovers_kinds_live`.
+    #[tokio::test]
+    #[ignore]
+    async fn discovers_kinds_live() {
+        let k = discover_kinds(&Client::try_default().await.unwrap()).await.unwrap();
+        assert!(k.kinds.contains(&("".into(), "configmaps".into(), "ConfigMap".into())), "core group included");
+        assert!(!k.kinds.iter().any(|(_, r, _)| r.contains('/')), "no subresources");
+        for (g, r, kind) in &k.kinds {
+            if !g.ends_with(".k8s.io") && !g.is_empty() && !g.starts_with("apps") {
+                println!("{g}\t{r}\t{kind}");
+            }
+        }
+        println!("{} kinds", k.kinds.len());
+    }
+
+    #[test]
+    fn kind_list_wire_format() {
+        let k = KindList { kinds: vec![("neuvector.com".into(), "nvadmissioncontrolsecurityrules".into(), "NvAdmissionControlSecurityRule".into())] };
+        let text = serde_json::to_string(&k).unwrap();
+        assert_eq!(text, r#"{"kinds":[["neuvector.com","nvadmissioncontrolsecurityrules","NvAdmissionControlSecurityRule"]]}"#);
+        assert_eq!(serde_json::from_str::<KindList>(&text).unwrap(), k);
     }
 
     #[test]

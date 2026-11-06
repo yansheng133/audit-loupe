@@ -603,6 +603,12 @@ fn prepare_stats(conn: &Connection) -> anyhow::Result<()> {
            cluster TEXT NOT NULL, api_group TEXT NOT NULL, resource TEXT NOT NULL, kind TEXT NOT NULL,
            PRIMARY KEY (cluster, api_group, resource, kind)
          ) WITHOUT ROWID;
+         -- Kind of every resource type a cluster serves, as collect-watch's discovery last saw it.
+         -- Names custom resources that are not watched (resource_kinds only knows watched ones).
+         CREATE TABLE IF NOT EXISTS api_kinds (
+           cluster TEXT NOT NULL, api_group TEXT NOT NULL, resource TEXT NOT NULL, kind TEXT NOT NULL,
+           PRIMARY KEY (cluster, api_group, resource)
+         ) WITHOUT ROWID;
          CREATE TRIGGER IF NOT EXISTS events_stats AFTER INSERT ON events BEGIN
            INSERT INTO cluster_stats (cluster, last_event_ms) VALUES (NEW.cluster, NEW.ts_ms)
            ON CONFLICT (cluster) DO UPDATE SET last_event_ms = max(coalesce(last_event_ms, excluded.last_event_ms), excluded.last_event_ms);
@@ -1477,6 +1483,21 @@ impl Store {
         let c = self.conn.lock().unwrap();
         let ids: Vec<String> = c.prepare("SELECT DISTINCT user_id FROM users ORDER BY user_id")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
         ids.into_iter().map(|id| Ok((id.clone(), Self::lifetimes(&c, &id)?))).collect()
+    }
+
+    /// Replace what discovery says about a cluster's resource types (`k8s-kinds`).
+    pub fn set_api_kinds(&self, cluster: &str, kinds: &[(String, String, String)]) -> anyhow::Result<usize> {
+        let mut c = self.conn.lock().unwrap();
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM api_kinds WHERE cluster=?1", params![cluster])?;
+        {
+            let mut ins = tx.prepare("INSERT OR REPLACE INTO api_kinds (cluster, api_group, resource, kind) VALUES (?1,?2,?3,?4)")?;
+            for (g, r, k) in kinds {
+                ins.execute(params![cluster, g, r, k])?;
+            }
+        }
+        tx.commit()?;
+        Ok(kinds.len())
     }
 
     /// Apply a batch from `collect-watch`. Returns how many versions were stored.

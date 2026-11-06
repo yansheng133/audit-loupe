@@ -527,7 +527,7 @@ fn build(store: &Store, tz: chrono_tz::Tz, p: &Params, now_ms: i64, only: Option
         }
     }
     let kinds: HashMap<(String, String, String), String> = c
-        .prepare("SELECT cluster, api_group, resource, kind FROM resource_kinds")?
+        .prepare("SELECT cluster, api_group, resource, kind, 0 FROM api_kinds UNION ALL SELECT cluster, api_group, resource, kind, 1 FROM resource_kinds ORDER BY 5")?
         .query_map([], |r| Ok(((r.get(0)?, r.get(1)?, r.get(2)?), r.get(3)?)))?
         .collect::<Result<_, _>>()?;
 
@@ -1217,6 +1217,30 @@ mod tests {
     /// Refused requests are counted, not listed, by default (the behaviors setting), split by
     /// whether the account would be a system one; one with a medium or high alert stays. The
     /// namespace that decides is the target one: a Namespace object counts as its own.
+    /// A custom resource nobody watches is named by the Kind discovery reported, not by its
+    /// plural; a Kind learned from stored versions still wins over discovery.
+    #[test]
+    fn unwatched_custom_resources_are_named_by_discovered_kind() {
+        let s = store();
+        {
+            let c = s.conn.lock().unwrap();
+            ev(&c, 1, "c1", T, "alice", 1, "direct", "patch", "widgets", "shop", "w");
+            ev(&c, 2, "c1", T + 1000, "alice", 1, "direct", "patch", "gadgets", "shop", "g");
+            ev(&c, 3, "c1", T + 2000, "alice", 1, "direct", "patch", "sprockets", "shop", "s");
+            c.execute("INSERT INTO resource_kinds (cluster, api_group, resource, kind) VALUES ('c1', '', 'gadgets', 'Gadget')", []).unwrap();
+        }
+        let kinds = [("".to_string(), "widgets".to_string(), "Widget".to_string()), ("".to_string(), "gadgets".to_string(), "FromDiscovery".to_string())];
+        assert_eq!(s.set_api_kinds("c1", &kinds).unwrap(), 2);
+        // A later report replaces the earlier one for that cluster.
+        assert_eq!(s.set_api_kinds("c1", &kinds).unwrap(), 2);
+        let p = Params { day: Some("2026-10-20".into()), ..Default::default() };
+        let v = changemap(&s, chrono_tz::Asia::Taipei, &p, T + 7000).unwrap();
+        let kind = |n: &str| v["rows"].as_array().unwrap().iter().find(|r| r["name"] == n).map(|r| r["kind"].as_str().unwrap().to_string()).unwrap();
+        assert_eq!(kind("w"), "Widget");
+        assert_eq!(kind("g"), "Gadget", "stored versions win over discovery");
+        assert_eq!(kind("s"), "sprockets", "unknown to both: the plural, as before");
+    }
+
     #[test]
     fn failed_requests_are_counted_and_namespaces_count_as_their_own() {
         let cattle = "system:serviceaccount:cattle-system:cattle";

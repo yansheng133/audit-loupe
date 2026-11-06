@@ -7,6 +7,10 @@
 - **變更地圖與行為頁面判斷系統元件的方式統一**：都用目標 namespace，Namespace 物件算它自己的名稱。以前變更地圖把 Rancher 帳號對 Namespace 物件的修改一律當成系統元件（例如 cattle 在下游叢集建立 Namespace `local` 回 409 的 8 筆，兩頁分類不同）。
 - 約定見 `docs/api/changemap-v0.md`「0.7.1 補充」。
 - 行為的 `title` 多一個 `code`（那一筆的回應碼），介面才能把被拒、失敗的操作標出來（例如登入失敗不再顯示成「登入」）。
+- **自訂資源用正式的種類名稱**：以前沒被 watch 的自訂資源（CRD）只能顯示成資源的複數小寫名稱（例如 `nvadmissioncontrolsecurityrules`、`applications`）。`collect-watch` 啟動時與之後每 6 小時，把叢集提供的每種資源和它的 Kind 回報給 server（新的 ingest 來源 `k8s-kinds`，只送名稱對照，不送物件內容），存在 `api_kinds`；變更地圖與行為頁面找不到 watch 過的種類名稱時改用它。被 watch 的種類仍以實際收到的物件為準。
+  - 只走叢集預設就有的探索 API（`/api`、`/apis`），不需要新的權限。某個 API 群組暫時不通（例如 metrics-server 掛了）只會少那一組，不影響其他。
+  - 相容性：新版 `collect-watch` 配舊版 server 時，舊 server 會回 400，collect-watch 只記一行警告、6 小時後再試，**不影響**物件變更的傳送。舊版 `collect-watch` 配新版 server 則照舊顯示複數名稱。
+  - 已經存下來的資料不用重算：開頁時才查對照表，升級後 collect-watch 回報一次就生效。
 
 ## 0.7.0（預覽版）
 

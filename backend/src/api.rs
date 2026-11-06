@@ -74,6 +74,23 @@ async fn ingest(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> R
             return (StatusCode::FORBIDDEN, "only the Rancher cluster's collector may send Rancher records").into_response();
         }
         "k8s-object" => return ingest_objects(s, cluster, &body).await,
+        "k8s-kinds" => {
+            // collect-watch's list of every resource type the cluster serves and its Kind, so
+            // custom resources it does not watch are still named by Kind, not by plural.
+            let k: crate::watch::KindList = match serde_json::from_slice(&body) {
+                Ok(k) => k,
+                Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+            };
+            if k.kinds.len() > 5000 || k.kinds.iter().any(|(g, r, kind)| g.len() > 253 || r.len() > 253 || kind.is_empty() || kind.len() > 253) {
+                return (StatusCode::BAD_REQUEST, "at most 5000 kinds, each [group, resource, kind] within 253 bytes").into_response();
+            }
+            let store = s.store.clone();
+            return match tokio::task::spawn_blocking(move || store.set_api_kinds(&cluster, &k.kinds)).await {
+                Ok(Ok(n)) => Json(json!({"received": n})).into_response(),
+                Ok(Err(e)) => err(e),
+                Err(e) => err(e.into()),
+            };
+        }
         "neuvector" => {
             let mut items = Vec::new();
             for line in body.split(|b| *b == b'\n').map(|l| l.trim_ascii()).filter(|l| !l.is_empty()) {
@@ -827,6 +844,18 @@ mod tests {
         assert!(yaml.contains("replicas: 3") && !yaml.contains("uid"), "{yaml}");
         let (code, _) = get(first).await;
         assert_eq!(code, StatusCode::CONFLICT, "the first sighting has nothing before it");
+    }
+
+    #[tokio::test]
+    async fn stores_reported_kinds() {
+        let st = state();
+        let body = br#"{"kinds":[["neuvector.com","nvadmissioncontrolsecurityrules","NvAdmissionControlSecurityRule"]]}"#.to_vec();
+        let (code, text) = post(ingest_router(st.clone()), Some("test-token"), "k8s-kinds", body, false).await;
+        assert_eq!(code, StatusCode::OK, "{text}");
+        let n: i64 = st.store.conn.lock().unwrap().query_row("SELECT COUNT(*) FROM api_kinds WHERE kind = 'NvAdmissionControlSecurityRule'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+        let (code, _) = post(ingest_router(st), Some("test-token"), "k8s-kinds", br#"{"kinds":[["g","r",""]]}"#.to_vec(), false).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "a Kind may not be empty");
     }
 
     #[tokio::test]
